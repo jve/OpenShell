@@ -36,6 +36,7 @@ jobs:
       CARGO_PROFILE_DEV_DEBUG: "0"
       CARGO_PROFILE_TEST_DEBUG: "0"
       CARGO_BUILD_JOBS: "2"
+      CONTAINER_ENGINE: docker
       MISE_GITHUB_TOKEN: ${{ github.token }}
       PREBUILT_ARCH: ${{ matrix.arch }}
       IMAGE_TAG: ${{ github.sha }}-${{ matrix.arch }}
@@ -57,8 +58,12 @@ jobs:
           cache-on-failure: true
       - name: Build gateway and static supervisor
         run: mise run build:docker:prebuilt
+      - name: Create Docker builder for image attestations
+        run: docker buildx create --name niuu-builder --driver docker-container --use
       - name: Build local images
-        run: mise run build:docker:gateway build:docker:supervisor
+        run: |
+          mise run build:docker:gateway
+          mise run build:docker:supervisor
       - name: Build test clients
         run: mise exec -- cargo build -p openshell-cli -p openshell-conformance-cli
       - name: Create acceptance cluster
@@ -91,7 +96,9 @@ jobs:
       - name: Publish tested architecture with provenance and SBOM
         env:
           DOCKER_PUSH: "1"
-        run: mise run build:docker:gateway build:docker:supervisor
+        run: |
+          mise run build:docker:gateway
+          mise run build:docker:supervisor
       - name: Remove acceptance cluster
         if: always()
         run: kind delete cluster --name niuu-acceptance
