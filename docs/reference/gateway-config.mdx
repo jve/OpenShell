@@ -1074,3 +1074,13 @@ $EDITOR ~/.config/openshell/gateway.toml
 openshell-gateway config preflight --path ~/.config/openshell/gateway.toml
 systemctl --user restart openshell-gateway
 ```
+
+### Kubernetes workload container requests
+
+Per-sandbox `driver_config.kubernetes.containers.workloads` adds regular
+containers to a sandbox pod. Set the gateway's Kubernetes `topology` to `sidecar`
+to provide shared pod-local networking with supervised process containers.
+This setting configures OpenShell's internal enforcement component; the workload
+containers are regular `spec.containers` entries. See
+[Multiple workload containers](./sandbox-compute-drivers#multiple-workload-containers)
+for the request schema, shared volume configuration, and lifecycle contract.

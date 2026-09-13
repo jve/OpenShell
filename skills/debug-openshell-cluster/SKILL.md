@@ -799,3 +799,13 @@ probes. Arguments after `--` validate the effective daemon invocation,
 including its command-line overrides. Preflight preserves every failed file. Do
 not advise users to delete or rewrite it automatically; back it up and follow the
 manual schema-v2 migration in the Gateway Configuration reference.
+
+### Multiple workload containers
+
+When driver config requests `containers.workloads`, inspect regular
+`spec.containers` entries and each container's status/logs. These are peer
+workloads, not restartable init containers. OpenShell's internal `sidecar`
+topology is required. All process supervisors must authenticate on private
+control sockets before workload startup; a missing or failed required peer
+terminates the group. Verify shared localhost connectivity without disabling
+egress policy. Use the compute-driver reference for the supported schema.

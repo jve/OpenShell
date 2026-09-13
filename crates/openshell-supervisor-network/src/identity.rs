@@ -76,8 +76,10 @@ struct CachedBinary {
 /// Thread-safe cache of binary SHA256 hashes for TOFU enforcement.
 pub struct BinaryIdentityCache {
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-    hashes: Mutex<HashMap<PathBuf, CachedBinary>>,
+    hashes: Mutex<HashMap<BinaryCacheKey, CachedBinary>>,
 }
+
+type BinaryCacheKey = (PathBuf, Option<(u64, u64)>);
 
 impl Default for BinaryIdentityCache {
     fn default() -> Self {
@@ -106,18 +108,41 @@ impl BinaryIdentityCache {
     #[cfg(target_os = "linux")]
     pub fn verify_or_cache_process_exe(&self, display_path: &Path, pid: u32) -> Result<String> {
         let proc_exe = PathBuf::from(format!("/proc/{pid}/exe"));
-        self.verify_or_cache_with_paths(display_path, &proc_exe, procfs::file_sha256)
+        // Use filesystem-root identity, not mount-namespace identity: child
+        // mount namespaces must retain the same TOFU history for their image.
+        let root = std::fs::metadata(format!("/proc/{pid}/root"))
+            .map_err(|e| miette::miette!("Failed to resolve executable filesystem root: {e}"))?;
+        self.verify_or_cache_in_root(
+            display_path,
+            &proc_exe,
+            Some((root.dev(), root.ino())),
+            procfs::file_sha256,
+        )
     }
 
     fn verify_or_cache_with_paths<F>(
         &self,
         cache_path: &Path,
         access_path: &Path,
+        hash_file: F,
+    ) -> Result<String>
+    where
+        F: FnMut(&Path) -> Result<String>,
+    {
+        self.verify_or_cache_in_root(cache_path, access_path, None, hash_file)
+    }
+
+    fn verify_or_cache_in_root<F>(
+        &self,
+        cache_path: &Path,
+        access_path: &Path,
+        root: Option<(u64, u64)>,
         mut hash_file: F,
     ) -> Result<String>
     where
         F: FnMut(&Path) -> Result<String>,
     {
+        let cache_key = (cache_path.to_path_buf(), root);
         let start = std::time::Instant::now();
         let metadata = std::fs::metadata(access_path)
             .map_err(|error| miette::miette!("Failed to stat {}: {error}", cache_path.display()))?;
@@ -127,7 +152,7 @@ impl BinaryIdentityCache {
             .hashes
             .lock()
             .map_err(|_| miette::miette!("Binary identity cache lock poisoned"))?
-            .get(cache_path)
+            .get(&cache_key)
             .cloned();
 
         if let Some(cached_binary) = &cached
@@ -154,7 +179,7 @@ impl BinaryIdentityCache {
             .lock()
             .map_err(|_| miette::miette!("Binary identity cache lock poisoned"))?;
 
-        if let Some(existing) = hashes.get(cache_path)
+        if let Some(existing) = hashes.get(&cache_key)
             && existing.hash != current_hash
         {
             return Err(miette::miette!(
@@ -166,7 +191,7 @@ impl BinaryIdentityCache {
         }
 
         hashes.insert(
-            cache_path.to_path_buf(),
+            cache_key,
             CachedBinary {
                 hash: current_hash.clone(),
                 fingerprint,
@@ -189,6 +214,29 @@ mod tests {
     use crate::procfs;
     use std::io::Write;
     use std::time::Duration;
+
+    #[test]
+    fn different_container_images_have_independent_binary_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = dir.path().join("image-a");
+        let second = dir.path().join("image-b");
+        std::fs::write(&first, b"python image one").unwrap();
+        std::fs::write(&second, b"python image two").unwrap();
+        let cache = BinaryIdentityCache::new();
+        let path = Path::new("/usr/bin/python3");
+        let a = cache
+            .verify_or_cache_in_root(path, &first, Some((1, 10)), procfs::file_sha256)
+            .unwrap();
+        let b = cache
+            .verify_or_cache_in_root(path, &second, Some((1, 20)), procfs::file_sha256)
+            .unwrap();
+        assert_ne!(a, b);
+        assert!(
+            cache
+                .verify_or_cache_in_root(path, &second, Some((1, 10)), procfs::file_sha256)
+                .is_err()
+        );
+    }
 
     #[test]
     fn first_call_caches_hash() {
@@ -330,7 +378,7 @@ mod tests {
                 .hashes
                 .lock()
                 .unwrap()
-                .contains_key(Path::new("/usr/bin/python3"))
+                .contains_key(&(PathBuf::from("/usr/bin/python3"), None))
         );
     }
 

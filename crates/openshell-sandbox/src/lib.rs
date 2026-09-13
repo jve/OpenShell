@@ -159,6 +159,13 @@ pub async fn run_sandbox(
     let process_enforcement_mode = process_enforcement_mode();
     let process_uses_sidecar_control =
         process_enabled && !network_enabled && sidecar_network_enforcement;
+    let pod_workload =
+        std::env::var(openshell_core::sandbox_env::POD_WORKLOAD).is_ok_and(|value| value == "1");
+    if pod_workload && (!process_uses_sidecar_control || ssh_socket_path.is_some()) {
+        return Err(miette::miette!(
+            "additional pod workloads require process-only control without SSH"
+        ));
+    }
     let mut process_control_connection = None;
     let sidecar_bootstrap = if process_uses_sidecar_control {
         let socket = sidecar_control_socket().ok_or_else(|| {
@@ -580,7 +587,7 @@ pub async fn run_sandbox(
             )
         })?;
         let ca_paths = networking.as_ref().and_then(|n| n.ca_file_paths.clone());
-        Some(sidecar_control::spawn_server(
+        Some(sidecar_control::spawn_pod_server(
             &socket,
             sidecar_control::BootstrapData {
                 policy_proto: proto.clone(),
@@ -592,6 +599,12 @@ pub async fn run_sandbox(
                 proxy_ca_bundle_path: ca_paths.as_ref().map(|paths| paths.1.clone()),
             },
             sidecar_expected_peer()?,
+            &serde_json::from_str::<Vec<std::path::PathBuf>>(
+                &std::env::var(openshell_core::sandbox_env::WORKLOAD_CONTROL_SOCKETS)
+                    .unwrap_or_else(|_| "[]".to_string()),
+            )
+            .into_diagnostic()
+            .wrap_err("invalid workload control sockets")?,
         )?)
     } else {
         None
@@ -879,29 +892,32 @@ pub async fn run_sandbox(
         };
         tokio::pin!(ssh_exited);
 
-        let entrypoint_started_tx =
-            if process_uses_sidecar_control && let Some(writer) = process_control_writer.clone() {
-                let (tx, rx) = tokio::sync::oneshot::channel();
-                tokio::spawn(async move {
-                    match rx.await {
-                        Ok((pid, instance_id)) => {
-                            if let Err(err) =
-                                sidecar_control::send_entrypoint_started(&writer, pid, instance_id)
-                                    .await
-                            {
-                                warn!(error = %err, "Failed to send sidecar entrypoint event");
-                            }
-                        }
-                        Err(_closed) => {
-                            debug!("Entrypoint exited before sidecar entrypoint event was sent");
+        let entrypoint_started_tx = if process_uses_sidecar_control
+            && !pod_workload
+            && let Some(writer) = process_control_writer.clone()
+        {
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            tokio::spawn(async move {
+                match rx.await {
+                    Ok((pid, instance_id)) => {
+                        if let Err(err) =
+                            sidecar_control::send_entrypoint_started(&writer, pid, instance_id)
+                                .await
+                        {
+                            warn!(error = %err, "Failed to send sidecar entrypoint event");
                         }
                     }
-                });
-                Some(tx)
-            } else {
-                None
-            };
+                    Err(_closed) => {
+                        debug!("Entrypoint exited before sidecar entrypoint event was sent");
+                    }
+                }
+            });
+            Some(tx)
+        } else {
+            None
+        };
         let sidecar_exit_tx = if process_uses_sidecar_control
+            && !pod_workload
             && let Some(writer) = process_control_writer.clone()
         {
             let exit_ack = Arc::clone(&process_exit_ack);
@@ -1067,9 +1083,9 @@ pub async fn run_sandbox(
     } else {
         // Network-only sidecar mode: keep the proxy and its background
         // tasks alive (held via the `networking` value) until shutdown. If the
-        // sole authenticated process-supervisor control connection closes,
+        // any required process-supervisor control connection closes,
         // exit non-zero so Kubernetes restarts the network sidecar and creates
-        // a fresh one-client bootstrap listener for the restarted agent.
+        // fresh bootstrap listeners for the restarted workload group.
         #[cfg(target_os = "linux")]
         if let Some(control_task) = sidecar_control_task {
             tokio::select! {

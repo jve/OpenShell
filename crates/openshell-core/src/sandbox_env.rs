@@ -159,6 +159,12 @@ pub const NETWORK_BINARY_IDENTITY: &str = "OPENSHELL_NETWORK_BINARY_IDENTITY";
 /// container.
 pub const SIDECAR_CONTROL_SOCKET: &str = "OPENSHELL_SIDECAR_CONTROL_SOCKET";
 
+/// Driver-owned JSON list of private control sockets for additional pod workloads.
+pub const WORKLOAD_CONTROL_SOCKETS: &str = "OPENSHELL_WORKLOAD_CONTROL_SOCKETS";
+
+/// Additional regular pod container: supervised locally without a gateway SSH session.
+pub const POD_WORKLOAD: &str = "OPENSHELL_POD_WORKLOAD";
+
 /// Optional TLS server name override used when connecting to the gateway.
 pub const GATEWAY_TLS_SERVER_NAME: &str = "OPENSHELL_GATEWAY_TLS_SERVER_NAME";
 

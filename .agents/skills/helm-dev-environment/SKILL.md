@@ -327,3 +327,13 @@ for dependencies still declared in `Chart.yaml`.
 | `deploy/kube/manifests/envoy-gateway-openshell.yaml` | GatewayClass for Envoy Gateway (`mise run helm:gateway:apply`) |
 | `tasks/scripts/helm-k3s-local.sh` | k3d cluster create/delete/start/stop/status |
 | `tasks/scripts/keycloak-k8s-setup.sh` | Keycloak deploy + realm import |
+
+### Multiple workload containers
+
+When driver config requests `containers.workloads`, inspect regular
+`spec.containers` entries and each container's status/logs. These are peer
+workloads, not restartable init containers. OpenShell's internal `sidecar`
+topology is required. All process supervisors must authenticate on private
+control sockets before workload startup; a missing or failed required peer
+terminates the group. Verify shared localhost connectivity without disabling
+egress policy. Use the compute-driver reference for the supported schema.

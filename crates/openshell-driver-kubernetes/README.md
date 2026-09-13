@@ -259,3 +259,13 @@ openshell sandbox create \
   }' \
   -- claude
 ```
+
+### Regular workload containers
+
+`containers.workloads` in Kubernetes driver config renders additional regular
+pod containers. See the compute-driver reference for fields and examples. The
+driver requires the existing `sidecar` supervisor topology for shared pod-local
+networking, assigns private control volumes, and keeps credentials out of the
+workload containers. The network supervisor authenticates all process wrappers
+before releasing any workload. All workloads share the sandbox policy and
+lifecycle; only `agent` is the canonical process and SSH target.

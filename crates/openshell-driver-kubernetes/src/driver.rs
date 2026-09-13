@@ -15,8 +15,8 @@ use k8s_openapi::api::authentication::v1::{
     TokenReview, TokenReviewSpec, TokenReviewStatus, UserInfo,
 };
 use k8s_openapi::api::core::v1::{
-    Event as KubeEventObj, Namespace, Node, PersistentVolumeClaimVolumeSource, Pod, Secret,
-    ServiceAccount, Volume, VolumeMount,
+    EmptyDirVolumeSource, Event as KubeEventObj, Namespace, Node,
+    PersistentVolumeClaimVolumeSource, Pod, Secret, ServiceAccount, Volume, VolumeMount,
 };
 use k8s_openapi::api::networking::v1::{
     NetworkPolicy, NetworkPolicyIngressRule, NetworkPolicyPeer, NetworkPolicyPort,
@@ -169,7 +169,45 @@ impl KubernetesSandboxDriverConfig {
         validate_kubernetes_driver_volume_mounts(
             &self.volumes,
             &self.containers.agent.volume_mounts,
-        )
+        )?;
+        let mut names = HashSet::new();
+        if self.containers.workloads.len() > 16 {
+            return Err("at most 16 additional workload containers are supported".into());
+        }
+        for workload in &self.containers.workloads {
+            validate_kubernetes_dns1123_label(&workload.name, "containers.workloads[].name")?;
+            if workload.name == "agent"
+                || workload.name.starts_with("openshell-")
+                || workload.name.len() > 40
+                || !names.insert(&workload.name)
+            {
+                return Err(
+                    "workload names must be unique, non-reserved, and at most 40 characters".into(),
+                );
+            }
+            if workload.image.trim().is_empty()
+                || workload.command.first().is_none_or(|s| s.trim().is_empty())
+            {
+                return Err("each workload requires an image and an explicit command".into());
+            }
+            if workload.command.iter().any(|s| s.contains('\0'))
+                || workload.environment.iter().any(|(k, v)| {
+                    k.is_empty()
+                        || k.contains(['=', '\0'])
+                        || k.starts_with("OPENSHELL_")
+                        || v.contains('\0')
+                })
+            {
+                return Err(
+                    "workload command or environment contains invalid or reserved values".into(),
+                );
+            }
+            if workload.readiness_port == Some(0) {
+                return Err("workload readiness_port must be nonzero".into());
+            }
+            validate_kubernetes_driver_volume_mounts(&self.volumes, &workload.volume_mounts)?;
+        }
+        Ok(())
     }
 
     fn has_explicit_sandbox_data_mount(&self) -> bool {
@@ -195,6 +233,39 @@ struct KubernetesPodDriverConfig {
 #[serde(default, deny_unknown_fields)]
 struct KubernetesDriverContainersConfig {
     agent: KubernetesContainerDriverConfig,
+    workloads: Vec<KubernetesWorkloadConfig>,
+}
+
+/// Regular peer containers in spec.containers, sharing the pod's network namespace.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct KubernetesWorkloadConfig {
+    name: String,
+    image: String,
+    command: Vec<String>,
+    environment: BTreeMap<String, String>,
+    resources: KubernetesContainerResourceConfig,
+    volume_mounts: Vec<KubernetesDriverVolumeMountConfig>,
+    #[serde(deserialize_with = "deserialize_optional_port")]
+    readiness_port: Option<u16>,
+}
+
+fn deserialize_optional_port<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<u16>, D::Error> {
+    // Protobuf Struct encodes every number as a double, including port numbers.
+    Option::<f64>::deserialize(deserializer)?
+        .map(|port| {
+            if port.is_finite() && port.fract() == 0.0 && (1.0..=65535.0).contains(&port) {
+                #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                Ok(port as u16)
+            } else {
+                Err(serde::de::Error::custom(
+                    "readiness_port must be an integer from 1 to 65535",
+                ))
+            }
+        })
+        .transpose()
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -215,8 +286,13 @@ struct KubernetesContainerResourceConfig {
 #[serde(default, deny_unknown_fields)]
 struct KubernetesDriverVolumeConfig {
     name: String,
-    persistent_volume_claim: KubernetesPersistentVolumeClaimConfig,
+    persistent_volume_claim: Option<KubernetesPersistentVolumeClaimConfig>,
+    empty_dir: Option<KubernetesEmptyDirConfig>,
 }
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct KubernetesEmptyDirConfig {}
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -258,10 +334,16 @@ impl From<&KubernetesDriverVolumeConfig> for Volume {
     fn from(volume: &KubernetesDriverVolumeConfig) -> Self {
         Self {
             name: volume.name.clone(),
-            persistent_volume_claim: Some(PersistentVolumeClaimVolumeSource {
-                claim_name: volume.persistent_volume_claim.claim_name.clone(),
-                read_only: Some(volume.persistent_volume_claim.read_only),
+            persistent_volume_claim: volume.persistent_volume_claim.as_ref().map(|pvc| {
+                PersistentVolumeClaimVolumeSource {
+                    claim_name: pvc.claim_name.clone(),
+                    read_only: Some(pvc.read_only),
+                }
             }),
+            empty_dir: volume
+                .empty_dir
+                .as_ref()
+                .map(|_| EmptyDirVolumeSource::default()),
             ..Default::default()
         }
     }
@@ -291,6 +373,8 @@ const KUBERNETES_DRIVER_RESERVED_VOLUME_NAMES: &[&str] = &[
     SPIFFE_WORKLOAD_API_VOLUME_NAME,
     SUPERVISOR_VOLUME_NAME,
     WORKSPACE_VOLUME_NAME,
+    SIDECAR_STATE_VOLUME_NAME,
+    SIDECAR_TLS_VOLUME_NAME,
 ];
 
 const KUBERNETES_DRIVER_PROTECTED_MOUNT_PATHS: &[&str] = &[SERVICE_ACCOUNT_TOKEN_MOUNT_PATH];
@@ -302,7 +386,9 @@ fn validate_kubernetes_driver_volumes(
     for volume in volumes {
         validate_kubernetes_dns1123_label(&volume.name, "volumes[].name")?;
         let name = volume.name.as_str();
-        if KUBERNETES_DRIVER_RESERVED_VOLUME_NAMES.contains(&name) {
+        if KUBERNETES_DRIVER_RESERVED_VOLUME_NAMES.contains(&name)
+            || name.starts_with("openshell-workload-")
+        {
             return Err(format!(
                 "volume name '{name}' is reserved for OpenShell-managed volumes"
             ));
@@ -312,10 +398,17 @@ fn validate_kubernetes_driver_volumes(
                 "duplicate kubernetes driver_config volume '{name}'"
             ));
         }
-        validate_kubernetes_dns1123_subdomain(
-            &volume.persistent_volume_claim.claim_name,
-            "volumes[].persistent_volume_claim.claim_name",
-        )?;
+        if volume.persistent_volume_claim.is_some() == volume.empty_dir.is_some() {
+            return Err(
+                "each volume requires exactly one of persistent_volume_claim or empty_dir".into(),
+            );
+        }
+        if let Some(pvc) = &volume.persistent_volume_claim {
+            validate_kubernetes_dns1123_subdomain(
+                &pvc.claim_name,
+                "volumes[].persistent_volume_claim.claim_name",
+            )?;
+        }
     }
     Ok(())
 }
@@ -328,7 +421,10 @@ fn validate_kubernetes_driver_volume_mounts(
     for volume in volumes {
         volume_read_only.insert(
             volume.name.as_str(),
-            volume.persistent_volume_claim.read_only,
+            volume
+                .persistent_volume_claim
+                .as_ref()
+                .is_some_and(|pvc| pvc.read_only),
         );
     }
 
@@ -1094,14 +1190,16 @@ impl KubernetesComputeDriver {
         &self,
         sandbox: &Sandbox,
     ) -> Result<KubernetesSandboxDriverConfig, String> {
-        kubernetes_driver_config_for_spec(
+        let config = kubernetes_driver_config_for_spec(
             sandbox.spec.as_ref(),
             self.config.provider_spiffe_enabled().then_some(
                 self.config
                     .provider_spiffe_workload_api_socket_path
                     .as_str(),
             ),
-        )
+        )?;
+        validate_workload_topology(&config, self.config.topology)?;
+        Ok(config)
     }
 
     fn agent_sandbox_api(
@@ -3653,7 +3751,20 @@ fn kubernetes_driver_config_for_spec(
         &config.containers.agent.volume_mounts,
         &protected_paths,
     )?;
+    for workload in &config.containers.workloads {
+        validate_kubernetes_protected_path_conflicts(&workload.volume_mounts, &protected_paths)?;
+    }
     Ok(config)
+}
+
+fn validate_workload_topology(
+    config: &KubernetesSandboxDriverConfig,
+    topology: SupervisorTopology,
+) -> Result<(), String> {
+    if !config.containers.workloads.is_empty() && topology != SupervisorTopology::Sidecar {
+        return Err("multiple workload containers require supervisor.topology=sidecar to share pod localhost".into());
+    }
+    Ok(())
 }
 
 fn sandbox_to_k8s_spec(
@@ -3662,6 +3773,7 @@ fn sandbox_to_k8s_spec(
 ) -> Result<serde_json::Value, String> {
     let driver_config =
         kubernetes_driver_config_for_spec(spec, provider_spiffe_socket_path(params))?;
+    validate_workload_topology(&driver_config, params.topology)?;
     let mut root = serde_json::Map::new();
 
     // Determine early whether OpenShell should inject its default workspace
@@ -4116,7 +4228,118 @@ fn sandbox_template_to_k8s_with_validated_config(
         );
     }
 
+    apply_workload_containers(&mut result, driver_config, inject_workspace, params);
     result
+}
+
+fn apply_workload_containers(
+    pod: &mut serde_json::Value,
+    config: &KubernetesSandboxDriverConfig,
+    inject_workspace: bool,
+    params: &SandboxPodParams<'_>,
+) {
+    if config.containers.workloads.is_empty() {
+        return;
+    }
+    let mut sockets = Vec::new();
+    let mut control_mounts = Vec::new();
+    for workload in &config.containers.workloads {
+        let volume_name = format!("openshell-workload-{}", workload.name);
+        let network_mount = format!("/run/openshell-workloads/{}", workload.name);
+        sockets.push(format!("{network_mount}/control.sock"));
+        pod["spec"]["volumes"]
+            .as_array_mut()
+            .expect("pod volumes")
+            .push(serde_json::json!({
+                "name": volume_name, "emptyDir": {}
+            }));
+        control_mounts.push(serde_json::json!({"name": volume_name, "mountPath": network_mount}));
+        let mut mounts = vec![
+            supervisor_volume_mount(),
+            serde_json::json!({"name": volume_name, "mountPath": SIDECAR_STATE_MOUNT_PATH}),
+            serde_json::json!({"name": SIDECAR_TLS_VOLUME_NAME, "mountPath": SIDECAR_TLS_MOUNT_PATH, "readOnly": true}),
+        ];
+        if inject_workspace {
+            mounts.push(serde_json::json!({"name": WORKSPACE_VOLUME_NAME, "mountPath": WORKSPACE_MOUNT_PATH}));
+        }
+        mounts.extend(
+            workload
+                .volume_mounts
+                .iter()
+                .map(kubernetes_driver_volume_mount_to_k8s),
+        );
+        let mut env: Vec<serde_json::Value> = workload
+            .environment
+            .iter()
+            .map(|(name, value)| serde_json::json!({"name": name, "value": value}))
+            .collect();
+        apply_resolved_identity_env(&mut env, params.sandbox_uid, params.sandbox_gid);
+        for (name, value) in [
+            (openshell_core::sandbox_env::POD_WORKLOAD, "1"),
+            (openshell_core::sandbox_env::SUPERVISOR_TOPOLOGY, "sidecar"),
+            (
+                openshell_core::sandbox_env::NETWORK_ENFORCEMENT_MODE,
+                "sidecar-nftables",
+            ),
+            (
+                openshell_core::sandbox_env::SIDECAR_CONTROL_SOCKET,
+                SIDECAR_CONTROL_SOCKET,
+            ),
+            (
+                openshell_core::sandbox_env::PROXY_TLS_DIR,
+                SIDECAR_TLS_MOUNT_PATH,
+            ),
+        ] {
+            upsert_env(&mut env, name, value);
+        }
+        let mut command = vec![
+            format!("{SUPERVISOR_MOUNT_PATH}/openshell-sandbox"),
+            "--mode=process".into(),
+            "--workdir".into(),
+            WORKSPACE_MOUNT_PATH.into(),
+            "--".into(),
+        ];
+        command.extend(workload.command.clone());
+        let mut container = serde_json::json!({
+            "name": workload.name, "image": workload.image, "command": command,
+            "env": env, "volumeMounts": mounts,
+            "securityContext": {"runAsUser": params.sandbox_uid, "runAsGroup": params.sandbox_gid,
+                "runAsNonRoot": true, "allowPrivilegeEscalation": false, "capabilities": {"drop": ["ALL"]}}
+        });
+        if let Some(policy) = params.image_pull_policy {
+            container["imagePullPolicy"] = policy.into();
+        }
+        if let Some(profile) = params.app_armor_profile {
+            container["securityContext"]["appArmorProfile"] = app_armor_profile_to_k8s(profile);
+        }
+        apply_agent_driver_resources(
+            container.as_object_mut().expect("workload object"),
+            &workload.resources,
+        );
+        if let Some(port) = workload.readiness_port {
+            container["readinessProbe"] =
+                serde_json::json!({"tcpSocket": {"port": port}, "periodSeconds": 2});
+        }
+        pod["spec"]["containers"]
+            .as_array_mut()
+            .expect("pod containers")
+            .push(container);
+    }
+    let network = pod["spec"]["containers"]
+        .as_array_mut()
+        .expect("pod containers")
+        .iter_mut()
+        .find(|c| c["name"] == SUPERVISOR_NETWORK_SIDECAR_NAME)
+        .expect("validated network topology");
+    network["volumeMounts"]
+        .as_array_mut()
+        .expect("network mounts")
+        .extend(control_mounts);
+    upsert_env(
+        network["env"].as_array_mut().expect("network env"),
+        openshell_core::sandbox_env::WORKLOAD_CONTROL_SOCKETS,
+        &serde_json::to_string(&sockets).expect("socket list serializes"),
+    );
 }
 
 fn apply_pod_driver_config(
@@ -5598,6 +5821,113 @@ mod tests {
     }
 
     #[test]
+    fn workload_containers_share_pod_network_and_private_bootstrap() {
+        let template = SandboxTemplate {
+            driver_config: Some(json_struct(serde_json::json!({
+                "volumes": [{"name": "mesh", "empty_dir": {}}],
+                "containers": {"workloads": [{
+                    "name": "ravn", "image": "ravn:test", "command": ["python", "-m", "ravn"],
+                    "environment": {"MESH_PEER": "tcp://127.0.0.1:7480"},
+                    "resources": {"limits": {"memory": "256Mi"}},
+                    "readiness_port": 7482,
+                    "volume_mounts": [{"name": "mesh", "mount_path": "/tmp/niuu-mesh", "read_only": false}]
+                }]}
+            }))),
+            ..Default::default()
+        };
+        let spec = SandboxSpec {
+            template: Some(template),
+            ..Default::default()
+        };
+        let params = SandboxPodParams {
+            topology: SupervisorTopology::Sidecar,
+            ..Default::default()
+        };
+        let cr = sandbox_to_k8s_spec(Some(&spec), &params).unwrap();
+        let pod = &cr["spec"]["podTemplate"]["spec"];
+        let containers = pod["containers"].as_array().unwrap();
+        assert_eq!(containers.len(), 3);
+        let workload = containers.iter().find(|c| c["name"] == "ravn").unwrap();
+        assert_eq!(workload["command"][1], "--mode=process");
+        assert_eq!(workload["readinessProbe"]["tcpSocket"]["port"], 7482);
+        assert_eq!(workload["resources"]["limits"]["memory"], "256Mi");
+        assert!(workload.get("restartPolicy").is_none());
+        assert_eq!(
+            workload["securityContext"]["capabilities"]["drop"],
+            serde_json::json!(["ALL"])
+        );
+        assert!(
+            pod["initContainers"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|c| c["name"] != "ravn")
+        );
+        assert_eq!(pod["shareProcessNamespace"], true);
+        assert_eq!(
+            rendered_env(workload, openshell_core::sandbox_env::POD_WORKLOAD),
+            Some("1")
+        );
+        assert_eq!(
+            rendered_env(workload, openshell_core::sandbox_env::ENDPOINT),
+            None
+        );
+        let mounts = workload["volumeMounts"].as_array().unwrap();
+        assert!(mounts.iter().any(|m| m["name"] == WORKSPACE_VOLUME_NAME));
+        assert!(
+            mounts
+                .iter()
+                .any(|m| m["name"] == "openshell-workload-ravn")
+        );
+        assert!(
+            !mounts.iter().any(|m| m["name"] == SIDECAR_STATE_VOLUME_NAME
+                || m["name"] == SERVICE_ACCOUNT_TOKEN_VOLUME_NAME)
+        );
+        let network = containers
+            .iter()
+            .find(|c| c["name"] == SUPERVISOR_NETWORK_SIDECAR_NAME)
+            .unwrap();
+        assert_eq!(
+            rendered_env(
+                network,
+                openshell_core::sandbox_env::WORKLOAD_CONTROL_SOCKETS
+            ),
+            Some("[\"/run/openshell-workloads/ravn/control.sock\"]")
+        );
+        assert!(
+            sandbox_to_k8s_spec(Some(&spec), &SandboxPodParams::default())
+                .unwrap_err()
+                .contains("localhost")
+        );
+    }
+
+    #[test]
+    fn workload_config_rejects_privilege_and_control_overrides() {
+        let valid = serde_json::json!({"name": "ravn", "image": "ravn:test", "command": ["ravn"]});
+        for bad in [
+            serde_json::json!({"name": "agent"}),
+            serde_json::json!({"name": "openshell-network"}),
+            serde_json::json!({"command": []}),
+            serde_json::json!({"security_context": {"privileged": true}}),
+            serde_json::json!({"environment": {"OPENSHELL_POD_WORKLOAD": "0"}}),
+            serde_json::json!({"volume_mounts": [{"name": "unknown", "mount_path": "/tmp/config"}]}),
+        ] {
+            let mut workload = valid.clone();
+            workload
+                .as_object_mut()
+                .unwrap()
+                .extend(bad.as_object().unwrap().clone());
+            let template = SandboxTemplate {
+                driver_config: Some(json_struct(
+                    serde_json::json!({"containers": {"workloads": [workload]}}),
+                )),
+                ..Default::default()
+            };
+            assert!(KubernetesSandboxDriverConfig::from_template(&template).is_err());
+        }
+    }
+
+    #[test]
     fn driver_config_pvc_subpath_mounts_render_in_pod_template() {
         let template = SandboxTemplate {
             driver_config: Some(json_struct(serde_json::json!({
@@ -5731,10 +6061,20 @@ mod tests {
         assert_eq!(config.volumes.len(), 1);
         assert_eq!(config.volumes[0].name, "user-data");
         assert_eq!(
-            config.volumes[0].persistent_volume_claim.claim_name,
+            config.volumes[0]
+                .persistent_volume_claim
+                .as_ref()
+                .unwrap()
+                .claim_name,
             "pvc-user-data"
         );
-        assert!(!config.volumes[0].persistent_volume_claim.read_only);
+        assert!(
+            !config.volumes[0]
+                .persistent_volume_claim
+                .as_ref()
+                .unwrap()
+                .read_only
+        );
         assert_eq!(config.containers.agent.volume_mounts.len(), 3);
         assert!(
             config
@@ -5817,7 +6157,11 @@ mod tests {
             .expect("DNS-1123 subdomain PVC names should validate");
 
         assert_eq!(
-            config.volumes[0].persistent_volume_claim.claim_name,
+            config.volumes[0]
+                .persistent_volume_claim
+                .as_ref()
+                .unwrap()
+                .claim_name,
             "pvc.user-data.123"
         );
     }

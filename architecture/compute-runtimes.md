@@ -590,3 +590,20 @@ namespace.
 
 When runtime infrastructure changes, validate the relevant sandbox e2e path and
 update the matching driver README if a maintainer-facing constraint changes.
+
+## Kubernetes peer workloads
+
+The Kubernetes driver accepts additional regular workload containers through its
+local typed driver configuration. All workloads share the pod network namespace
+and sandbox policy. The network supervisor owns gateway credentials; each
+process supervisor gets a private control volume and a single-use socket. A
+bootstrap barrier prevents workload execution until every supervisor connects.
+Any required connection loss closes the group. Only the primary process
+supervisor may report canonical lifecycle events or own the gateway SSH relay.
+Binary integrity caches distinguish container filesystem roots so different workload
+images can contain different executables at the same path.
+
+Additional containers use the existing sidecar enforcement topology, with
+non-root process wrappers and pod-level egress rules. The containers themselves
+are peers in `spec.containers`; they are not Kubernetes native sidecars. The
+agent remains the canonical process and public exec target.

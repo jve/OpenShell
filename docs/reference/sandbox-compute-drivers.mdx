@@ -605,6 +605,71 @@ workspace PVC injection for that sandbox. Only the explicit mount paths persist
 through the external PVC; other `/sandbox` paths come from the current sandbox
 image.
 
+## Multiple workload containers
+
+Kubernetes sandboxes can add regular peer containers with
+`driver_config.kubernetes.containers.workloads`. These are entries in
+`spec.containers`, not restartable init containers. Each runs its own process
+supervisor and shares the pod network namespace, including `127.0.0.1` and
+`localhost`, with the agent and the other workloads. Assign different listening
+ports to each process. The network namespace remains subject to OpenShell's
+network policy; do not enable host networking or exempt workload UIDs.
+
+This requires `supervisor.topology: sidecar`, which describes the arrangement of
+OpenShell's network supervisor, not the role of the application containers.
+The existing sidecar topology's enforcement contract applies: Kubernetes supplies
+non-root identities and drops capabilities, each process supervisor applies
+Landlock/seccomp where supported, and the network supervisor enforces egress.
+This does not introduce separate policies or identities for each workload.
+
+Example driver configuration (requires images containing the specified commands):
+
+```json
+{
+  "kubernetes": {
+    "volumes": [{"name": "mesh-ipc", "empty_dir": {}}],
+    "containers": {
+      "agent": {
+        "volume_mounts": [{"name": "mesh-ipc", "mount_path": "/tmp/niuu-mesh", "read_only": false}]
+      },
+      "workloads": [{
+        "name": "ravn-reviewer",
+        "image": "your-registry/ravn:your-version",
+        "command": ["python3", "-m", "ravn", "daemon", "--config", "/sandbox/reviewer.yaml"],
+        "environment": {"MESH_PEER": "tcp://127.0.0.1:7480"},
+        "resources": {"requests": {"cpu": "100m"}, "limits": {"memory": "512Mi"}},
+        "volume_mounts": [{"name": "mesh-ipc", "mount_path": "/tmp/niuu-mesh", "read_only": false}]
+      }]
+    }
+  }
+}
+```
+
+Provide configuration before workloads need it, for example on a pre-provisioned
+workspace PVC. Do not wait for workload readiness before supplying files needed
+to become ready. When OpenShell injects its default workspace, all workloads
+mount it at `/sandbox`; explicit PVC configurations require explicit mounts for
+each workload. `empty_dir: {}` creates shared ephemeral storage and is mutually
+exclusive with `persistent_volume_claim` on a volume.
+
+Each workload requires a unique non-reserved name (at most 40 characters), an
+image, and an explicit command array. Up to 16 additional workloads are accepted.
+Optional fields are `environment`, `resources`, `volume_mounts`, and
+`readiness_port`. The latter adds a Kubernetes TCP readiness probe and requires
+a listener reachable through the pod IP, not only loopback. The driver owns
+security contexts and control mounts; arbitrary PodSpec fields and reserved
+`OPENSHELL_` environment variables are rejected. Environment values are for
+non-secret configuration; do not embed credentials in driver configuration.
+
+Every workload receives policy and provider updates through its own private,
+single-use bootstrap socket. No workload starts until all supervisors have
+connected; bootstrap fails closed if a participant does not connect within five
+minutes. Gateway authentication material remains with the network supervisor.
+All workloads are required: loss of any control connection terminates the group.
+The agent remains the canonical main process and SSH/exec target; this feature
+does not add per-container exec, independent restart, or automatic collection of
+additional container stdout through the sandbox logs API.
+
 ## Sandbox User Identity
 
 The policy can set `process.run_as_user` and `process.run_as_group`

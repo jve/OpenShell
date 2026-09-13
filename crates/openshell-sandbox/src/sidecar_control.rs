@@ -18,7 +18,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::net::UnixListener;
 use tokio::net::unix::OwnedWriteHalf;
 use tokio::sync::{Mutex, broadcast, mpsc};
-use tracing::{debug, info, warn};
+use tracing::{debug, warn};
 
 #[derive(Debug, Clone)]
 pub struct BootstrapData {
@@ -321,52 +321,33 @@ impl TryFrom<WireServerMessage> for ControlUpdate {
     }
 }
 
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+#[cfg(test)]
 pub fn spawn_server(
     path: &Path,
     bootstrap: BootstrapData,
     expected_peer: ExpectedPeer,
 ) -> Result<ServerHandle> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .into_diagnostic()
-            .wrap_err_with(|| {
-                format!(
-                    "failed to create sidecar control socket dir {}",
-                    parent.display()
-                )
-            })?;
-    }
-    match std::fs::remove_file(path) {
-        Ok(()) => {}
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-        Err(err) => {
-            return Err(err).into_diagnostic().wrap_err_with(|| {
-                format!(
-                    "failed to remove stale sidecar control socket {}",
-                    path.display()
-                )
-            });
-        }
-    }
+    spawn_pod_server(path, bootstrap, expected_peer, &[])
+}
 
-    let listener = UnixListener::bind(path)
-        .into_diagnostic()
-        .wrap_err_with(|| format!("failed to bind sidecar control socket {}", path.display()))?;
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o660))
-            .into_diagnostic()
-            .wrap_err_with(|| {
-                format!(
-                    "failed to set permissions on sidecar control socket {}",
-                    path.display()
-                )
-            })?;
+/// Each workload has a private, single-use socket. Release no workload until
+/// every supervisor authenticates and all listeners have been removed. Losing
+/// any required connection closes the group.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub fn spawn_pod_server(
+    primary_path: &Path,
+    bootstrap: BootstrapData,
+    expected_peer: ExpectedPeer,
+    workload_paths: &[PathBuf],
+) -> Result<ServerHandle> {
+    let mut paths = vec![primary_path.to_path_buf()];
+    paths.extend_from_slice(workload_paths);
+    let mut unique = std::collections::HashSet::new();
+    if paths.len() > 17 || paths.iter().any(|p| !unique.insert(p.clone())) {
+        return Err(miette::miette!(
+            "invalid or duplicate workload control sockets"
+        ));
     }
-
     let state = Arc::new(RwLock::new(bootstrap));
     let (updates, _) = broadcast::channel(32);
     let (entrypoint_tx, entrypoint_rx) = mpsc::channel(8);
@@ -374,17 +355,39 @@ pub fn spawn_server(
         state: state.clone(),
         updates: updates.clone(),
     };
-
-    let connection_task = tokio::spawn(accept_authoritative_connection(
-        listener,
-        path.to_path_buf(),
-        expected_peer,
-        state,
-        updates,
-        entrypoint_tx,
-    ));
-    info!(path = %path.display(), "Sidecar control socket listening");
-
+    let barrier = Arc::new(tokio::sync::Barrier::new(paths.len()));
+    let mut connections = tokio::task::JoinSet::new();
+    for (index, path) in paths.into_iter().enumerate() {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).into_diagnostic()?;
+        }
+        match std::fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e).into_diagnostic(),
+        }
+        let listener = UnixListener::bind(&path).into_diagnostic()?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o660))
+                .into_diagnostic()?;
+        }
+        connections.spawn(accept_authoritative_connection(
+            listener,
+            path,
+            expected_peer,
+            state.clone(),
+            updates.clone(),
+            (index == 0).then(|| entrypoint_tx.clone()),
+            barrier.clone(),
+        ));
+    }
+    let connection_task = tokio::spawn(async move {
+        // Dropping JoinSet aborts the remaining connections, including peers
+        // waiting at the bootstrap barrier for a missing or invalid workload.
+        let _ = connections.join_next().await;
+    });
     Ok(ServerHandle {
         publisher,
         entrypoint_rx,
@@ -399,12 +402,16 @@ async fn accept_authoritative_connection(
     expected_peer: ExpectedPeer,
     state: Arc<RwLock<BootstrapData>>,
     updates: broadcast::Sender<WireServerMessage>,
-    entrypoint_tx: mpsc::Sender<EntrypointStarted>,
+    entrypoint_tx: Option<mpsc::Sender<EntrypointStarted>>,
+    barrier: Arc<tokio::sync::Barrier>,
 ) {
-    let stream = match listener.accept().await {
-        Ok((stream, _addr)) => stream,
-        Err(err) => {
-            warn!(error = %err, "Failed to accept authoritative sidecar control connection");
+    let stream = match tokio::time::timeout(Duration::from_mins(5), listener.accept()).await {
+        Ok(Ok((stream, _addr))) => stream,
+        result => {
+            warn!(
+                ?result,
+                "Failed to accept authoritative sidecar control connection"
+            );
             return;
         }
     };
@@ -424,7 +431,15 @@ async fn accept_authoritative_connection(
         );
     }
 
-    if let Err(err) = handle_connection(stream, expected_peer, state, updates, entrypoint_tx).await
+    if let Err(err) = handle_connection(
+        stream,
+        expected_peer,
+        state,
+        updates,
+        entrypoint_tx,
+        barrier,
+    )
+    .await
     {
         warn!(error = %err, "Authoritative sidecar control connection closed");
     }
@@ -436,7 +451,8 @@ async fn handle_connection(
     expected_peer: ExpectedPeer,
     state: Arc<RwLock<BootstrapData>>,
     updates: broadcast::Sender<WireServerMessage>,
-    entrypoint_tx: mpsc::Sender<EntrypointStarted>,
+    entrypoint_tx: Option<mpsc::Sender<EntrypointStarted>>,
+    barrier: Arc<tokio::sync::Barrier>,
 ) -> Result<()> {
     let credentials = stream
         .peer_cred()
@@ -470,16 +486,18 @@ async fn handle_connection(
                     "sidecar bootstrap PID mismatch: peer PID {peer_pid}, claimed PID {supervisor_pid}"
                 ));
             }
-            entrypoint_tx
-                .send(EntrypointStarted {
-                    pid: supervisor_pid,
-                    start_session: false,
-                    instance_id: String::new(),
-                    exit_code: None,
-                    finalized: false,
-                })
-                .await
-                .map_err(|_| miette::miette!("sidecar entrypoint receiver closed"))?;
+            if let Some(entrypoint_tx) = &entrypoint_tx {
+                entrypoint_tx
+                    .send(EntrypointStarted {
+                        pid: supervisor_pid,
+                        start_session: false,
+                        instance_id: String::new(),
+                        exit_code: None,
+                        finalized: false,
+                    })
+                    .await
+                    .map_err(|_| miette::miette!("sidecar entrypoint receiver closed"))?;
+            }
         }
         WireClientMessage::EntrypointStarted { .. }
         | WireClientMessage::MainProcessExited { .. }
@@ -489,6 +507,11 @@ async fn handle_connection(
             ));
         }
     }
+
+    tokio::time::timeout(Duration::from_mins(5), barrier.wait())
+        .await
+        .into_diagnostic()
+        .wrap_err("pod workload bootstrap timed out")?;
 
     // Subscribe before taking the bootstrap snapshot so an update can neither
     // be missed between the snapshot and the live update stream nor omitted
@@ -506,6 +529,7 @@ async fn handle_connection(
                 let Some(line) = line.into_diagnostic()? else {
                     return Ok(());
                 };
+                let entrypoint_tx = entrypoint_tx.as_ref().ok_or_else(|| miette::miette!("additional workload cannot publish primary lifecycle events"))?;
                 match decode_client_message(&line)? {
                     WireClientMessage::BootstrapRequest { .. } => {
                         debug!("Ignoring duplicate sidecar bootstrap request");
@@ -817,6 +841,74 @@ mod tests {
             .to_string();
         assert_eq!(update_error, "sidecar policy update failed validation");
         assert!(!update_error.contains("latest"));
+    }
+
+    #[tokio::test]
+    async fn pod_bootstrap_waits_for_all_peers_and_closes_on_peer_loss() {
+        let dir = tempfile::tempdir().unwrap();
+        let primary = dir.path().join("primary.sock");
+        let peer = dir.path().join("peer.sock");
+        let bootstrap = BootstrapData {
+            policy_proto: SandboxPolicy::default(),
+            provider_env_revision: 0,
+            provider_env_generation: 0,
+            provider_child_env: HashMap::new(),
+            agent_proposals_enabled: false,
+            proxy_ca_cert_path: None,
+            proxy_ca_bundle_path: None,
+        };
+        let server = spawn_pod_server(
+            &primary,
+            bootstrap,
+            current_peer(),
+            std::slice::from_ref(&peer),
+        )
+        .unwrap();
+        let publisher = server.publisher();
+        let primary_path = primary.clone();
+        let first = tokio::spawn(async move {
+            connect_process_client(&primary_path, Duration::from_secs(2)).await
+        });
+        // Observe removal of the accepted listener rather than sleeping a fixed interval.
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while primary.exists() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(
+            !first.is_finished(),
+            "primary must not run before peer authentication"
+        );
+        let (_, mut second) = connect_process_client(&peer, Duration::from_secs(2))
+            .await
+            .unwrap();
+        let (_, mut first) = first.await.unwrap().unwrap();
+        assert!(!peer.exists());
+        publisher.publish_provider_env(
+            1,
+            HashMap::from([("TEST_PROVIDER".into(), "updated".into())]),
+        );
+        for connection in [&mut first, &mut second] {
+            let update = tokio::time::timeout(Duration::from_secs(2), connection.updates.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(matches!(
+                update,
+                ControlUpdate::ProviderEnv { revision: 1, .. }
+            ));
+        }
+        // Additional workloads cannot claim the canonical process lifecycle.
+        send_entrypoint_started(&second.writer, 123, "not-primary".into())
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), &mut first.closed)
+            .await
+            .unwrap()
+            .unwrap();
+        server.connection_task.await.unwrap();
     }
 
     #[tokio::test]
