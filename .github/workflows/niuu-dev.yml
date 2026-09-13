@@ -71,7 +71,8 @@ jobs:
           kind load docker-image --name niuu-acceptance \
             "${IMAGE_REGISTRY}/gateway:${IMAGE_TAG}" \
             "${IMAGE_REGISTRY}/supervisor:${IMAGE_TAG}"
-          kind get kubeconfig --name niuu-acceptance > kubeconfig
+          kind get kubeconfig --name niuu-acceptance > "${RUNNER_TEMP}/acceptance-kubeconfig"
+          cp "${RUNNER_TEMP}/acceptance-kubeconfig" kubeconfig
       - name: Verify multi-container localhost and egress enforcement
         env:
           OPENSHELL_BIN: ${{ github.workspace }}/target/debug/openshell
