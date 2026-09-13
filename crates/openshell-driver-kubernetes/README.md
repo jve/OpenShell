@@ -269,3 +269,14 @@ networking, assigns private control volumes, and keeps credentials out of the
 workload containers. The network supervisor authenticates all process wrappers
 before releasing any workload. All workloads share the sandbox policy and
 lifecycle; only `agent` is the canonical process and SSH target.
+
+### Niuu fork builds
+
+The fork's `Niuu Dev Images` workflow builds amd64 and arm64 gateway and static
+supervisor images on GitHub-hosted runners. Each architecture must pass the
+regular-workload Kubernetes acceptance test before publication. The final job
+publishes images at `ghcr.io/jve/openshell/{gateway,supervisor}:<commit>` and the
+matching chart at `oci://ghcr.io/jve/openshell/helm-chart`, version
+`0.0.0-niuu.sha<commit>`. Pin the chart and both images to the same commit when
+rolling out through GitOps. Upstream release workflows require NVIDIA runners
+and publish to NVIDIA's registry; they are not the fork publication path.
