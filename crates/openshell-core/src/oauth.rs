@@ -231,32 +231,14 @@ fn is_kubernetes_service_host(host: &str) -> bool {
 }
 
 pub fn validate_access_token(token: &str) -> Result<()> {
-    if token.is_empty() || !is_token68(token) {
+    // Provider access tokens are opaque, not necessarily token68 (Linear uses colons).
+    // Keep whitespace, controls and non-ASCII bytes out of injected HTTP headers.
+    if token.is_empty() || !token.bytes().all(|byte| byte.is_ascii_graphic()) {
         return Err(miette::miette!(
             "token grant returned a malformed access token"
         ));
     }
     Ok(())
-}
-
-fn is_token68(token: &str) -> bool {
-    let mut padding_started = false;
-    let mut saw_value = false;
-    for byte in token.bytes() {
-        if byte == b'=' {
-            padding_started = true;
-            continue;
-        }
-        if padding_started || !is_token68_value_byte(byte) {
-            return false;
-        }
-        saw_value = true;
-    }
-    saw_value
-}
-
-fn is_token68_value_byte(byte: u8) -> bool {
-    byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~' | b'+' | b'/')
 }
 
 fn failure_message(status: reqwest::StatusCode, body: &str) -> String {
@@ -700,26 +682,29 @@ mod tests {
     }
 
     #[test]
-    fn validate_access_token_accepts_token68_values() {
+    fn validate_access_token_accepts_opaque_header_safe_values() {
         for token in [
             "abcXYZ123-._~+/",
             "eyJhbGciOiJSUzI1NiJ9.payload.sig",
             "token==",
+            "linear:opaque:access-token",
+            "token=continued",
+            "opaque!#$%&*",
         ] {
             validate_access_token(token).expect("should be accepted");
         }
     }
 
     #[test]
-    fn validate_access_token_rejects_non_token68_values() {
+    fn validate_access_token_rejects_unsafe_header_values() {
         for token in [
             "",
             "token with spaces",
             "token\r\nX-Injected: yes",
             "token\u{7f}",
             "tokené",
-            "token=continued",
-            "==",
+            "token\tvalue",
+            "token\0value",
         ] {
             let err = validate_access_token(token).expect_err("should be rejected");
             assert_eq!(

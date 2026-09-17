@@ -786,6 +786,21 @@ mod tests {
     }
 
     #[test]
+    fn inject_token_grant_header_preserves_opaque_colon_token() {
+        let raw = b"GET /mcp/readonly HTTP/1.1\r\nHost: mcp.example.com\r\n\r\n";
+        let rewritten = inject_token_grant_header(
+            raw,
+            &credential("bearer", "Authorization"),
+            "linear:opaque:access-token",
+        )
+        .expect("opaque token should be injected unchanged");
+        assert_eq!(
+            rewritten,
+            b"GET /mcp/readonly HTTP/1.1\r\nHost: mcp.example.com\r\nAuthorization: Bearer linear:opaque:access-token\r\n\r\n"
+        );
+    }
+
+    #[test]
     fn inject_token_grant_header_rejects_malformed_access_token() {
         let raw = b"GET /v1 HTTP/1.1\r\nHost: api.example.com\r\n\r\n";
 

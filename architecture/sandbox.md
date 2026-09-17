@@ -109,6 +109,10 @@ generation-pinned authorization form the transparent TCP security boundary.
 Docker and Podman do not currently advertise usable IPv6 egress for this
 substrate, so AAAA queries return NOERROR/NODATA and IPv6 DNS remains fenced.
 
+Dynamic token grants preserve opaque provider access tokens, including punctuation
+such as colons. Before HTTP header injection, shared validation rejects empty
+values, whitespace, control characters, and non-ASCII bytes.
+
 Provider credential placeholders are resolved through the live provider state
 for each HTTP request, after destination and L7 policy admission. A static
 credential resolves only when the request host, port, and path match an endpoint
