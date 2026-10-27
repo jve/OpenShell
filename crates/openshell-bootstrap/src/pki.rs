@@ -3,7 +3,9 @@
 
 use crate::jwt::{JwtKeyMaterial, generate_jwt_key};
 use miette::{IntoDiagnostic, Result, WrapErr};
-use rcgen::{BasicConstraints, CertificateParams, DnType, Ia5String, IsCa, KeyPair, SanType};
+use rcgen::{
+    BasicConstraints, CertificateParams, DnType, IsCa, KeyUsagePurpose, SanType, string::Ia5String,
+};
 use std::net::IpAddr;
 
 /// All PEM-encoded materials produced by [`generate_pki`].
@@ -52,13 +54,14 @@ pub const DEFAULT_SERVER_SANS: &[&str] = &[
 /// are ephemeral to the cluster's lifetime.
 pub fn generate_pki(extra_sans: &[String]) -> Result<PkiBundle> {
     // --- CA ---
-    let ca_key = KeyPair::generate()
+    let ca_key = openshell_crypto::pki::generate_keypair()
         .into_diagnostic()
         .wrap_err("failed to generate CA key")?;
     let mut ca_params = CertificateParams::new(Vec::<String>::new())
         .into_diagnostic()
         .wrap_err("failed to create CA params")?;
     ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+    ca_params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
     ca_params
         .distinguished_name
         .push(DnType::OrganizationName, "openshell");
@@ -66,13 +69,12 @@ pub fn generate_pki(extra_sans: &[String]) -> Result<PkiBundle> {
         .distinguished_name
         .push(DnType::CommonName, "openshell-ca");
 
-    let ca_cert = ca_params
-        .self_signed(&ca_key)
+    let ca_cert = openshell_crypto::pki::self_signed(ca_params, &ca_key)
         .into_diagnostic()
         .wrap_err("failed to self-sign CA certificate")?;
 
     // --- Server cert ---
-    let server_key = KeyPair::generate()
+    let server_key = openshell_crypto::pki::generate_keypair()
         .into_diagnostic()
         .wrap_err("failed to generate server key")?;
     let server_sans = build_server_sans(extra_sans);
@@ -80,22 +82,24 @@ pub fn generate_pki(extra_sans: &[String]) -> Result<PkiBundle> {
         .into_diagnostic()
         .wrap_err("failed to create server cert params")?;
     server_params.subject_alt_names = server_sans;
+    server_params.use_authority_key_identifier_extension = true;
     server_params
         .distinguished_name
         .push(DnType::CommonName, "openshell-server");
 
-    let server_cert = server_params
-        .signed_by(&server_key, &ca_cert, &ca_key)
-        .into_diagnostic()
-        .wrap_err("failed to sign server certificate")?;
+    let server_cert =
+        openshell_crypto::pki::signed_by(server_params, &server_key, &ca_cert, &ca_key)
+            .into_diagnostic()
+            .wrap_err("failed to sign server certificate")?;
 
-    // --- Client cert (shared by CLI and sandbox pods) ---
-    let client_key = KeyPair::generate()
+    // --- User client cert (CLI only; sandboxes use bearer identity) ---
+    let client_key = openshell_crypto::pki::generate_keypair()
         .into_diagnostic()
         .wrap_err("failed to generate client key")?;
     let mut client_params = CertificateParams::new(Vec::<String>::new())
         .into_diagnostic()
         .wrap_err("failed to create client cert params")?;
+    client_params.use_authority_key_identifier_extension = true;
     client_params
         .distinguished_name
         .push(DnType::CommonName, "openshell-client");
@@ -103,10 +107,10 @@ pub fn generate_pki(extra_sans: &[String]) -> Result<PkiBundle> {
         .distinguished_name
         .push(DnType::OrganizationalUnitName, "openshell-user");
 
-    let client_cert = client_params
-        .signed_by(&client_key, &ca_cert, &ca_key)
-        .into_diagnostic()
-        .wrap_err("failed to sign client certificate")?;
+    let client_cert =
+        openshell_crypto::pki::signed_by(client_params, &client_key, &ca_cert, &ca_key)
+            .into_diagnostic()
+            .wrap_err("failed to sign client certificate")?;
 
     // --- JWT signing key (Ed25519, used to mint per-sandbox identity tokens) ---
     let JwtKeyMaterial {
@@ -117,11 +121,11 @@ pub fn generate_pki(extra_sans: &[String]) -> Result<PkiBundle> {
 
     Ok(PkiBundle {
         ca_cert_pem: ca_cert.pem(),
-        ca_key_pem: ca_key.serialize_pem(),
+        ca_key_pem: ca_key.serialize_pem().into_diagnostic()?,
         server_cert_pem: server_cert.pem(),
-        server_key_pem: server_key.serialize_pem(),
+        server_key_pem: server_key.serialize_pem().into_diagnostic()?,
         client_cert_pem: client_cert.pem(),
-        client_key_pem: client_key.serialize_pem(),
+        client_key_pem: client_key.serialize_pem().into_diagnostic()?,
         jwt_signing_key_pem,
         jwt_public_key_pem,
         jwt_key_id,
@@ -176,6 +180,58 @@ mod tests {
     fn generate_pki_no_extra_sans() {
         let bundle = generate_pki(&[]).expect("generate_pki failed");
         assert!(bundle.server_cert_pem.contains("BEGIN CERTIFICATE"));
+    }
+
+    #[test]
+    fn generate_pki_emits_strict_verifier_extensions() {
+        use x509_parser::pem::parse_x509_pem;
+        use x509_parser::prelude::{FromDer, ParsedExtension, X509Certificate};
+
+        let bundle = generate_pki(&[]).expect("generate_pki failed");
+        let parse = |pem: &str| -> Vec<u8> {
+            parse_x509_pem(pem.as_bytes())
+                .expect("valid PEM")
+                .1
+                .contents
+        };
+        let ca_der = parse(&bundle.ca_cert_pem);
+        let ca = X509Certificate::from_der(&ca_der).expect("valid CA cert").1;
+        let ca_key_usage = ca
+            .key_usage()
+            .expect("readable key usage")
+            .expect("CA has a key usage extension");
+        assert!(ca_key_usage.value.key_cert_sign());
+        assert!(ca_key_usage.value.crl_sign());
+        let ca_ski = ca
+            .get_extension_unique(&x509_parser::oid_registry::OID_X509_EXT_SUBJECT_KEY_IDENTIFIER)
+            .expect("readable SKI")
+            .expect("CA has a Subject Key Identifier");
+
+        for (name, pem) in [
+            ("server", &bundle.server_cert_pem),
+            ("client", &bundle.client_cert_pem),
+        ] {
+            let der = parse(pem);
+            let cert = X509Certificate::from_der(&der).expect("valid leaf cert").1;
+            let aki = cert
+                .get_extension_unique(
+                    &x509_parser::oid_registry::OID_X509_EXT_AUTHORITY_KEY_IDENTIFIER,
+                )
+                .expect("readable AKI")
+                .unwrap_or_else(|| panic!("{name} cert has no Authority Key Identifier"));
+            let (
+                ParsedExtension::AuthorityKeyIdentifier(aki),
+                ParsedExtension::SubjectKeyIdentifier(ski),
+            ) = (aki.parsed_extension(), ca_ski.parsed_extension())
+            else {
+                panic!("{name}: unexpected extension shapes");
+            };
+            let key_id = aki
+                .key_identifier
+                .as_ref()
+                .unwrap_or_else(|| panic!("{name} AKI has no key identifier"));
+            assert_eq!(key_id.0, ski.0, "{name} AKI must match the CA SKI");
+        }
     }
 
     #[test]

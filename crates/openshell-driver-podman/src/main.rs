@@ -18,6 +18,13 @@ use openshell_driver_podman::{ComputeDriverService, PodmanComputeConfig, PodmanC
 #[command(name = "openshell-driver-podman")]
 #[command(version = VERSION)]
 struct Args {
+    /// Operator-owned JSON policy; omitted means driver config disabled and labels required.
+    #[arg(
+        long,
+        env = "OPENSHELL_DRIVER_ADMISSION_CONFIG_JSON",
+        default_value = "{}"
+    )]
+    admission_config_json: openshell_core::resource_admission::DriverAdmissionConfig,
     /// Public compute-driver Unix socket used by an external gateway.
     #[arg(long, env = "OPENSHELL_COMPUTE_DRIVER_SOCKET")]
     bind_socket: Option<PathBuf>,
@@ -34,6 +41,18 @@ struct Args {
 
     #[arg(long, env = "OPENSHELL_OTLP_ENDPOINT")]
     otlp_endpoint: Option<String>,
+
+    /// OTLP/gRPC collector endpoint for supervisor OCSF event export.
+    #[arg(long, env = "OPENSHELL_OTLP_OCSF_ENDPOINT")]
+    otlp_ocsf_endpoint: Option<String>,
+
+    /// OCSF schema version that supervisors downgrade exported events to.
+    #[arg(
+        long,
+        env = "OPENSHELL_OTLP_OCSF_SCHEMA_VERSION",
+        requires = "otlp_ocsf_endpoint"
+    )]
+    otlp_ocsf_schema_version: Option<String>,
 
     #[arg(long, env = "OPENSHELL_GATEWAY_NAME")]
     gateway_name: Option<String>,
@@ -66,9 +85,10 @@ struct Args {
     )]
     gateway_port: u16,
 
-    /// Host gateway IP used for sandbox host aliases.
+    /// Trusted supervisor-side destination used for sandbox host aliases.
     ///
-    /// Empty uses Podman's `host-gateway` resolver.
+    /// Empty uses loopback on native Linux and the gvproxy host address on
+    /// macOS Podman Machine.
     #[arg(long, env = "OPENSHELL_PODMAN_HOST_GATEWAY_IP")]
     host_gateway_ip: Option<String>,
 
@@ -79,7 +99,7 @@ struct Args {
     )]
     sandbox_ssh_socket_path: String,
 
-    /// Podman bridge network name.
+    /// Podman network name retained for driver-managed resources.
     #[arg(long, env = "OPENSHELL_NETWORK_NAME", default_value = DEFAULT_NETWORK_NAME)]
     network_name: String,
 
@@ -101,19 +121,23 @@ struct Args {
     )]
     health_check_interval_secs: Option<NonZeroU64>,
 
-    /// OCI image containing the openshell-sandbox supervisor binary.
-    #[arg(long, env = "OPENSHELL_SUPERVISOR_IMAGE")]
+    /// OCI image containing the `openshell-sandbox` runtime binary.
+    #[arg(long, env = openshell_core::config::SANDBOX_RUNTIME_IMAGE_ENV)]
+    sandbox_runtime_image: Option<String>,
+
+    /// OCI image containing the `openshell-supervisor` control binary.
+    #[arg(long, env = openshell_core::config::SUPERVISOR_IMAGE_ENV)]
     supervisor_image: Option<String>,
 
-    /// Host path to the CA certificate for sandbox mTLS.
+    /// Host path to the CA certificate for supervisor-to-gateway TLS.
     #[arg(long, env = "OPENSHELL_PODMAN_TLS_CA")]
     podman_tls_ca: Option<PathBuf>,
 
-    /// Host path to the client certificate for sandbox mTLS.
+    /// Deprecated; client certificates are rejected.
     #[arg(long, env = "OPENSHELL_PODMAN_TLS_CERT")]
     podman_tls_cert: Option<PathBuf>,
 
-    /// Host path to the client private key for sandbox mTLS.
+    /// Deprecated; client private keys are rejected.
     #[arg(long, env = "OPENSHELL_PODMAN_TLS_KEY")]
     podman_tls_key: Option<PathBuf>,
 
@@ -162,6 +186,14 @@ struct Args {
     #[arg(long, env = "OPENSHELL_SANDBOX_PROXY_CA_BUNDLE")]
     sandbox_proxy_ca_bundle: Option<String>,
 
+    /// Path (on the gateway host) to a PEM CA bundle trusted for direct
+    /// (non-proxied), policy-inspected HTTPS egress to destinations signed by
+    /// a private CA. Unlike `--sandbox-proxy-ca-bundle`, this applies
+    /// regardless of whether a corporate proxy is configured. Bind-mounted
+    /// read-only into the supervisor container.
+    #[arg(long, env = "OPENSHELL_SANDBOX_ADDITIONAL_CA_BUNDLE")]
+    sandbox_additional_ca_bundle: Option<String>,
+
     /// User namespace mode for sandbox containers (e.g. `auto`).
     /// When unset, containers use the default user namespace.
     #[arg(long, env = "OPENSHELL_PODMAN_USERNS")]
@@ -196,10 +228,20 @@ async fn main() -> Result<()> {
     );
 
     let driver = PodmanComputeDriver::new(PodmanComputeConfig {
+        allow_driver_config: args.admission_config_json.allow_driver_config,
+        resource_admission: args.admission_config_json.resource_admission.clone(),
         socket_path: args.podman_socket,
         default_image: args.sandbox_image.unwrap_or_default(),
         image_pull_policy: args.sandbox_image_pull_policy,
         grpc_endpoint: args.grpc_endpoint.unwrap_or_default(),
+        supervisor_otlp_endpoint: args.otlp_endpoint.clone(),
+        supervisor_gateway_name: args.gateway_name.clone(),
+        supervisor_ocsf_export: args.otlp_ocsf_endpoint.clone().map(|endpoint| {
+            openshell_core::sandbox_env::OcsfOtlpExport {
+                endpoint,
+                schema_version: args.otlp_ocsf_schema_version.clone(),
+            }
+        }),
         gateway_port: args.gateway_port,
         host_gateway_ip: args
             .host_gateway_ip
@@ -207,6 +249,9 @@ async fn main() -> Result<()> {
         ssh_socket_path: args.sandbox_ssh_socket_path,
         network_name: args.network_name,
         stop_timeout_secs: args.stop_timeout,
+        sandbox_runtime_image: args
+            .sandbox_runtime_image
+            .unwrap_or_else(openshell_core::config::default_sandbox_runtime_image),
         supervisor_image: args
             .supervisor_image
             .unwrap_or_else(openshell_core::config::default_supervisor_image),
@@ -223,6 +268,7 @@ async fn main() -> Result<()> {
         proxy_auth_allow_insecure: args.sandbox_proxy_auth_allow_insecure,
         proxy_connect_by_hostname: args.sandbox_proxy_connect_by_hostname,
         proxy_ca_bundle: args.sandbox_proxy_ca_bundle,
+        additional_ca_bundle: args.sandbox_additional_ca_bundle,
         userns: args.userns,
         uidmap: args.uidmap,
         gidmap: args.gidmap,

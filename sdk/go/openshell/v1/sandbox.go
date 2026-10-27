@@ -24,6 +24,39 @@ type SandboxStatus = types.SandboxStatus
 // SandboxCondition describes an observed condition of a sandbox.
 type SandboxCondition = types.SandboxCondition
 
+// EndpointStatus holds a configured tool endpoint and its last accepted network result.
+type EndpointStatus = types.EndpointStatus
+
+// EndpointResult classifies the last accepted network result for a tool endpoint.
+type EndpointResult = types.EndpointResult
+
+// EndpointResult values describe passive observations of actual traffic.
+const (
+	EndpointUnspecified           = types.EndpointUnspecified
+	EndpointNoObservedExchange    = types.EndpointNoObservedExchange
+	EndpointHTTPResponseReceived  = types.EndpointHTTPResponseReceived
+	EndpointPolicyDenied          = types.EndpointPolicyDenied
+	EndpointCredentialUnavailable = types.EndpointCredentialUnavailable
+	EndpointTLSFailed             = types.EndpointTLSFailed
+	EndpointTransportFailed       = types.EndpointTransportFailed
+	EndpointUpstreamRejected      = types.EndpointUpstreamRejected
+)
+
+// EndpointFailure explains a failed endpoint result with bounded values.
+type EndpointFailure = types.EndpointFailure
+
+// TokenGrantFailureObservation records a refused grant's destination and cause.
+type TokenGrantFailureObservation = types.TokenGrantFailureObservation
+
+// EndpointFailureDomain names the subsystem that explains an endpoint failure.
+type EndpointFailureDomain = types.EndpointFailureDomain
+
+// EndpointFailureDomain values select the closed set that Code and Stage come from.
+const (
+	EndpointFailureDomainUnspecified = types.EndpointFailureDomainUnspecified
+	EndpointFailureDomainTokenGrant  = types.EndpointFailureDomainTokenGrant
+)
+
 // AttachProviderResult holds the result of attaching a provider to a sandbox.
 type AttachProviderResult = types.AttachProviderResult
 
@@ -53,16 +86,19 @@ var WithLogMinLevel = types.WithLogMinLevel
 
 // SandboxInterface defines lifecycle operations on sandboxes.
 type SandboxInterface interface {
-	Create(ctx context.Context, workspace, name string, spec *SandboxSpec, labels map[string]string, opts ...CreateOptions) (*Sandbox, error)
+	Create(ctx context.Context, workspace, name string, spec *SandboxSpec, opts ...CreateOption) (*Sandbox, error)
 	Get(ctx context.Context, workspace, name string) (*Sandbox, error)
 	List(workspace string, opts ...ListOptions) (*Pager[*Sandbox], error)
 	ListAll(ctx context.Context, workspace string, opts ...ListOptions) ([]*Sandbox, error)
 	Stop(ctx context.Context, workspace, name string) (*Sandbox, error)
 	Start(ctx context.Context, workspace, name string) (*Sandbox, error)
-	Delete(ctx context.Context, workspace, name string) error
+	Delete(ctx context.Context, workspace, name string, opts ...DeleteOptions) (*DeletionResult, error)
 	AttachProvider(ctx context.Context, workspace, sandboxName, providerName string, expectedResourceVersion uint64) (*AttachProviderResult, error)
 	DetachProvider(ctx context.Context, workspace, sandboxName, providerName string, expectedResourceVersion uint64) (*DetachProviderResult, error)
-	ListProviders(ctx context.Context, workspace, sandboxName string) ([]*Provider, error)
+	// ListProviders returns a lazy pager over providers attached to a sandbox.
+	ListProviders(workspace, sandboxName string, opts ...ListOptions) (*Pager[*Provider], error)
+	// ListAllProviders exhausts ListProviders for callers that need every provider.
+	ListAllProviders(ctx context.Context, workspace, sandboxName string, opts ...ListOptions) ([]*Provider, error)
 	WaitReady(ctx context.Context, workspace, name string, opts ...WaitOptions) (*Sandbox, error)
 	WaitStopped(ctx context.Context, workspace, name string, opts ...WaitOptions) (*Sandbox, error)
 	Watch(ctx context.Context, workspace, name string, opts ...WatchOptions) (WatchInterface[*Sandbox], error)
@@ -72,5 +108,5 @@ type SandboxInterface interface {
 // SandboxTemplateCreateInterface defines additive sandbox creation from named
 // workload templates without widening SandboxInterface.
 type SandboxTemplateCreateInterface interface {
-	CreateFromTemplate(ctx context.Context, workspace, name, templateName string, spec *SandboxSpec, labels map[string]string, opts ...CreateOptions) (*Sandbox, error)
+	CreateFromTemplate(ctx context.Context, workspace, name, templateName string, spec *SandboxSpec, opts ...CreateOption) (*Sandbox, error)
 }

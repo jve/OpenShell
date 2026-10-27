@@ -9,8 +9,7 @@ maintaining the existing build-only Windows MSVC lane.
 |---|---|
 | `tasks/windows.toml` | Mise task definitions for `windows:*`. |
 | `tasks/scripts/windows-msvc.ps1` | Visual Studio environment discovery, rustup target setup, Cargo invocation, logs, artifact report. |
-| `.github/workflows/windows-msvc.yml` | PR/merge-queue lint and test plus main/manual cache seeding and dependent binary builds on native x64 and ARM64 runners. |
-| `architecture/windows-msvc-build.md` | Human-readable design contract. |
+| `.github/workflows/windows-msvc.yml` | Opt-in PR lint and test plus `windows` branch cache seeding and dependent binary builds on native x64 and ARM64 runners. |
 
 ## Commands
 
@@ -69,7 +68,7 @@ For ARM64, verify the Visual Studio instance contains the ARM64 MSVC tools,
 ARM64 Spectre-mitigated libraries, Clang tools, CMake tools, and a Windows SDK.
 Clang supplies host-native `libclang.dll` for `bindgen` and `clang-cl.exe` for
 ARM64 crypto dependencies such as `aws-lc-sys`. Native and
-x64-to-ARM64 builds use the official prebuilt Z3 4.16.0 static library for the
+x64-to-ARM64 builds use the official prebuilt Z3 5.1.0 static library for the
 target architecture. An x64-to-ARM64 check/build discovers and adds host-native
 Ninja to `PATH`, while the crypto crates select `clang-cl`. Use a short
 `CARGO_TARGET_DIR` if Windows path-length limits are reached.
@@ -112,16 +111,20 @@ top-level workspace targets for check/test:
 --exclude openshell-driver-vault
 --exclude openshell-driver-vm
 --exclude openshell-sandbox
---exclude openshell-supervisor-network
---exclude openshell-supervisor-process
 --exclude openshell-vfio
 ```
 
 The gateway keeps platform configuration and unsupported-operation contracts
-without depending on the Docker, Kubernetes, Podman, sandbox supervisor,
-process supervisor, VM, or VFIO runtime crates. The Kubernetes Secrets and
-Vault libraries still compile as gateway dependencies; only their standalone
-Unix-socket binaries and package-level tests are excluded as top-level targets.
+without depending on the Docker, Kubernetes, Podman, sandbox runtime,
+standalone supervisor, supervisor process runtime, VM, or VFIO crates. The MXC
+driver does depend on the cross-platform supervisor network library for its host
+egress proxy. The Kubernetes Secrets and Vault libraries still compile as
+gateway dependencies; only their standalone Unix-socket binaries and
+package-level tests are excluded as top-level targets.
+
+The supervisor and supervisor-process packages now participate as top-level
+native check/test targets. Their portable session, attachment, and TCP readiness
+coverage does not enable a Windows isolation runtime.
 
 ## Common Errors
 

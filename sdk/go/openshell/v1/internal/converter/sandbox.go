@@ -5,6 +5,7 @@ package converter
 
 import (
 	"fmt"
+	"slices"
 	"time"
 
 	"github.com/NVIDIA/OpenShell/sdk/go/openshell/v1/types"
@@ -20,17 +21,17 @@ func SandboxFromProto(s *pb.Sandbox) *types.Sandbox {
 		return nil
 	}
 
-	result := &types.Sandbox{}
+	result := &types.Sandbox{HostKeyFingerprint: s.GetHostKeyFingerprint()}
 
 	if m := s.GetMetadata(); m != nil {
 		result.ID = m.GetId()
 		result.Name = m.GetName()
-		result.CreatedAt = TimeFromMillis(m.GetCreatedAtMs())
+		result.CreatedAt = TimeFromProto(m.GetCreatedTime())
 		result.Labels = CopyStringMap(m.GetLabels())
 		result.Annotations = CopyStringMap(m.GetAnnotations())
 		result.ResourceVersion = m.GetResourceVersion()
 		result.Workspace = m.GetWorkspace()
-		result.DeletionTimestamp = TimeFromMillisPtr(m.GetDeletionTimestampMs())
+		result.DeletionTimestamp = TimePtrFromProto(m.GetDeletionTime())
 	}
 
 	if provenance := s.GetCreatedFromWorkloadTemplate(); provenance != nil {
@@ -55,10 +56,11 @@ func SandboxFromProto(s *pb.Sandbox) *types.Sandbox {
 
 func sandboxSpecFromProto(spec *pb.SandboxSpec) types.SandboxSpec {
 	result := types.SandboxSpec{
-		LogLevel:    spec.GetLogLevel(),
-		Environment: CopyStringMap(spec.GetEnvironment()),
-		Providers:   CopyStringSlice(spec.GetProviders()),
-		Policy:      SandboxPolicyFromProto(spec.GetPolicy()),
+		LogLevel:      spec.GetLogLevel(),
+		Environment:   CopyStringMap(spec.GetEnvironment()),
+		Providers:     CopyStringSlice(spec.GetProviders()),
+		Policy:        SandboxPolicyFromProto(spec.GetPolicy()),
+		RestartPolicy: SandboxRestartPolicyFromProto(spec.GetRestartPolicy()),
 	}
 
 	if tmpl := spec.GetTemplate(); tmpl != nil {
@@ -96,7 +98,6 @@ func sandboxSpecFromProto(spec *pb.SandboxSpec) types.SandboxSpec {
 
 func sandboxStatusFromProto(status *pb.SandboxStatus) types.SandboxStatus {
 	result := types.SandboxStatus{
-		SandboxName:          status.GetSandboxName(),
 		AgentPod:             status.GetAgentPod(),
 		AgentFd:              status.GetAgentFd(),
 		SandboxFd:            status.GetSandboxFd(),
@@ -110,12 +111,100 @@ func sandboxStatusFromProto(status *pb.SandboxStatus) types.SandboxStatus {
 			Status:             c.GetStatus(),
 			Reason:             c.GetReason(),
 			Message:            c.GetMessage(),
-			LastTransitionTime: c.GetLastTransitionTime(),
+			LastTransitionTime: TimestampStringFromProto(c.GetTransitionTime()),
 		})
 	}
+	for _, endpoint := range status.GetEndpointStatuses() {
+		result.EndpointStatuses = append(result.EndpointStatuses, types.EndpointStatus{
+			EndpointID:     endpoint.GetEndpointId(),
+			Host:           endpoint.GetHost(),
+			Ports:          slices.Clone(endpoint.GetPorts()),
+			Path:           endpoint.GetPath(),
+			LastResult:     endpointResultFromProto(endpoint.GetLastResult()),
+			LastReportedAt: TimestampStringFromProto(endpoint.GetLastReportedTime()),
+			LastFailure:    endpointFailureFromProto(endpoint.GetLastFailure()),
+		})
+	}
+	if observation := status.GetLastTokenGrantFailure(); observation != nil {
+		result.LastTokenGrantFailure = &types.TokenGrantFailureObservation{
+			DestinationHost: observation.GetDestinationHost(),
+			DestinationPort: observation.GetDestinationPort(),
+			Failure:         endpointFailureFromProto(observation.GetFailure()),
+		}
+	}
 	result.ExitCode = CopyInt32Ptr(status.ExitCode)
+	if admission := status.GetConfigurationAdmission(); admission != nil {
+		state := types.ConfigurationAdmissionUnknown
+		switch admission.GetState() {
+		case pb.ConfigurationAdmissionState_CONFIGURATION_ADMISSION_STATE_PENDING:
+			state = types.ConfigurationAdmissionPending
+		case pb.ConfigurationAdmissionState_CONFIGURATION_ADMISSION_STATE_ACCEPTED:
+			state = types.ConfigurationAdmissionAccepted
+		case pb.ConfigurationAdmissionState_CONFIGURATION_ADMISSION_STATE_REJECTED:
+			state = types.ConfigurationAdmissionRejected
+		}
+		result.ConfigurationAdmission = &types.SandboxConfigurationAdmission{
+			State:               state,
+			PolicyVersion:       admission.GetPolicyVersion(),
+			PolicyHash:          admission.GetPolicyHash(),
+			ConfigRevision:      admission.GetConfigRevision(),
+			ProviderEnvRevision: admission.GetProviderEnvRevision(),
+			Error:               admission.GetError(),
+		}
+	}
+	result.RestartCount = status.GetRestartCount()
+	result.NextRestartAtMs = MillisFromProto(status.GetNextRestartTime())
+	result.MainProcessStartedAtMs = MillisFromProto(status.GetMainProcessStartedTime())
 
 	return result
+}
+
+func endpointResultFromProto(result pb.EndpointResult) types.EndpointResult {
+	switch result {
+	case pb.EndpointResult_ENDPOINT_RESULT_NO_OBSERVED_EXCHANGE:
+		return types.EndpointNoObservedExchange
+	case pb.EndpointResult_ENDPOINT_RESULT_HTTP_RESPONSE_RECEIVED:
+		return types.EndpointHTTPResponseReceived
+	case pb.EndpointResult_ENDPOINT_RESULT_POLICY_DENIED:
+		return types.EndpointPolicyDenied
+	case pb.EndpointResult_ENDPOINT_RESULT_CREDENTIAL_UNAVAILABLE:
+		return types.EndpointCredentialUnavailable
+	case pb.EndpointResult_ENDPOINT_RESULT_TLS_FAILED:
+		return types.EndpointTLSFailed
+	case pb.EndpointResult_ENDPOINT_RESULT_TRANSPORT_FAILED:
+		return types.EndpointTransportFailed
+	case pb.EndpointResult_ENDPOINT_RESULT_UPSTREAM_REJECTED:
+		return types.EndpointUpstreamRejected
+	default:
+		// Unknown wire values must not imply an observation or a successful call.
+		return types.EndpointUnspecified
+	}
+}
+
+func endpointFailureFromProto(failure *pb.EndpointFailure) *types.EndpointFailure {
+	if failure == nil {
+		return nil
+	}
+	return &types.EndpointFailure{
+		Domain:             endpointFailureDomainFromProto(failure.GetDomain()),
+		Code:               failure.GetCode(),
+		RecoveryAction:     RefreshRecoveryActionFromProto(failure.GetRecoveryAction()),
+		Provider:           failure.GetProvider(),
+		CredentialKey:      failure.GetCredentialKey(),
+		Stage:              failure.GetStage(),
+		UpstreamHTTPStatus: CopyUint32Ptr(failure.UpstreamHttpStatus),
+		RequestID:          failure.GetRequestId(),
+	}
+}
+
+func endpointFailureDomainFromProto(domain pb.EndpointFailureDomain) types.EndpointFailureDomain {
+	switch domain {
+	case pb.EndpointFailureDomain_ENDPOINT_FAILURE_DOMAIN_TOKEN_GRANT:
+		return types.EndpointFailureDomainTokenGrant
+	default:
+		// Unknown wire values must not select a closed code set.
+		return types.EndpointFailureDomainUnspecified
+	}
 }
 
 // SandboxPhaseFromProto converts a proto SandboxPhase to an SDK SandboxPhase.
@@ -178,14 +267,14 @@ func SandboxToProto(s *types.Sandbox) *pb.Sandbox {
 
 	return &pb.Sandbox{
 		Metadata: &dm.ObjectMeta{
-			Id:                  s.ID,
-			Name:                s.Name,
-			CreatedAtMs:         MillisFromTime(s.CreatedAt),
-			Labels:              CopyStringMap(s.Labels),
-			Annotations:         CopyStringMap(s.Annotations),
-			ResourceVersion:     s.ResourceVersion,
-			Workspace:           s.Workspace,
-			DeletionTimestampMs: MillisFromTimePtr(s.DeletionTimestamp),
+			Id:              s.ID,
+			Name:            s.Name,
+			CreatedTime:     TimestampFromTime(s.CreatedAt),
+			Labels:          CopyStringMap(s.Labels),
+			Annotations:     CopyStringMap(s.Annotations),
+			ResourceVersion: s.ResourceVersion,
+			Workspace:       s.Workspace,
+			DeletionTime:    TimestampFromTimePtr(s.DeletionTimestamp),
 		},
 		Spec: SandboxSpecToProto(&s.Spec),
 	}
@@ -241,8 +330,33 @@ func SandboxSpecToProto(spec *types.SandboxSpec) *pb.SandboxSpec {
 
 	result.Command = CopyStringSlice(spec.Command)
 	result.Tty = spec.TTY
+	result.RestartPolicy = SandboxRestartPolicyToProto(spec.RestartPolicy)
 
 	return result
+}
+
+// SandboxRestartPolicyFromProto converts the restart policy to the curated SDK type.
+func SandboxRestartPolicyFromProto(policy pb.SandboxRestartPolicy) types.SandboxRestartPolicy {
+	switch policy {
+	case pb.SandboxRestartPolicy_SANDBOX_RESTART_POLICY_ON_FAILURE:
+		return types.SandboxRestartOnFailure
+	case pb.SandboxRestartPolicy_SANDBOX_RESTART_POLICY_ALWAYS:
+		return types.SandboxRestartAlways
+	default:
+		return types.SandboxRestartNever
+	}
+}
+
+// SandboxRestartPolicyToProto converts the curated SDK restart policy to protobuf.
+func SandboxRestartPolicyToProto(policy types.SandboxRestartPolicy) pb.SandboxRestartPolicy {
+	switch policy {
+	case types.SandboxRestartOnFailure:
+		return pb.SandboxRestartPolicy_SANDBOX_RESTART_POLICY_ON_FAILURE
+	case types.SandboxRestartAlways:
+		return pb.SandboxRestartPolicy_SANDBOX_RESTART_POLICY_ALWAYS
+	default:
+		return pb.SandboxRestartPolicy_SANDBOX_RESTART_POLICY_NEVER
+	}
 }
 
 // SandboxSpecToProtoChecked converts an SDK SandboxSpec and reports values
@@ -287,12 +401,12 @@ func SandboxWorkloadTemplateFromProto(t *pb.SandboxWorkloadTemplate) *types.Sand
 	if m := t.GetMetadata(); m != nil {
 		result.ID = m.GetId()
 		result.Name = m.GetName()
-		result.CreatedAt = TimeFromMillis(m.GetCreatedAtMs())
+		result.CreatedAt = TimeFromProto(m.GetCreatedTime())
 		result.Labels = CopyStringMap(m.GetLabels())
 		result.Annotations = CopyStringMap(m.GetAnnotations())
 		result.ResourceVersion = m.GetResourceVersion()
 		result.Workspace = m.GetWorkspace()
-		result.DeletionTimestamp = TimeFromMillisPtr(m.GetDeletionTimestampMs())
+		result.DeletionTimestamp = TimePtrFromProto(m.GetDeletionTime())
 	}
 	if spec := t.GetSpec(); spec != nil {
 		result.Spec = SandboxWorkloadTemplateSpecFromProto(spec)
@@ -366,14 +480,14 @@ func SandboxWorkloadTemplateToProto(t *types.SandboxWorkloadTemplate) *pb.Sandbo
 	}
 	return &pb.SandboxWorkloadTemplate{
 		Metadata: &dm.ObjectMeta{
-			Id:                  t.ID,
-			Name:                t.Name,
-			CreatedAtMs:         MillisFromTime(t.CreatedAt),
-			Labels:              CopyStringMap(t.Labels),
-			Annotations:         CopyStringMap(t.Annotations),
-			ResourceVersion:     t.ResourceVersion,
-			Workspace:           t.Workspace,
-			DeletionTimestampMs: MillisFromTimePtr(t.DeletionTimestamp),
+			Id:              t.ID,
+			Name:            t.Name,
+			CreatedTime:     TimestampFromTime(t.CreatedAt),
+			Labels:          CopyStringMap(t.Labels),
+			Annotations:     CopyStringMap(t.Annotations),
+			ResourceVersion: t.ResourceVersion,
+			Workspace:       t.Workspace,
+			DeletionTime:    TimestampFromTimePtr(t.DeletionTimestamp),
 		},
 		Spec: SandboxWorkloadTemplateSpecToProto(&t.Spec),
 	}

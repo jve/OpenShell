@@ -70,7 +70,7 @@ sb, err := client.CreateSandboxFromTemplate(
         Providers: []string{"openai"},
         Policy:    policy,
     },
-    map[string]string{"job": "training"},
+    v1.WithLabels(map[string]string{"job": "training"}),
 )
 ```
 
@@ -108,7 +108,7 @@ Deletes a template by name. Existing sandboxes created from the template are not
 deleted.
 
 ```go
-deleted, err := client.SandboxTemplates().Delete(ctx, "default", "gpu-kata")
+deletion, err := client.SandboxTemplates().Delete(ctx, "default", "gpu-kata")
 ```
 
 ## Fake Client

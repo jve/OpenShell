@@ -52,22 +52,15 @@ type KrunSetConsoleOutput = unsafe extern "C" fn(ctx_id: u32, filepath: *const c
 type KrunStartEnter = unsafe extern "C" fn(ctx_id: u32) -> i32;
 type KrunDisableImplicitVsock = unsafe extern "C" fn(ctx_id: u32) -> i32;
 type KrunAddVsock = unsafe extern "C" fn(ctx_id: u32, tsi_features: u32) -> i32;
-#[cfg(target_os = "macos")]
-type KrunAddNetUnixgram = unsafe extern "C" fn(
+type KrunAddVsockPort2 =
+    unsafe extern "C" fn(ctx_id: u32, port: u32, filepath: *const c_char, listen: bool) -> i32;
+type KrunAddVirtiofs4 = unsafe extern "C" fn(
     ctx_id: u32,
-    c_path: *const c_char,
-    fd: i32,
-    c_mac: *const u8,
-    features: u32,
-    flags: u32,
-) -> i32;
-type KrunAddNetUnixstream = unsafe extern "C" fn(
-    ctx_id: u32,
-    c_path: *const c_char,
-    fd: i32,
-    c_mac: *const u8,
-    features: u32,
-    flags: u32,
+    tag: *const c_char,
+    path: *const c_char,
+    shm_size: u64,
+    read_only: bool,
+    semantics: u32,
 ) -> i32;
 
 // Field names mirror the libkrun C API symbol names (`krun_*`); preserving
@@ -86,10 +79,10 @@ pub struct LibKrun {
     pub krun_start_enter: KrunStartEnter,
     pub krun_disable_implicit_vsock: KrunDisableImplicitVsock,
     pub krun_add_vsock: KrunAddVsock,
-    #[cfg(target_os = "macos")]
-    pub krun_add_net_unixgram: KrunAddNetUnixgram,
-    #[allow(dead_code)] // Used on Linux when gvproxy runs in qemu/unixstream mode.
-    pub krun_add_net_unixstream: KrunAddNetUnixstream,
+    pub krun_add_vsock_port2: KrunAddVsockPort2,
+    /// Load error kept so runtimes without virtiofs still boot sandboxes
+    /// that request no bind mounts, and mount requests report why.
+    pub krun_add_virtiofs4: Result<KrunAddVirtiofs4, String>,
 }
 
 static LIBKRUN: OnceLock<LibKrun> = OnceLock::new();
@@ -151,13 +144,8 @@ impl LibKrun {
                 &libkrun_path,
             )?,
             krun_add_vsock: load_symbol(library, b"krun_add_vsock\0", &libkrun_path)?,
-            #[cfg(target_os = "macos")]
-            krun_add_net_unixgram: load_symbol(library, b"krun_add_net_unixgram\0", &libkrun_path)?,
-            krun_add_net_unixstream: load_symbol(
-                library,
-                b"krun_add_net_unixstream\0",
-                &libkrun_path,
-            )?,
+            krun_add_vsock_port2: load_symbol(library, b"krun_add_vsock_port2\0", &libkrun_path)?,
+            krun_add_virtiofs4: load_symbol(library, b"krun_add_virtiofs4\0", &libkrun_path),
         })
     }
 }

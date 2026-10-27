@@ -14,7 +14,7 @@ import (
 )
 
 func newTestSandboxTemplateClient() *fakeSandboxTemplateClient {
-	store := newobjectStore(sandboxWorkloadTemplateName, copySandboxWorkloadTemplate)
+	store := newobjectStore(sandboxWorkloadTemplate, copySandboxWorkloadTemplate)
 	return newFakeSandboxTemplateClient(store, func() bool { return false })
 }
 
@@ -78,14 +78,14 @@ func TestSandboxTemplate_CreateGetListDelete(t *testing.T) {
 
 	deleted, err := tc.Delete(ctx, "default", "gpu-kata")
 	require.NoError(t, err)
-	assert.True(t, deleted)
+	assert.Equal(t, types.DeletionCompleted, deleted.Outcome)
 	_, err = tc.Get(ctx, "default", "gpu-kata")
 	require.Error(t, err)
 	assert.True(t, types.IsNotFound(err))
 
-	deleted, err = tc.Delete(ctx, "default", "gpu-kata")
+	deleted, err = tc.Delete(ctx, "default", "gpu-kata", types.DeleteOptions{AllowMissing: true})
 	require.NoError(t, err)
-	assert.False(t, deleted)
+	assert.Equal(t, types.DeletionAlreadyAbsent, deleted.Outcome)
 }
 
 func TestSandboxTemplate_CreateAlreadyExists(t *testing.T) {
@@ -233,7 +233,7 @@ func TestSandboxTemplate_CreateSandboxFromTemplateResolvesWorkloadAndGovernance(
 			Providers: []string{"github"},
 			Policy:    policy,
 		},
-		map[string]string{"team": "runtime"},
+		types.WithLabels(map[string]string{"team": "runtime"}),
 	)
 
 	require.NoError(t, err)
@@ -345,7 +345,6 @@ func TestSandboxTemplate_CreateSandboxFromTemplatePreservesDefaultGPURequest(t *
 		"default",
 		"job-default-gpu",
 		"default-gpu",
-		nil,
 		nil,
 	)
 
@@ -459,7 +458,7 @@ func TestSandboxTemplate_CreateRejectsInvalidTemplate(t *testing.T) {
 }
 
 func TestSandboxTemplate_ClosedReturnsUnavailable(t *testing.T) {
-	store := newobjectStore(sandboxWorkloadTemplateName, copySandboxWorkloadTemplate)
+	store := newobjectStore(sandboxWorkloadTemplate, copySandboxWorkloadTemplate)
 	tc := newFakeSandboxTemplateClient(store, func() bool { return true })
 	ctx := context.Background()
 

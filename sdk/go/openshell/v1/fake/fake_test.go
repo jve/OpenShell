@@ -38,7 +38,7 @@ func TestFakeClient_Sandboxes_AfterClose(t *testing.T) {
 
 	_ = fc.Close()
 
-	_, err := fc.Sandboxes().Create(ctx, "default", "test", &types.SandboxSpec{}, nil)
+	_, err := fc.Sandboxes().Create(ctx, "default", "test", &types.SandboxSpec{})
 	require.Error(t, err)
 	assert.True(t, types.IsUnavailable(err))
 }
@@ -192,6 +192,73 @@ func TestFakeClient_AddSandbox_DeepCopy(t *testing.T) {
 	got, err := fc.Sandboxes().Get(ctx, "default", "pre-seeded")
 	require.NoError(t, err)
 	assert.Equal(t, "test", got.Labels["env"])
+}
+
+func TestFakeClient_SandboxEndpointStatuses_DeepCopy(t *testing.T) {
+	fc := NewClient()
+	ctx := context.Background()
+	sb := &types.Sandbox{
+		Name: "tool-sandbox",
+		Status: types.SandboxStatus{EndpointStatuses: []types.EndpointStatus{{
+			EndpointID:     "endpoint-one",
+			Host:           "tools.example.test",
+			Ports:          []uint32{443, 8443},
+			Path:           "/mcp",
+			LastResult:     types.EndpointTransportFailed,
+			LastReportedAt: "2026-09-11T10:00:00Z",
+		}}},
+	}
+	fc.AddSandbox("default", sb)
+
+	// Neither the seed object nor returned snapshots may mutate stored endpoints.
+	sb.Status.EndpointStatuses[0].Host = "seed-changed.example.test"
+	sb.Status.EndpointStatuses[0].Ports[0] = 80
+	sb.Status.EndpointStatuses[0].LastResult = types.EndpointHTTPResponseReceived
+	got, err := fc.Sandboxes().Get(ctx, "default", "tool-sandbox")
+	require.NoError(t, err)
+	require.Equal(t, []types.EndpointStatus{{
+		EndpointID: "endpoint-one", Host: "tools.example.test", Ports: []uint32{443, 8443}, Path: "/mcp",
+		LastResult: types.EndpointTransportFailed, LastReportedAt: "2026-09-11T10:00:00Z",
+	}}, got.Status.EndpointStatuses)
+	got.Status.EndpointStatuses[0].Path = "/changed"
+	got.Status.EndpointStatuses[0].Ports[1] = 8080
+	got.Status.EndpointStatuses[0].LastReportedAt = "changed"
+
+	listed, err := fc.Sandboxes().ListAll(ctx, "default")
+	require.NoError(t, err)
+	require.Len(t, listed, 1)
+	assert.Equal(t, "/mcp", listed[0].Status.EndpointStatuses[0].Path)
+	assert.Equal(t, []uint32{443, 8443}, listed[0].Status.EndpointStatuses[0].Ports)
+	assert.Equal(t, "2026-09-11T10:00:00Z", listed[0].Status.EndpointStatuses[0].LastReportedAt)
+}
+
+func TestFakeClient_SandboxGrantFailures_DeepCopy(t *testing.T) {
+	fc := NewClient()
+	ctx := context.Background()
+	upstreamStatus := uint32(401)
+	failure := &types.EndpointFailure{Code: "provider_authorization_required", UpstreamHTTPStatus: &upstreamStatus}
+	sb := &types.Sandbox{Name: "grant-sandbox", Status: types.SandboxStatus{
+		EndpointStatuses:      []types.EndpointStatus{{EndpointID: "endpoint-grant", LastFailure: failure}},
+		LastTokenGrantFailure: &types.TokenGrantFailureObservation{DestinationHost: "api.example.test", Failure: failure},
+	}}
+	fc.AddSandbox("default", sb)
+
+	// Neither the seed object nor returned snapshots may mutate the stored failure.
+	failure.Code = "seed_changed"
+	upstreamStatus = 500
+	got, err := fc.Sandboxes().Get(ctx, "default", "grant-sandbox")
+	require.NoError(t, err)
+	got.Status.EndpointStatuses[0].LastFailure.Code = "changed"
+	got.Status.LastTokenGrantFailure.DestinationHost = "changed.example.test"
+	*got.Status.LastTokenGrantFailure.Failure.UpstreamHTTPStatus = 503
+
+	stored, err := fc.Sandboxes().Get(ctx, "default", "grant-sandbox")
+	require.NoError(t, err)
+	assert.Equal(t, "provider_authorization_required", stored.Status.EndpointStatuses[0].LastFailure.Code)
+	assert.Equal(t, uint32(401), *stored.Status.EndpointStatuses[0].LastFailure.UpstreamHTTPStatus)
+	assert.Equal(t, "api.example.test", stored.Status.LastTokenGrantFailure.DestinationHost)
+	assert.Equal(t, "provider_authorization_required", stored.Status.LastTokenGrantFailure.Failure.Code)
+	assert.Equal(t, uint32(401), *stored.Status.LastTokenGrantFailure.Failure.UpstreamHTTPStatus)
 }
 
 func TestFakeClient_AddProvider(t *testing.T) {

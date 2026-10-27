@@ -12,17 +12,8 @@ use openshell_e2e::harness::cli::run_cli;
 use openshell_e2e::harness::output::strip_ansi;
 use openshell_e2e::harness::sandbox::SandboxGuard;
 use sha2::{Digest, Sha256};
-use tokio::io::AsyncWriteExt;
 
 const CREDENTIAL_KEY: &str = "OPENAI_API_KEY";
-const VAULT_POLICY: &str = r#"path "secret/data/openshell/provider-credentials/*" {
-  capabilities = ["create", "read", "update", "delete"]
-}
-
-path "secret/metadata/openshell/provider-credentials/*" {
-  capabilities = ["read", "delete", "list"]
-}
-"#;
 
 fn unique_suffix() -> String {
     let millis = SystemTime::now()
@@ -153,49 +144,6 @@ async fn bao(args: &[&str]) -> Result<String, String> {
     Ok(combined)
 }
 
-async fn bao_with_stdin(args: &[&str], stdin: &str) -> Result<String, String> {
-    let namespace = vault_namespace();
-    let pod = vault_pod();
-    let token = vault_token();
-    let token_env = format!("BAO_TOKEN={token}");
-    let mut command = kubectl_command();
-    command.args([
-        "-n", &namespace, "exec", "-i", &pod, "--", "env", &token_env, "bao",
-    ]);
-    command.args(args);
-    command.stdin(Stdio::piped());
-    command.stdout(Stdio::piped());
-    command.stderr(Stdio::piped());
-
-    let mut child = command
-        .spawn()
-        .map_err(|err| format!("failed to spawn bao {args:?}: {err}"))?;
-    let mut child_stdin = child
-        .stdin
-        .take()
-        .ok_or_else(|| "failed to open bao stdin".to_string())?;
-    child_stdin
-        .write_all(stdin.as_bytes())
-        .await
-        .map_err(|err| format!("failed to write bao stdin: {err}"))?;
-    drop(child_stdin);
-
-    let output = child
-        .wait_with_output()
-        .await
-        .map_err(|err| format!("failed to wait for bao {args:?}: {err}"))?;
-    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-    let combined = format!("{stdout}{stderr}");
-    if !output.status.success() {
-        return Err(format!(
-            "bao {args:?} failed (exit {:?}):\n{combined}",
-            output.status.code()
-        ));
-    }
-    Ok(combined)
-}
-
 async fn delete_provider(name: &str) {
     let mut cmd = openshell_cmd();
     cmd.arg("provider")
@@ -234,9 +182,11 @@ async fn provider_identity(provider_name: &str) -> Result<ProviderIdentity, Stri
     if code != 0 {
         return Err(format!("provider list failed (exit {code}):\n{clean}"));
     }
-    let providers: Vec<serde_json::Value> = serde_json::from_str(&clean)
+    let listing: serde_json::Value = serde_json::from_str(&clean)
         .map_err(|err| format!("failed to parse provider list JSON: {err}\n{clean}"))?;
-    let provider = providers
+    let provider = listing["providers"]
+        .as_array()
+        .ok_or_else(|| format!("provider list JSON has no providers array:\n{clean}"))?
         .iter()
         .find(|provider| provider["name"].as_str() == Some(provider_name))
         .ok_or_else(|| format!("provider '{provider_name}' was not returned by provider list"))?;
@@ -277,7 +227,7 @@ async fn assert_provider_placeholder_available_in_sandbox(
     sandbox_name: &str,
     secret_value: &str,
 ) -> Result<(), String> {
-    let guard = SandboxGuard::create(&[
+    let mut guard = SandboxGuard::create(&[
         "--name",
         sandbox_name,
         "--provider",
@@ -291,6 +241,9 @@ async fn assert_provider_placeholder_available_in_sandbox(
     ])
     .await?;
     let clean = strip_ansi(&guard.create_output);
+    // Delete the sandbox before returning: the gateway refuses to delete a
+    // provider that is still attached to a sandbox.
+    guard.cleanup().await;
     if !contains_placeholder_for_env_key(&clean, CREDENTIAL_KEY) {
         return Err(format!(
             "sandbox {sandbox_name} did not receive provider credential placeholder:\n{clean}"
@@ -301,33 +254,6 @@ async fn assert_provider_placeholder_available_in_sandbox(
             "sandbox {sandbox_name} output exposed credential material:\n{clean}"
         ));
     }
-    Ok(())
-}
-
-async fn configure_vault_storage() -> Result<(), String> {
-    let _ = bao(&["secrets", "enable", "-path=secret", "kv-v2"]).await;
-    let _ = bao(&["auth", "enable", "kubernetes"]).await;
-    bao(&[
-        "write",
-        "auth/kubernetes/config",
-        "kubernetes_host=https://kubernetes.default.svc",
-        "kubernetes_ca_cert=@/var/run/secrets/kubernetes.io/serviceaccount/ca.crt",
-    ])
-    .await?;
-    bao_with_stdin(
-        &["policy", "write", "openshell-provider-storage", "-"],
-        VAULT_POLICY,
-    )
-    .await?;
-    bao(&[
-        "write",
-        "auth/kubernetes/role/openshell-gateway",
-        "bound_service_account_names=openshell",
-        &format!("bound_service_account_namespaces={}", namespace()),
-        "policies=openshell-provider-storage",
-        "ttl=1h",
-    ])
-    .await?;
     Ok(())
 }
 
@@ -453,15 +379,15 @@ async fn provider_credentials_are_stored_in_configured_backend() {
     let suffix = unique_suffix();
     let driver_slug = driver.replace('-', "");
     let provider_name = format!("cred-storage-{driver_slug}-{suffix}");
-    let sandbox_name = format!("cred-storage-sandbox-{driver_slug}-{suffix}");
+    // Sandbox names are DNS-routable and limited to 19 characters.
+    let sandbox_name = format!(
+        "cred-{}-{}",
+        &driver_slug[..1],
+        &suffix[suffix.len() - 10..]
+    );
     let secret_value = format!("example-e2e-{driver_slug}-{suffix}");
 
     delete_provider(&provider_name).await;
-    if driver == "vault" {
-        configure_vault_storage()
-            .await
-            .expect("configure Vault storage fixture");
-    }
 
     let result: Result<ProviderIdentity, String> = async {
         create_provider(&provider_name, &secret_value).await?;

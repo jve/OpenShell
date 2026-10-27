@@ -1,9 +1,8 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-pub use openshell_core::AppArmorProfile;
 pub use openshell_core::DynamicStringAllowlist as OperatorNamespaceAllowlist;
-use openshell_core::{ImagePullPolicy, config};
+use openshell_core::config;
 use serde::{Deserialize, Deserializer, Serialize};
 use std::collections::BTreeMap;
 #[cfg(test)]
@@ -11,11 +10,63 @@ use std::collections::BTreeSet;
 use std::path::Path;
 use std::str::FromStr;
 
+/// Image pull policies accepted by the Kubernetes API.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum KubernetesImagePullPolicy {
+    #[serde(alias = "Always")]
+    Always,
+    #[serde(alias = "IfNotPresent")]
+    IfNotPresent,
+    #[serde(alias = "Never")]
+    Never,
+}
+
+impl KubernetesImagePullPolicy {
+    /// Return the spelling required by Kubernetes Pod specs.
+    #[must_use]
+    pub const fn as_kubernetes_str(self) -> &'static str {
+        match self {
+            Self::Always => "Always",
+            Self::IfNotPresent => "IfNotPresent",
+            Self::Never => "Never",
+        }
+    }
+}
+
+impl FromStr for KubernetesImagePullPolicy {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "always" | "Always" => Ok(Self::Always),
+            "if_not_present" | "IfNotPresent" => Ok(Self::IfNotPresent),
+            "never" | "Never" => Ok(Self::Never),
+            other => Err(format!(
+                "invalid Kubernetes image pull policy '{other}'; expected always, if_not_present, or never"
+            )),
+        }
+    }
+}
+
 /// Default gateway identity used in managed-mode namespace naming.
 pub const DEFAULT_GATEWAY_ID: &str = "openshell";
 
 /// Default Kubernetes namespace for sandbox resources.
 pub const DEFAULT_K8S_NAMESPACE: &str = "openshell";
+
+/// Hard upper bound on a `proxy_ca_bundle` staged into a bootstrap Secret.
+///
+/// The shared reader already bounds the file at
+/// [`MAX_UPSTREAM_PROXY_CA_BUNDLE_BYTES`](openshell_core::driver_utils::MAX_UPSTREAM_PROXY_CA_BUNDLE_BYTES),
+/// but that bound is exactly the apiserver's own ~1 MiB limit on a Secret,
+/// and the bootstrap Secret carries four other keys besides this one. A
+/// bundle between the two limits would be accepted on the gateway host and
+/// then fail every sandbox create with an opaque apiserver `data: Too long`
+/// error, so this driver bounds it well clear of that ceiling and names the
+/// operator setting in the error. A bundle holding every corporate trust
+/// anchor is a few tens of kilobytes.
+pub const MAX_STAGED_PROXY_CA_BUNDLE_BYTES: usize = 256 * 1024;
 
 /// Default Kubernetes `ServiceAccount` assigned to sandbox pods.
 pub const DEFAULT_SANDBOX_SERVICE_ACCOUNT_NAME: &str = "default";
@@ -23,76 +74,69 @@ pub const DEFAULT_SANDBOX_SERVICE_ACCOUNT_NAME: &str = "default";
 /// Default storage size for the workspace PVC.
 pub const DEFAULT_WORKSPACE_STORAGE_SIZE: &str = "2Gi";
 
-/// Default non-root UID for relaxed Kubernetes network supervisor sidecars.
-pub const DEFAULT_PROXY_UID: u32 = 1337;
-
-/// How the supervisor binary is delivered into sandbox pods.
+/// Which side opens the Sandbox Protocol TCP connection.
+///
+/// Internal state for the current runtime generation. A missing Sandbox
+/// annotation identifies a legacy generation; every new generation uses
+/// `RuntimeInitiated`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
-pub enum SupervisorSideloadMethod {
-    /// Mount the supervisor OCI image directly as a read-only volume
-    /// (requires Kubernetes >= v1.33 with the `ImageVolume` feature gate,
-    /// or >= v1.36 where it is GA).
+pub enum KubernetesControlConnection {
+    /// The sandbox runtime dials its supervisor's per-sandbox Service.
     #[default]
-    ImageVolume,
-    /// Copy the binary via an init container and emptyDir volume.
-    /// Works on all Kubernetes versions.
-    InitContainer,
+    RuntimeInitiated,
+    /// The supervisor dials the sandbox runtime's listener (original mode).
+    SupervisorInitiated,
 }
 
-impl std::fmt::Display for SupervisorSideloadMethod {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl KubernetesControlConnection {
+    /// Stable spelling used in configuration and Sandbox annotations.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
         match self {
-            Self::ImageVolume => f.write_str("image-volume"),
-            Self::InitContainer => f.write_str("init-container"),
+            Self::RuntimeInitiated => "runtime-initiated",
+            Self::SupervisorInitiated => "supervisor-initiated",
         }
     }
 }
 
-impl FromStr for SupervisorSideloadMethod {
+impl FromStr for KubernetesControlConnection {
     type Err = String;
 
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s {
-            "image-volume" => Ok(Self::ImageVolume),
-            "init-container" => Ok(Self::InitContainer),
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "runtime-initiated" => Ok(Self::RuntimeInitiated),
+            "supervisor-initiated" => Ok(Self::SupervisorInitiated),
             other => Err(format!(
-                "unknown supervisor sideload method '{other}'; expected 'image-volume' or 'init-container'"
+                "invalid sandbox control connection '{other}'; expected runtime-initiated or supervisor-initiated"
             )),
         }
     }
 }
 
-/// How the supervisor is arranged inside Kubernetes sandbox pods.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum SupervisorTopology {
-    /// Run networking and process supervision in the agent container.
-    #[default]
-    Combined,
-    /// Run network supervision in a privileged sidecar and process supervision
-    /// as a low-capability wrapper in the agent container.
-    Sidecar,
+/// Driver-owned requirements for the Kubernetes sandbox runtime.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct KubernetesSandboxRuntimeConfig {
+    /// TCP port of the Sandbox Protocol listener: the workload boundary for
+    /// supervisor-initiated sandboxes, the supervisor for runtime-initiated ones.
+    pub boundary_port: u16,
 }
 
-impl std::fmt::Display for SupervisorTopology {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Combined => f.write_str("combined"),
-            Self::Sidecar => f.write_str("sidecar"),
+impl Default for KubernetesSandboxRuntimeConfig {
+    fn default() -> Self {
+        Self {
+            boundary_port: 5500,
         }
     }
 }
 
-impl FromStr for SupervisorTopology {
-    type Err = String;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s {
-            "combined" => Ok(Self::Combined),
-            "sidecar" => Ok(Self::Sidecar),
-            other => Err(format!("unknown topology '{other}'")),
+impl KubernetesSandboxRuntimeConfig {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.boundary_port < 1024 {
+            return Err("sandbox_runtime.boundary_port must be at least 1024".to_string());
         }
+        Ok(())
     }
 }
 
@@ -138,62 +182,6 @@ impl FromStr for WorkspaceMode {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-pub struct KubernetesSidecarConfig {
-    /// UID used by relaxed long-running network sidecars in `sidecar`
-    /// topology. The network init container installs nftables rules that
-    /// exempt this UID, so it must not match the sandbox workload UID.
-    /// Strict process/binary-aware sidecars run as UID 0 so Kubernetes grants
-    /// the requested `/proc` inspection capabilities into the effective set.
-    pub proxy_uid: u32,
-    /// Require process/binary-aware network policy enforcement in sidecar
-    /// topology. When disabled, the network sidecar runs as `proxy_uid`,
-    /// drops the extra `/proc` inspection permissions, and evaluates
-    /// endpoint/L7 policy without matching `policy.binaries`.
-    pub process_binary_aware_network_policy: bool,
-}
-
-impl Default for KubernetesSidecarConfig {
-    fn default() -> Self {
-        Self {
-            proxy_uid: DEFAULT_PROXY_UID,
-            process_binary_aware_network_policy: true,
-        }
-    }
-}
-
-impl KubernetesSidecarConfig {
-    pub fn validate_proxy_uid(&self) -> Result<(), String> {
-        if !(openshell_policy::MIN_SANDBOX_PROXY_UID..=openshell_policy::MAX_SANDBOX_UID)
-            .contains(&self.proxy_uid)
-        {
-            return Err(format!(
-                "sidecar.proxy_uid must be in range [{}, {}]",
-                openshell_policy::MIN_SANDBOX_PROXY_UID,
-                openshell_policy::MAX_SANDBOX_UID,
-            ));
-        }
-        Ok(())
-    }
-}
-
-fn deserialize_optional_app_armor_profile<'de, D>(
-    deserializer: D,
-) -> Result<Option<AppArmorProfile>, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    let value = Option::<String>::deserialize(deserializer)?;
-    match value.as_deref() {
-        None | Some("") => Ok(None),
-        Some(value) => value
-            .parse::<AppArmorProfile>()
-            .map(Some)
-            .map_err(serde::de::Error::custom),
-    }
-}
-
 fn deserialize_provider_spiffe_workload_api_socket_path<'de, D>(
     deserializer: D,
 ) -> Result<String, D::Error>
@@ -206,9 +194,92 @@ where
     Ok(value)
 }
 
+/// Scope of a shared supervisor deployment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SupervisorTopology {
+    Gateway,
+    Workspace,
+}
+
+/// The supervisor Helm deploys for the gateway topology.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SharedSupervisorConfig {
+    /// Service selecting the shared supervisor Pod.
+    pub service_name: String,
+    pub service_namespace: String,
+    /// Service port for runtime-initiated Sandbox Protocol connections.
+    pub runtime_port: u16,
+    /// Secret in `service_namespace` the driver keeps current with the
+    /// gateway-minted supervisor token (key `token`); the supervisor Pod
+    /// mounts it and presents the token on its assignment stream.
+    pub token_secret_name: String,
+}
+
+impl SharedSupervisorConfig {
+    fn validate(&self) -> Result<(), String> {
+        if !is_dns_label(&self.service_name) || !is_dns_label(&self.service_namespace) {
+            return Err(
+                "shared_supervisor service_name and service_namespace must be DNS labels".into(),
+            );
+        }
+        if self.runtime_port == 0 {
+            return Err("shared_supervisor runtime_port must be nonzero".into());
+        }
+        if !is_dns_subdomain(&self.token_secret_name) {
+            return Err("shared_supervisor token_secret_name must be a DNS subdomain name".into());
+        }
+        Ok(())
+    }
+
+    /// DNS name of the shared supervisor Service, which sandbox runtimes dial.
+    #[must_use]
+    pub fn service_host(&self) -> String {
+        format!("{}.{}.svc", self.service_name, self.service_namespace)
+    }
+}
+
+/// RFC 1123 subdomain, as Kubernetes object names require.
+fn is_dns_subdomain(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 253
+        && value.split('.').all(|label| {
+            !label.is_empty()
+                && label.len() <= 63
+                && label
+                    .bytes()
+                    .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+                && !label.starts_with('-')
+                && !label.ends_with('-')
+        })
+}
+
+fn is_dns_label(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 63
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+        && !value.starts_with('-')
+        && !value.ends_with('-')
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct KubernetesComputeConfig {
+    /// Supervise new sandbox generations with one supervisor shared by the
+    /// gateway instead of a supervisor Pod per sandbox. Existing generations
+    /// keep the topology recorded when they started.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub supervisor_topology: Option<SupervisorTopology>,
+    /// Shared supervisor connection rendered by Helm with the gateway topology.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub shared_supervisor: Option<SharedSupervisorConfig>,
+    /// Permit caller-supplied driver JSON. Does not waive resource admission.
+    pub allow_driver_config: bool,
+    /// Operator-owned external attachment approval policy.
+    pub resource_admission: openshell_core::resource_admission::ResourceAdmissionConfig,
     /// How workspaces map to Kubernetes namespaces. `"shared"` (default)
     /// renders all sandboxes into `namespace`; `"managed"` creates per-workspace
     /// namespaces on demand; `"operator"` uses pre-provisioned namespaces.
@@ -227,33 +298,33 @@ pub struct KubernetesComputeConfig {
     /// operator mode. Hot-reloaded on change. Delivered via `ConfigMap` volume mount.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub operator_namespace_file: Option<String>,
-    /// Kubernetes `ServiceAccount` assigned to sandbox pods and accepted by
-    /// the driver's `TokenReview` bootstrap authenticator.
+    /// Kubernetes `ServiceAccount` assigned to the workload and supervisor Pods. Automatic
+    /// token mounting is disabled; only the supervisor receives an explicit
+    /// audience-bound projected token accepted by the bootstrap authenticator.
     pub service_account_name: String,
     pub default_image: String,
-    /// Pull policy for sandbox images. Omit to use Kubernetes's image default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub image_pull_policy: Option<ImagePullPolicy>,
+    pub image_pull_policy: Option<KubernetesImagePullPolicy>,
     /// Kubernetes `imagePullSecrets` names attached to sandbox pods.
     pub image_pull_secrets: Vec<String>,
     /// Managed-mode SSH ingress isolation. When enabled, the driver creates a
     /// `NetworkPolicy` in each managed workspace namespace that permits TCP 2222
     /// only from gateway pods matching this peer.
     pub managed_ssh_ingress: ManagedSshIngressConfig,
-    /// Image that provides the `openshell-sandbox` supervisor binary.
-    /// Mounted directly as an image volume, or copied via an init container,
-    /// depending on `supervisor_sideload_method`.
-    pub supervisor_image: String,
-    /// Pull policy for the supervisor image. Omit to use Kubernetes's image
-    /// default.
+    /// Image that provides the trusted `openshell-sandbox` bootstrap binary.
+    pub sandbox_runtime_image: String,
+    /// Kubernetes `imagePullPolicy` for the sandbox runtime image.
+    /// When omitted, Kubernetes selects its default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub supervisor_image_pull_policy: Option<ImagePullPolicy>,
-    /// How the supervisor binary is delivered into sandbox pods.
-    pub supervisor_sideload_method: SupervisorSideloadMethod,
-    /// How the supervisor is arranged for Kubernetes sandbox pods.
-    pub topology: SupervisorTopology,
-    /// Sidecar-only settings used when `topology = "sidecar"`.
-    pub sidecar: KubernetesSidecarConfig,
+    pub sandbox_runtime_image_pull_policy: Option<KubernetesImagePullPolicy>,
+    /// Image that provides the trusted `openshell-supervisor` control binary.
+    pub supervisor_image: String,
+    /// Kubernetes `imagePullPolicy` for the supervisor image.
+    /// When omitted, Kubernetes selects its default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supervisor_image_pull_policy: Option<KubernetesImagePullPolicy>,
+    /// Cross-pod sandbox/supervisor settings.
+    pub sandbox_runtime: KubernetesSandboxRuntimeConfig,
     /// Corporate HTTP forward proxy used by the network supervisor for
     /// policy-approved TLS CONNECT egress.
     pub https_proxy: Option<String>,
@@ -273,19 +344,43 @@ pub struct KubernetesComputeConfig {
     /// Send hostnames rather than validated IPs in CONNECT requests. This is a
     /// last-resort compatibility mode for hostname-filtering proxy ACLs.
     pub proxy_connect_by_hostname: Option<bool>,
+    /// Path, on the gateway Pod's filesystem, to a PEM CA bundle trusted for
+    /// the corporate proxy.
+    ///
+    /// A CA certificate is not secret, so the gateway reads this file and
+    /// stages it into the per-generation supervisor bootstrap Secret, which
+    /// kubelet mounts read-only in the supervisor Pod. The supervisor trusts
+    /// it for the TLS handshake with an `https://` proxy and, because a
+    /// TLS-intercepting proxy re-signs tunneled server certificates with the
+    /// same CA, folds it into the sandbox trust bundle and upstream
+    /// verification.
+    ///
+    /// The bundle is deliberately read from the gateway's own filesystem
+    /// rather than referenced as an object in the sandbox namespace: it
+    /// becomes a trust anchor for every upstream the sandbox reaches, so it
+    /// must stay in the gateway's trust domain. The staging Secret is
+    /// immutable, so the anchor cannot change underneath a running sandbox.
+    /// Only meaningful with `https_proxy` set; the bundle must exist and
+    /// contain at least one usable trust anchor.
+    pub proxy_ca_bundle: Option<String>,
     pub grpc_endpoint: String,
+    /// OTLP/gRPC collector endpoint passed to supervisor pods. The gateway
+    /// supplies its own export endpoint; driver TOML cannot set it.
+    #[serde(skip)]
+    pub supervisor_otlp_endpoint: Option<String>,
+    /// OCSF event export passed to supervisors. The gateway supplies its own
+    /// export; driver TOML cannot set it.
+    #[serde(skip)]
+    pub supervisor_ocsf_export: Option<openshell_core::sandbox_env::OcsfOtlpExport>,
+
+    /// Gateway name passed to supervisors for their telemetry. The gateway
+    /// supplies its own name; driver TOML cannot set it.
+    #[serde(skip)]
+    pub supervisor_gateway_name: Option<String>,
     pub ssh_socket_path: String,
     pub client_tls_secret_name: String,
     pub host_gateway_ip: String,
     pub enable_user_namespaces: bool,
-    /// Kubernetes `AppArmor` profile requested for the sandbox agent container.
-    /// Empty/None omits the `appArmorProfile` field from sandbox pod specs.
-    #[serde(
-        default,
-        skip_serializing_if = "Option::is_none",
-        deserialize_with = "deserialize_optional_app_armor_profile"
-    )]
-    pub app_armor_profile: Option<AppArmorProfile>,
     pub workspace_default_storage_size: String,
     /// Kubernetes `StorageClass` name for the default workspace PVC.
     /// Empty string (default) = omit `storageClassName`, using the cluster's
@@ -297,6 +392,19 @@ pub struct KubernetesComputeConfig {
     /// Applied when a `CreateSandbox` request does not specify one.
     /// Empty string (default) = omit the field, using the cluster default.
     pub default_runtime_class_name: String,
+    /// Pod annotation keys that sandbox templates may set. Each entry is an
+    /// exact key (`example.com/team`) or a prefix wildcard (`example.com/*`).
+    /// Empty (default) rejects every caller-supplied pod annotation.
+    ///
+    /// Keys in `openshell.ai` and `agents.x-k8s.io` (and their subdomains)
+    /// are always rejected and cannot be allowlisted. `OpenShell` writes sandbox
+    /// identity under `openshell.ai`, and the Agent Sandbox controller owns
+    /// `agents.x-k8s.io` and strips those keys from pod templates.
+    pub allowed_pod_annotations: Vec<String>,
+    /// Pod label keys that sandbox templates may set, using the same entry
+    /// format and reserved domains as `allowed_pod_annotations`. Empty
+    /// (default) rejects every caller-supplied pod label.
+    pub allowed_pod_labels: Vec<String>,
     /// Lifetime (seconds) of the projected `ServiceAccount` token kubelet
     /// writes into each sandbox pod. Used only for the one-shot
     /// `IssueSandboxToken` bootstrap exchange — the gateway-minted JWT
@@ -314,13 +422,10 @@ pub struct KubernetesComputeConfig {
         deserialize_with = "deserialize_provider_spiffe_workload_api_socket_path"
     )]
     pub provider_spiffe_workload_api_socket_path: String,
-    /// UID used for privilege-drop operations and workspace init container
-    /// ownership. The supervisor container always runs as UID 0 (root) to
-    /// create network namespaces and configure Landlock/seccomp; the
-    /// `sandbox_uid` is injected as the `SANDBOX_UID` environment variable so
-    /// the supervisor knows which UID to drop to for child processes.
+    /// Exact UID shared by `openshell-sandbox`, its agent children, the trusted
+    /// workspace/bootstrap init containers, and `openshell-supervisor`.
     /// When empty, the driver auto-detects from `OpenShift` SCC annotations on
-    /// the target namespace; if those are also absent, falls back to `1000`.
+    /// the target namespace; if those are also absent, falls back to `10001`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sandbox_uid: Option<u32>,
     /// GID used alongside `sandbox_uid` for PVC init container operations.
@@ -347,11 +452,14 @@ pub const MAX_SA_TOKEN_TTL_SECS: i64 = 86_400;
 
 /// Default sandbox UID used when neither config nor `OpenShift` SCC annotations
 /// provide a resolved value.
-pub(crate) const DEFAULT_SANDBOX_UID: u32 = 1000;
+pub(crate) const DEFAULT_SANDBOX_UID: u32 = 10001;
 
 /// The annotation key for the `OpenShift` `ServiceAccount` UID range.
 /// Format: `<start>/<size>` (e.g. `1000000000/10000`).
 pub const ANNOTATION_SCC_UID_RANGE: &str = "openshift.io/sa.scc.uid-range";
+
+/// The annotation key for the `OpenShift` MCS label allocated to a namespace.
+pub const ANNOTATION_SCC_MCS: &str = "openshift.io/sa.scc.mcs";
 
 /// The annotation key for the `OpenShift` `ServiceAccount` supplemental groups.
 /// Format: `<start>/<size>` (e.g. `1000000000/10000`).
@@ -360,38 +468,50 @@ pub const ANNOTATION_SCC_SUPPLEMENTAL_GROUPS: &str = "openshift.io/sa.scc.supple
 impl Default for KubernetesComputeConfig {
     fn default() -> Self {
         Self {
+            supervisor_topology: None,
+            shared_supervisor: None,
             workspace_mode: WorkspaceMode::default(),
+            allow_driver_config: false,
+            resource_admission:
+                openshell_core::resource_admission::ResourceAdmissionConfig::default(),
             gateway_id: DEFAULT_GATEWAY_ID.to_string(),
             namespace: DEFAULT_K8S_NAMESPACE.to_string(),
             operator_namespace_label: None,
             operator_namespace_file: None,
             service_account_name: DEFAULT_SANDBOX_SERVICE_ACCOUNT_NAME.to_string(),
             default_image: openshell_core::image::default_sandbox_image(),
-            // Omit the field so Kubernetes applies its own default (Always for
-            // `latest`, IfNotPresent otherwise).
+            // Default empty so the gateway omits `imagePullPolicy` from pod
+            // specs and Kubernetes applies its own default (Always for `latest`,
+            // IfNotPresent otherwise). `DEFAULT_IMAGE_PULL_POLICY` ("missing")
+            // is Podman vocabulary and is not a valid Kubernetes value.
             image_pull_policy: None,
             image_pull_secrets: Vec::new(),
             managed_ssh_ingress: ManagedSshIngressConfig::default(),
+            sandbox_runtime_image: config::default_sandbox_runtime_image(),
+            sandbox_runtime_image_pull_policy: None,
             supervisor_image: config::default_supervisor_image(),
             supervisor_image_pull_policy: None,
-            supervisor_sideload_method: SupervisorSideloadMethod::default(),
-            topology: SupervisorTopology::default(),
-            sidecar: KubernetesSidecarConfig::default(),
+            sandbox_runtime: KubernetesSandboxRuntimeConfig::default(),
             https_proxy: None,
             no_proxy: None,
             proxy_auth_secret_name: None,
             proxy_auth_secret_key: None,
             proxy_auth_allow_insecure: None,
             proxy_connect_by_hostname: None,
+            proxy_ca_bundle: None,
             grpc_endpoint: String::new(),
+            supervisor_otlp_endpoint: None,
+            supervisor_ocsf_export: None,
+            supervisor_gateway_name: None,
             ssh_socket_path: openshell_core::container_paths::SSH_SOCKET_PATH.to_string(),
             client_tls_secret_name: String::new(),
             host_gateway_ip: String::new(),
             enable_user_namespaces: false,
-            app_armor_profile: None,
             workspace_default_storage_size: DEFAULT_WORKSPACE_STORAGE_SIZE.to_string(),
             workspace_storage_class: String::new(),
             default_runtime_class_name: String::new(),
+            allowed_pod_annotations: Vec::new(),
+            allowed_pod_labels: Vec::new(),
             sa_token_ttl_secs: 3600,
             provider_spiffe_workload_api_socket_path: String::new(),
             sandbox_uid: None,
@@ -403,12 +523,70 @@ impl Default for KubernetesComputeConfig {
 impl KubernetesComputeConfig {
     /// Validate startup configuration without connecting to Kubernetes.
     pub fn validate_configuration(&self) -> Result<(), String> {
+        self.validate_supervisor_topology()?;
         self.validate_workspace_mode()?;
         self.validate_provider_spiffe_workload_api_socket_path()?;
         self.validate_sandbox_identity_config()?;
         self.validate_proxy_uid()?;
-        self.validate_image_pull_policies()?;
-        self.validate_upstream_proxy_config()
+        self.validate_upstream_proxy_config()?;
+        self.validate_allowed_pod_annotations()?;
+        self.validate_allowed_pod_labels()
+    }
+
+    /// The shared supervisor serves only sandbox instances it can isolate: it
+    /// holds no per-sandbox workload identity, upstream proxy credential, or
+    /// proxy CA.
+    pub fn validate_supervisor_topology(&self) -> Result<(), String> {
+        match self.supervisor_topology {
+            None => {
+                if self.shared_supervisor.is_some() {
+                    return Err("shared_supervisor requires supervisor_topology=gateway".into());
+                }
+                Ok(())
+            }
+            Some(SupervisorTopology::Workspace) => {
+                Err("supervisor_topology=workspace is not implemented".into())
+            }
+            Some(SupervisorTopology::Gateway) => {
+                let shared = self.shared_supervisor.as_ref().ok_or_else(|| {
+                    "supervisor_topology=gateway requires shared_supervisor".to_string()
+                })?;
+                shared.validate()?;
+                if self.provider_spiffe_enabled() {
+                    return Err("supervisor_topology=gateway does not support provider_spiffe_workload_api_socket_path; a shared supervisor has no per-sandbox workload identity".into());
+                }
+                if self.https_proxy.is_some()
+                    || self.proxy_auth_secret_name.is_some()
+                    || self.proxy_ca_bundle.is_some()
+                {
+                    return Err(
+                        "supervisor_topology=gateway does not support upstream proxy settings"
+                            .into(),
+                    );
+                }
+                Ok(())
+            }
+        }
+    }
+
+    pub fn validate_allowed_pod_annotations(&self) -> Result<(), String> {
+        validate_pod_metadata_allowlist("allowed_pod_annotations", &self.allowed_pod_annotations)
+    }
+
+    pub fn validate_allowed_pod_labels(&self) -> Result<(), String> {
+        validate_pod_metadata_allowlist("allowed_pod_labels", &self.allowed_pod_labels)
+    }
+
+    /// Whether a caller-supplied pod annotation key passes the operator allowlist.
+    #[must_use]
+    pub fn pod_annotation_allowed(&self, key: &str) -> bool {
+        pod_metadata_key_allowed(&self.allowed_pod_annotations, key)
+    }
+
+    /// Whether a caller-supplied pod label key passes the operator allowlist.
+    #[must_use]
+    pub fn pod_label_allowed(&self, key: &str) -> bool {
+        pod_metadata_key_allowed(&self.allowed_pod_labels, key)
     }
 
     /// Clamp `sa_token_ttl_secs` into the `[MIN_SA_TOKEN_TTL_SECS,
@@ -439,66 +617,50 @@ impl KubernetesComputeConfig {
     }
 
     pub fn validate_proxy_uid(&self) -> Result<(), String> {
-        self.sidecar.validate_proxy_uid()
-    }
-
-    /// Reject pull policies Kubernetes cannot express before creating pods.
-    pub fn validate_image_pull_policies(&self) -> Result<(), String> {
-        for (field, policy) in [
-            ("image_pull_policy", self.image_pull_policy),
-            (
-                "supervisor_image_pull_policy",
-                self.supervisor_image_pull_policy,
-            ),
-        ] {
-            if policy == Some(ImagePullPolicy::Newer) {
-                return Err(format!(
-                    "{field} = \"newer\" is supported only by the Podman compute driver"
-                ));
-            }
-        }
-        Ok(())
-    }
-
-    /// Translate a shared policy to Kubernetes's API vocabulary.
-    pub fn image_pull_policy_value(policy: ImagePullPolicy) -> Result<&'static str, String> {
-        match policy {
-            ImagePullPolicy::Always => Ok("Always"),
-            ImagePullPolicy::IfNotPresent => Ok("IfNotPresent"),
-            ImagePullPolicy::Never => Ok("Never"),
-            ImagePullPolicy::Newer => Err(
-                "image pull policy 'newer' is supported only by the Podman compute driver"
-                    .to_string(),
-            ),
-        }
+        self.sandbox_runtime.validate()
     }
 
     /// Validate the operator-owned corporate upstream proxy configuration.
+    ///
+    /// The URL grammar and the pairing rules for `no_proxy`,
+    /// `proxy_connect_by_hostname`, and `proxy_ca_bundle` are delegated to
+    /// [`validate_upstream_proxy_settings`](openshell_core::driver_utils::validate_upstream_proxy_settings)
+    /// so this driver can never accept a value the supervisor rejects, or
+    /// drift from the Podman and VM drivers.
+    ///
+    /// Credential validation stays local, because this driver takes
+    /// credentials from a Kubernetes Secret reference rather than the
+    /// `proxy_auth_file` the shared rules describe.
+    ///
+    /// # Errors
+    ///
+    /// Returns a message naming the offending key.
     pub fn validate_upstream_proxy_config(&self) -> Result<(), String> {
-        use openshell_core::driver_utils::{UpstreamProxyUrlError, parse_upstream_proxy_url};
+        use openshell_core::driver_utils::{
+            UpstreamProxySettings, parse_upstream_proxy_url, validate_upstream_proxy_settings,
+        };
 
-        let proxy_addr = self
+        validate_upstream_proxy_settings(&UpstreamProxySettings {
+            url: self.https_proxy.as_deref(),
+            no_proxy: self.no_proxy.as_deref(),
+            connect_by_hostname: self.proxy_connect_by_hostname,
+            ca_bundle: self.proxy_ca_bundle.as_deref(),
+            // Credentials are validated below, so the shared auth fields stay
+            // unset; this label only redirects the inline-credential
+            // diagnostic away from `proxy_auth_file`, which this driver
+            // rejects as an unknown key.
+            auth_setting_label: Some("proxy_auth_secret_name and proxy_auth_secret_key"),
+            ..UpstreamProxySettings::default()
+        })?;
+
+        // A credential sent to an `https://` proxy travels inside the verified
+        // TLS session to that proxy, so the cleartext acknowledgement below is
+        // only meaningful for an `http://` one. The URL already parsed above.
+        let proxy_secure = self
             .https_proxy
             .as_deref()
-            .map(|url| {
-                parse_upstream_proxy_url(url).map_err(|err| match err {
-                    UpstreamProxyUrlError::Empty => {
-                        "https_proxy must not be empty when set".to_string()
-                    }
-                    UpstreamProxyUrlError::InlineCredentials => "https_proxy must not embed credentials in the URL; supply them through proxy_auth_secret_name and proxy_auth_secret_key".to_string(),
-                    err => format!("https_proxy {err}"),
-                })
-            })
-            .transpose()?;
-
-        if let Some(list) = self.no_proxy.as_deref() {
-            if list.trim().is_empty() {
-                return Err("no_proxy must not be empty when set; omit it instead".to_string());
-            }
-            if self.https_proxy.is_none() {
-                return Err("no_proxy is set but no https_proxy is configured".to_string());
-            }
-        }
+            .and_then(|url| parse_upstream_proxy_url(url).ok())
+            .is_some_and(|addr| addr.secure);
 
         let secret_name = self.proxy_auth_secret_name.as_deref();
         let secret_key = self.proxy_auth_secret_key.as_deref();
@@ -548,16 +710,8 @@ impl KubernetesComputeConfig {
                             .to_string(),
                     );
                 }
-                if proxy_addr.as_ref().is_some_and(|proxy| !proxy.secure)
-                    && self.proxy_auth_allow_insecure != Some(true)
-                {
-                    return Err("proxy credentials use cleartext Basic auth over the connection to the http:// proxy; set proxy_auth_allow_insecure = true to accept that exposure, or remove the credential Secret".to_string());
-                }
-                if self.topology == SupervisorTopology::Combined {
-                    return Err(
-                        "proxy credential Secrets require topology = \"sidecar\"; combined topology shares the credential mount with the workload and fsGroup can make it readable by the sandbox user"
-                            .to_string(),
-                    );
+                if !proxy_secure && self.proxy_auth_allow_insecure != Some(true) {
+                    return Err("proxy credentials use cleartext Basic auth over the connection to the http:// proxy; set proxy_auth_allow_insecure = true to accept that exposure, use an https:// proxy, or remove the credential Secret".to_string());
                 }
             }
             _ => {
@@ -568,11 +722,6 @@ impl KubernetesComputeConfig {
             }
         }
 
-        if self.proxy_connect_by_hostname.is_some() && self.https_proxy.is_none() {
-            return Err(
-                "proxy_connect_by_hostname is set but no https_proxy is configured".to_string(),
-            );
-        }
         Ok(())
     }
 
@@ -583,7 +732,7 @@ impl KubernetesComputeConfig {
     /// 2. `OpenShift` SCC namespace annotations (`sa.scc.uid-range`,
     ///    `sa.scc.supplemental-groups`) — passed in as the optional
     ///    `namespace_annotations` map
-    /// 3. Fallback defaults: UID=`1000`, GID=UID
+    /// 3. Fallback defaults: UID=`10001`, GID=UID
     pub fn resolve_sandbox_uid(
         &self,
         namespace_annotations: Option<&BTreeMap<String, String>>,
@@ -688,6 +837,20 @@ impl KubernetesComputeConfig {
     #[must_use]
     pub fn is_multi_namespace(&self) -> bool {
         !matches!(self.workspace_mode, WorkspaceMode::Shared)
+    }
+
+    /// Where supervisor Pods read the gateway CA. Outside
+    /// shared mode it is staged into each generation's bootstrap Secret.
+    #[must_use]
+    pub fn supervisor_client_tls(&self) -> crate::sandbox_runtime::SupervisorClientTls<'_> {
+        use crate::sandbox_runtime::SupervisorClientTls;
+        if self.client_tls_secret_name.is_empty() {
+            SupervisorClientTls::Disabled
+        } else if self.is_multi_namespace() {
+            SupervisorClientTls::Bootstrap
+        } else {
+            SupervisorClientTls::Secret(&self.client_tls_secret_name)
+        }
     }
 
     /// Compute the K8s resource name for a sandbox.
@@ -832,6 +995,87 @@ fn is_dns1123_subdomain(value: &str) -> bool {
         })
 }
 
+/// Validate an `allowed_pod_annotations` or `allowed_pod_labels` list. Each
+/// entry is an exact qualified key or a `<domain>/*` wildcard outside the
+/// reserved domains.
+fn validate_pod_metadata_allowlist(field: &str, entries: &[String]) -> Result<(), String> {
+    for entry in entries {
+        let key = entry.strip_suffix("/*").unwrap_or(entry);
+        let wildcard = key.len() != entry.len();
+        let (prefix, name) = match key.split_once('/') {
+            Some((prefix, name)) if !wildcard => (Some(prefix), Some(name)),
+            Some(_) => {
+                return Err(format!(
+                    "{field} entry {entry:?}: wildcard entries must be `<domain>/*`"
+                ));
+            }
+            None if wildcard => (Some(key), None),
+            None => (None, Some(key)),
+        };
+        if let Some(prefix) = prefix
+            && !is_dns1123_subdomain(prefix)
+        {
+            return Err(format!(
+                "{field} entry {entry:?}: invalid key prefix {prefix:?}"
+            ));
+        }
+        if let Some(name) = name
+            && !is_qualified_name_segment(name)
+        {
+            return Err(format!(
+                "{field} entry {entry:?}: invalid key name {name:?}"
+            ));
+        }
+        if prefix.is_some_and(is_reserved_pod_metadata_domain) {
+            return Err(format!(
+                "{field} entry {entry:?}: domain is reserved for OpenShell and Agent Sandbox"
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn pod_metadata_key_allowed(entries: &[String], key: &str) -> bool {
+    let prefix = key.split_once('/').map(|(prefix, _)| prefix);
+    if prefix.is_some_and(is_reserved_pod_metadata_domain) {
+        return false;
+    }
+    entries.iter().any(|entry| {
+        entry
+            .strip_suffix("/*")
+            .map_or_else(|| entry == key, |domain| prefix == Some(domain))
+    })
+}
+
+/// Pod annotation and label domains owned by `OpenShell` (sandbox identity
+/// such as `openshell.ai/sandbox-id` and boundary labels) and the Agent
+/// Sandbox controller (which strips them from pod templates). Sandbox
+/// templates can never set keys in these domains or their subdomains,
+/// regardless of `allowed_pod_annotations` or `allowed_pod_labels`.
+const RESERVED_POD_METADATA_DOMAINS: &[&str] = &["openshell.ai", "agents.x-k8s.io"];
+
+fn is_reserved_pod_metadata_domain(domain: &str) -> bool {
+    RESERVED_POD_METADATA_DOMAINS.iter().any(|reserved| {
+        domain == *reserved
+            || domain
+                .strip_suffix(reserved)
+                .is_some_and(|rest| rest.ends_with('.'))
+    })
+}
+
+/// Kubernetes qualified-name segment: at most 63 alphanumeric, `-`, `_`, or
+/// `.` characters, beginning and ending with an alphanumeric character.
+fn is_qualified_name_segment(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    !bytes.is_empty()
+        && bytes.len() <= 63
+        && bytes.first().is_some_and(u8::is_ascii_alphanumeric)
+        && bytes.last().is_some_and(u8::is_ascii_alphanumeric)
+        && bytes
+            .iter()
+            .all(|b| b.is_ascii_alphanumeric() || b"-_.".contains(b))
+}
+
 fn validate_provider_spiffe_workload_api_socket_path_value(
     socket_path: &str,
 ) -> Result<(), String> {
@@ -870,6 +1114,114 @@ mod tests {
     use std::collections::BTreeMap as HashMap;
 
     #[test]
+    fn gateway_supervisor_topology_requires_its_connection_and_refuses_unsupported_inputs() {
+        let shared = || SharedSupervisorConfig {
+            service_name: "openshell-supervisor".to_string(),
+            service_namespace: "openshell".to_string(),
+            runtime_port: 8443,
+            token_secret_name: "openshell-supervisor-token".to_string(),
+        };
+        let gateway = |shared: Option<SharedSupervisorConfig>| KubernetesComputeConfig {
+            supervisor_topology: Some(SupervisorTopology::Gateway),
+            shared_supervisor: shared,
+            ..KubernetesComputeConfig::default()
+        };
+        assert!(
+            gateway(Some(shared()))
+                .validate_supervisor_topology()
+                .is_ok()
+        );
+        assert!(gateway(None).validate_supervisor_topology().is_err());
+        // The connection alone does not opt a gateway in.
+        let unset = KubernetesComputeConfig {
+            shared_supervisor: Some(shared()),
+            ..KubernetesComputeConfig::default()
+        };
+        assert!(unset.validate_supervisor_topology().is_err());
+        for invalid in [
+            SharedSupervisorConfig {
+                runtime_port: 0,
+                ..shared()
+            },
+            SharedSupervisorConfig {
+                service_namespace: "Not_A_Label".to_string(),
+                ..shared()
+            },
+            SharedSupervisorConfig {
+                token_secret_name: "Not_A_Secret_Name".to_string(),
+                ..shared()
+            },
+        ] {
+            assert!(
+                gateway(Some(invalid))
+                    .validate_supervisor_topology()
+                    .is_err()
+            );
+        }
+        // A shared supervisor holds no per-sandbox workload identity or proxy credential.
+        let with_proxy = KubernetesComputeConfig {
+            https_proxy: Some("http://proxy.example:3128".to_string()),
+            ..gateway(Some(shared()))
+        };
+        assert!(with_proxy.validate_supervisor_topology().is_err());
+        let with_proxy_ca = KubernetesComputeConfig {
+            proxy_ca_bundle: Some("/etc/proxy/ca.pem".to_string()),
+            ..gateway(Some(shared()))
+        };
+        assert!(with_proxy_ca.validate_supervisor_topology().is_err());
+        let workspace = KubernetesComputeConfig {
+            supervisor_topology: Some(SupervisorTopology::Workspace),
+            ..KubernetesComputeConfig::default()
+        };
+        assert!(workspace.validate_supervisor_topology().is_err());
+    }
+
+    #[test]
+    fn image_pull_policy_accepts_config_and_kubernetes_spellings() {
+        for (value, expected) in [
+            ("always", KubernetesImagePullPolicy::Always),
+            ("Always", KubernetesImagePullPolicy::Always),
+            ("if_not_present", KubernetesImagePullPolicy::IfNotPresent),
+            ("IfNotPresent", KubernetesImagePullPolicy::IfNotPresent),
+            ("never", KubernetesImagePullPolicy::Never),
+            ("Never", KubernetesImagePullPolicy::Never),
+        ] {
+            assert_eq!(value.parse(), Ok(expected));
+        }
+        assert!("newer".parse::<KubernetesImagePullPolicy>().is_err());
+        assert!("sometimes".parse::<KubernetesImagePullPolicy>().is_err());
+    }
+
+    #[test]
+    fn image_pull_policy_fields_reject_unsupported_values() {
+        for field in [
+            "image_pull_policy",
+            "sandbox_runtime_image_pull_policy",
+            "supervisor_image_pull_policy",
+        ] {
+            let input = format!("{field} = \"sometimes\"");
+            assert!(toml::from_str::<KubernetesComputeConfig>(&input).is_err());
+        }
+    }
+
+    #[test]
+    fn published_kubernetes_example_is_valid_toml() {
+        let docs = include_str!("../../../docs/how-it-works/gateways/configuration.mdx");
+        let section = docs
+            .split_once("### Kubernetes")
+            .expect("Kubernetes documentation section")
+            .1;
+        let example = section
+            .split_once("```toml")
+            .expect("Kubernetes TOML fence")
+            .1
+            .split_once("```")
+            .expect("closed Kubernetes TOML fence")
+            .0;
+        toml::from_str::<toml::Value>(example).expect("valid Kubernetes gateway TOML example");
+    }
+
+    #[test]
     fn default_workspace_storage_size_is_2gi() {
         let cfg = KubernetesComputeConfig::default();
         assert_eq!(
@@ -885,90 +1237,6 @@ mod tests {
     }
 
     #[test]
-    fn default_topology_is_combined() {
-        let cfg = KubernetesComputeConfig::default();
-        assert_eq!(cfg.topology, SupervisorTopology::Combined);
-        assert_eq!(cfg.topology.to_string(), "combined");
-    }
-
-    #[test]
-    fn default_proxy_uid_is_dedicated_non_root_uid() {
-        let cfg = KubernetesComputeConfig::default();
-        assert_eq!(cfg.sidecar.proxy_uid, DEFAULT_PROXY_UID);
-    }
-
-    #[test]
-    fn default_sidecar_requires_process_binary_aware_network_policy() {
-        let cfg = KubernetesComputeConfig::default();
-        assert!(cfg.sidecar.process_binary_aware_network_policy);
-    }
-
-    #[test]
-    fn image_pull_policy_uses_shared_canonical_values() {
-        let cfg: KubernetesComputeConfig = serde_json::from_value(serde_json::json!({
-            "image_pull_policy": "if_not_present",
-            "supervisor_image_pull_policy": "never"
-        }))
-        .unwrap();
-        assert_eq!(cfg.image_pull_policy, Some(ImagePullPolicy::IfNotPresent));
-        assert_eq!(
-            cfg.supervisor_image_pull_policy,
-            Some(ImagePullPolicy::Never)
-        );
-
-        for (policy, expected) in [
-            (ImagePullPolicy::Always, "Always"),
-            (ImagePullPolicy::IfNotPresent, "IfNotPresent"),
-            (ImagePullPolicy::Never, "Never"),
-        ] {
-            assert_eq!(
-                KubernetesComputeConfig::image_pull_policy_value(policy).unwrap(),
-                expected
-            );
-        }
-    }
-
-    #[test]
-    fn image_pull_policy_rejects_newer_for_sandbox_and_supervisor_images() {
-        assert!(
-            KubernetesComputeConfig::image_pull_policy_value(ImagePullPolicy::Newer)
-                .unwrap_err()
-                .contains("supported only by the Podman")
-        );
-
-        for (sandbox, supervisor) in [
-            (Some(ImagePullPolicy::Newer), None),
-            (None, Some(ImagePullPolicy::Newer)),
-        ] {
-            let cfg = KubernetesComputeConfig {
-                image_pull_policy: sandbox,
-                supervisor_image_pull_policy: supervisor,
-                ..KubernetesComputeConfig::default()
-            };
-            let error = cfg.validate_image_pull_policies().unwrap_err();
-            assert!(error.contains("supported only by the Podman"));
-        }
-    }
-
-    #[test]
-    fn serde_override_topology_sidecar() {
-        let json = serde_json::json!({
-            "topology": "sidecar"
-        });
-        let cfg: KubernetesComputeConfig = serde_json::from_value(json).unwrap();
-        assert_eq!(cfg.topology, SupervisorTopology::Sidecar);
-    }
-
-    #[test]
-    fn serde_override_topology_combined() {
-        let json = serde_json::json!({
-            "topology": "combined"
-        });
-        let cfg: KubernetesComputeConfig = serde_json::from_value(json).unwrap();
-        assert_eq!(cfg.topology, SupervisorTopology::Combined);
-    }
-
-    #[test]
     fn serde_rejects_sidecar_binary_identity_field() {
         let json = serde_json::json!({
             "sidecar": {
@@ -976,64 +1244,6 @@ mod tests {
             }
         });
         let err = serde_json::from_value::<KubernetesComputeConfig>(json).unwrap_err();
-        assert!(err.to_string().contains("unknown field"));
-    }
-
-    #[test]
-    fn serde_override_sidecar_process_binary_aware_network_policy_nested() {
-        let json = serde_json::json!({
-            "sidecar": {
-                "process_binary_aware_network_policy": false
-            }
-        });
-        let cfg: KubernetesComputeConfig = serde_json::from_value(json).unwrap();
-        assert!(!cfg.sidecar.process_binary_aware_network_policy);
-    }
-
-    #[test]
-    fn serde_override_sidecar_proxy_uid_nested() {
-        let json = serde_json::json!({
-            "sidecar": {
-                "proxy_uid": 2000
-            }
-        });
-        let cfg: KubernetesComputeConfig = serde_json::from_value(json).unwrap();
-        assert_eq!(cfg.sidecar.proxy_uid, 2000);
-        cfg.validate_proxy_uid().unwrap();
-    }
-
-    #[test]
-    fn validate_proxy_uid_rejects_privileged_uid() {
-        let cfg = KubernetesComputeConfig {
-            sidecar: KubernetesSidecarConfig {
-                proxy_uid: 999,
-                ..KubernetesSidecarConfig::default()
-            },
-            ..KubernetesComputeConfig::default()
-        };
-        let err = cfg.validate_proxy_uid().unwrap_err();
-        assert!(err.contains("proxy_uid"));
-    }
-
-    #[test]
-    fn serde_rejects_invalid_topology() {
-        let json = serde_json::json!({
-            "topology": "unsupported"
-        });
-        let err = serde_json::from_value::<KubernetesComputeConfig>(json).unwrap_err();
-        assert!(err.to_string().contains("unknown variant"));
-    }
-
-    #[test]
-    fn serde_rejects_removed_topology_alias_field() {
-        let mut json = serde_json::Map::new();
-        json.insert(
-            ["supervisor", "topology"].join("_"),
-            serde_json::json!("sidecar"),
-        );
-        let err =
-            serde_json::from_value::<KubernetesComputeConfig>(serde_json::Value::Object(json))
-                .unwrap_err();
         assert!(err.to_string().contains("unknown field"));
     }
 
@@ -1102,57 +1312,85 @@ mod tests {
         assert_eq!(cfg.default_runtime_class_name, "nvidia");
     }
 
+    fn with_allowed_pod_annotations(entries: &[&str]) -> KubernetesComputeConfig {
+        KubernetesComputeConfig {
+            allowed_pod_annotations: entries.iter().map(ToString::to_string).collect(),
+            ..KubernetesComputeConfig::default()
+        }
+    }
+
+    #[test]
+    fn pod_annotation_allowed_matches_exact_and_domain_entries() {
+        assert!(!KubernetesComputeConfig::default().pod_annotation_allowed("example.com/a"));
+
+        let cfg = with_allowed_pod_annotations(&["example.com/*", "team.org/owner", "owner"]);
+        for (key, allowed) in [
+            ("example.com/a", true),
+            ("sub.example.com/a", false),
+            ("team.org/owner", true),
+            ("team.org/other", false),
+            ("owner", true),
+        ] {
+            assert_eq!(cfg.pod_annotation_allowed(key), allowed, "{key}");
+        }
+
+        // Reserved domains stay blocked even if validation was bypassed.
+        let cfg = with_allowed_pod_annotations(&["openshell.ai/sandbox-id"]);
+        assert!(!cfg.pod_annotation_allowed("openshell.ai/sandbox-id"));
+    }
+
+    #[test]
+    fn validate_allowed_pod_annotations_rejects_malformed_and_reserved_entries() {
+        with_allowed_pod_annotations(&["example.com/*", "team.org/owner", "owner"])
+            .validate_allowed_pod_annotations()
+            .unwrap();
+        for entry in [
+            "*",
+            "",
+            "example.com/",
+            "Example.com/owner",
+            "example.com/a/*",
+            "example.com/*/owner",
+            "-bad",
+            "openshell.ai/*",
+            "agents.x-k8s.io/pod-name",
+            "extensions.agents.x-k8s.io/*",
+        ] {
+            assert!(
+                with_allowed_pod_annotations(&[entry])
+                    .validate_allowed_pod_annotations()
+                    .is_err(),
+                "{entry:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn pod_label_allowlist_is_separate_from_annotation_allowlist() {
+        let cfg = KubernetesComputeConfig {
+            allowed_pod_annotations: vec!["annotations.example.com/*".into()],
+            allowed_pod_labels: vec!["app".into(), "labels.example.com/*".into()],
+            ..KubernetesComputeConfig::default()
+        };
+        assert!(cfg.pod_label_allowed("app"));
+        assert!(cfg.pod_label_allowed("labels.example.com/team"));
+        assert!(!cfg.pod_label_allowed("annotations.example.com/team"));
+        assert!(!cfg.pod_annotation_allowed("labels.example.com/team"));
+        assert!(!KubernetesComputeConfig::default().pod_label_allowed("app"));
+
+        let cfg = KubernetesComputeConfig {
+            allowed_pod_labels: vec!["openshell.ai/managed-by".into()],
+            ..KubernetesComputeConfig::default()
+        };
+        assert!(!cfg.pod_label_allowed("openshell.ai/managed-by"));
+        let err = cfg.validate_allowed_pod_labels().unwrap_err();
+        assert!(err.starts_with("allowed_pod_labels entry"), "{err}");
+    }
+
     #[test]
     fn default_runtime_class_name_is_empty() {
         let cfg = KubernetesComputeConfig::default();
         assert!(cfg.default_runtime_class_name.is_empty());
-    }
-
-    #[test]
-    fn default_app_armor_profile_is_none() {
-        let cfg = KubernetesComputeConfig::default();
-        assert!(cfg.app_armor_profile.is_none());
-    }
-
-    #[test]
-    fn serde_override_app_armor_profile_unconfined() {
-        let json = serde_json::json!({
-            "app_armor_profile": "Unconfined"
-        });
-        let cfg: KubernetesComputeConfig = serde_json::from_value(json).unwrap();
-        assert_eq!(cfg.app_armor_profile, Some(AppArmorProfile::Unconfined));
-    }
-
-    #[test]
-    fn serde_override_app_armor_profile_runtime_default() {
-        let json = serde_json::json!({
-            "app_armor_profile": "RuntimeDefault"
-        });
-        let cfg: KubernetesComputeConfig = serde_json::from_value(json).unwrap();
-        assert_eq!(cfg.app_armor_profile, Some(AppArmorProfile::RuntimeDefault));
-    }
-
-    #[test]
-    fn serde_override_app_armor_profile_localhost() {
-        let json = serde_json::json!({
-            "app_armor_profile": "Localhost/openshell-supervisor"
-        });
-        let cfg: KubernetesComputeConfig = serde_json::from_value(json).unwrap();
-        assert_eq!(
-            cfg.app_armor_profile,
-            Some(AppArmorProfile::Localhost(
-                "openshell-supervisor".to_string()
-            ))
-        );
-    }
-
-    #[test]
-    fn serde_empty_app_armor_profile_disables_field() {
-        let json = serde_json::json!({
-            "app_armor_profile": ""
-        });
-        let cfg: KubernetesComputeConfig = serde_json::from_value(json).unwrap();
-        assert_eq!(cfg.app_armor_profile, None);
     }
 
     #[test]
@@ -1182,15 +1420,6 @@ mod tests {
                 "unexpected error for {socket_path}: {err}"
             );
         }
-    }
-
-    #[test]
-    fn serde_rejects_invalid_app_armor_profile() {
-        let json = serde_json::json!({
-            "app_armor_profile": "runtime/default"
-        });
-        let err = serde_json::from_value::<KubernetesComputeConfig>(json).unwrap_err();
-        assert!(err.to_string().contains("unknown AppArmor profile"));
     }
 
     #[test]
@@ -1399,7 +1628,6 @@ mod tests {
     #[test]
     fn upstream_proxy_config_accepts_secret_credentials_with_acknowledgement() {
         let cfg = KubernetesComputeConfig {
-            topology: SupervisorTopology::Sidecar,
             https_proxy: Some("http://proxy.corp.example:8080".to_string()),
             proxy_auth_secret_name: Some("corporate-proxy-auth".to_string()),
             proxy_auth_secret_key: Some("credentials".to_string()),
@@ -1410,32 +1638,24 @@ mod tests {
     }
 
     #[test]
-    fn upstream_proxy_config_accepts_tls_protected_secret_credentials() {
-        let cfg = KubernetesComputeConfig {
-            topology: SupervisorTopology::Sidecar,
-            https_proxy: Some("https://proxy.corp.example:8443".to_string()),
-            proxy_auth_secret_name: Some("corporate-proxy-auth".to_string()),
-            proxy_auth_secret_key: Some("credentials".to_string()),
-            ..KubernetesComputeConfig::default()
-        };
-        assert!(cfg.validate_upstream_proxy_config().is_ok());
-    }
-
-    #[test]
-    fn toml_deserializes_sidecar_upstream_proxy_settings() {
+    fn toml_deserializes_upstream_proxy_settings() {
         let cfg: KubernetesComputeConfig = toml::from_str(
             r#"
-                topology = "sidecar"
                 https_proxy = "http://proxy.corp.example:8080"
                 no_proxy = ".svc.cluster.local,10.96.0.0/12"
                 proxy_auth_secret_name = "corporate-proxy-auth"
                 proxy_auth_secret_key = "credentials"
                 proxy_auth_allow_insecure = true
                 proxy_connect_by_hostname = true
+                proxy_ca_bundle = "/etc/openshell-tls/proxy-ca/ca.crt"
             "#,
         )
         .unwrap();
         assert!(cfg.validate_upstream_proxy_config().is_ok());
+        assert_eq!(
+            cfg.proxy_ca_bundle.as_deref(),
+            Some("/etc/openshell-tls/proxy-ca/ca.crt")
+        );
         assert_eq!(
             cfg.https_proxy.as_deref(),
             Some("http://proxy.corp.example:8080")
@@ -1547,7 +1767,6 @@ mod tests {
             "bad key".to_string(), // whitespace is outside the allowed charset
         ] {
             let cfg = KubernetesComputeConfig {
-                topology: SupervisorTopology::Sidecar,
                 https_proxy: Some("http://proxy.corp.example:8080".to_string()),
                 proxy_auth_secret_name: Some("corporate-proxy-auth".to_string()),
                 proxy_auth_secret_key: Some(key.clone()),
@@ -1565,7 +1784,6 @@ mod tests {
     #[test]
     fn upstream_proxy_config_accepts_max_length_secret_key() {
         let cfg = KubernetesComputeConfig {
-            topology: SupervisorTopology::Sidecar,
             https_proxy: Some("http://proxy.corp.example:8080".to_string()),
             proxy_auth_secret_name: Some("corporate-proxy-auth".to_string()),
             proxy_auth_secret_key: Some("a".repeat(253)),
@@ -1576,20 +1794,6 @@ mod tests {
     }
 
     #[test]
-    fn upstream_proxy_config_rejects_credentials_in_combined_topology() {
-        let cfg = KubernetesComputeConfig {
-            topology: SupervisorTopology::Combined,
-            https_proxy: Some("http://proxy.corp.example:8080".to_string()),
-            proxy_auth_secret_name: Some("corporate-proxy-auth".to_string()),
-            proxy_auth_secret_key: Some("credentials".to_string()),
-            proxy_auth_allow_insecure: Some(true),
-            ..KubernetesComputeConfig::default()
-        };
-        let err = cfg.validate_upstream_proxy_config().unwrap_err();
-        assert!(err.contains("topology = \"sidecar\""), "{err}");
-    }
-
-    #[test]
     fn upstream_proxy_config_allows_explicit_false_acknowledgement_without_credentials() {
         let cfg = KubernetesComputeConfig {
             https_proxy: Some("http://proxy.corp.example:8080".to_string()),
@@ -1597,6 +1801,90 @@ mod tests {
             ..KubernetesComputeConfig::default()
         };
         assert!(cfg.validate_upstream_proxy_config().is_ok());
+    }
+
+    #[test]
+    fn upstream_proxy_config_accepts_a_ca_bundle_with_an_https_proxy() {
+        let cfg = KubernetesComputeConfig {
+            https_proxy: Some("https://proxy.corp.example:3130".to_string()),
+            proxy_ca_bundle: Some("/etc/openshell-tls/proxy-ca/ca.crt".to_string()),
+            ..KubernetesComputeConfig::default()
+        };
+        assert!(cfg.validate_upstream_proxy_config().is_ok());
+    }
+
+    #[test]
+    fn upstream_proxy_config_accepts_a_ca_bundle_for_an_intercepting_http_proxy() {
+        // A proxy reached over plain HTTP still re-signs tunneled upstream
+        // certificates when it intercepts TLS, so the bundle is meaningful
+        // without an `https://` proxy URL.
+        let cfg = KubernetesComputeConfig {
+            https_proxy: Some("http://proxy.corp.example:8080".to_string()),
+            proxy_ca_bundle: Some("/etc/openshell-tls/proxy-ca/ca.crt".to_string()),
+            ..KubernetesComputeConfig::default()
+        };
+        assert!(cfg.validate_upstream_proxy_config().is_ok());
+    }
+
+    #[test]
+    fn upstream_proxy_config_rejects_a_ca_bundle_without_a_proxy() {
+        let cfg = KubernetesComputeConfig {
+            proxy_ca_bundle: Some("/etc/openshell-tls/proxy-ca/ca.crt".to_string()),
+            ..KubernetesComputeConfig::default()
+        };
+        let err = cfg.validate_upstream_proxy_config().unwrap_err();
+        assert!(err.contains("proxy_ca_bundle"), "{err}");
+    }
+
+    #[test]
+    fn upstream_proxy_config_rejects_an_empty_ca_bundle() {
+        // Present-but-empty is a misconfiguration, not "unset": the supervisor
+        // treats an empty driver-supplied argument as a fatal error.
+        let cfg = KubernetesComputeConfig {
+            https_proxy: Some("https://proxy.corp.example:3130".to_string()),
+            proxy_ca_bundle: Some("   ".to_string()),
+            ..KubernetesComputeConfig::default()
+        };
+        let err = cfg.validate_upstream_proxy_config().unwrap_err();
+        assert!(err.contains("proxy_ca_bundle"), "{err}");
+    }
+
+    #[test]
+    fn upstream_proxy_config_accepts_credentials_without_acknowledgement_for_an_https_proxy() {
+        // The credential travels inside the verified TLS session to the proxy,
+        // so the cleartext acknowledgement is not meaningful here.
+        let cfg = KubernetesComputeConfig {
+            https_proxy: Some("https://proxy.corp.example:3130".to_string()),
+            proxy_auth_secret_name: Some("corporate-proxy-auth".to_string()),
+            proxy_auth_secret_key: Some("credentials".to_string()),
+            ..KubernetesComputeConfig::default()
+        };
+        assert!(cfg.validate_upstream_proxy_config().is_ok());
+    }
+
+    #[test]
+    fn upstream_proxy_config_still_requires_acknowledgement_for_an_http_proxy() {
+        let cfg = KubernetesComputeConfig {
+            https_proxy: Some("http://proxy.corp.example:8080".to_string()),
+            proxy_auth_secret_name: Some("corporate-proxy-auth".to_string()),
+            proxy_auth_secret_key: Some("credentials".to_string()),
+            ..KubernetesComputeConfig::default()
+        };
+        let err = cfg.validate_upstream_proxy_config().unwrap_err();
+        assert!(err.contains("proxy_auth_allow_insecure"), "{err}");
+    }
+
+    #[test]
+    fn upstream_proxy_config_names_the_secret_keys_for_inline_credentials() {
+        // `proxy_auth_file` is a Podman/VM key that this driver rejects under
+        // `deny_unknown_fields`, so it must never appear in the diagnostic.
+        let cfg = KubernetesComputeConfig {
+            https_proxy: Some("http://user:pass@proxy.corp.example:8080".to_string()),
+            ..KubernetesComputeConfig::default()
+        };
+        let err = cfg.validate_upstream_proxy_config().unwrap_err();
+        assert!(err.contains("proxy_auth_secret_name"), "{err}");
+        assert!(!err.contains("proxy_auth_file"), "{err}");
     }
 
     #[test]

@@ -19,7 +19,7 @@ func TestSandboxLifecycle(t *testing.T) {
 
     ctx := context.Background()
 
-    sb, err := client.Sandboxes().Create(ctx, "default", "my-sandbox", &v1.SandboxSpec{}, nil)
+    sb, err := client.Sandboxes().Create(ctx, "default", "my-sandbox", &v1.SandboxSpec{})
     require.NoError(t, err)
     assert.Equal(t, types.SandboxProvisioning, sb.Status.Phase)
 
@@ -27,7 +27,9 @@ func TestSandboxLifecycle(t *testing.T) {
     require.NoError(t, err)
     assert.Equal(t, types.SandboxReady, sb.Status.Phase)
 
-    require.NoError(t, client.Sandboxes().Delete(ctx, "default", "my-sandbox"))
+    deletion, err := client.Sandboxes().Delete(ctx, "default", "my-sandbox")
+    require.NoError(t, err)
+    assert.Equal(t, v1.DeletionCompleted, deletion.Outcome)
 }
 ```
 

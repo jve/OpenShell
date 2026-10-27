@@ -8,7 +8,9 @@ use openshell_core::VERSION;
 use openshell_core::proto::compute::v1::compute_driver_server::ComputeDriverServer;
 #[cfg(target_os = "macos")]
 use openshell_driver_vm::{VM_RUNTIME_DIR_ENV, configured_runtime_dir};
-use openshell_driver_vm::{VmBackend, VmDriver, VmDriverConfig, VmLaunchConfig, procguard, run_vm};
+use openshell_driver_vm::{
+    VmBackend, VmDriver, VmDriverConfig, VmLaunchConfig, VmMount, VsockPortMap, procguard, run_vm,
+};
 use std::io;
 use std::net::SocketAddr;
 use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
@@ -23,8 +25,18 @@ use tracing::info;
 #[command(version = VERSION)]
 #[allow(clippy::struct_excessive_bools)]
 struct Args {
+    /// Operator-owned JSON policy; omitted means driver config disabled and labels required.
+    #[arg(
+        long,
+        env = "OPENSHELL_DRIVER_ADMISSION_CONFIG_JSON",
+        default_value = "{}"
+    )]
+    admission_config_json: openshell_core::resource_admission::DriverAdmissionConfig,
     #[arg(long, hide = true, default_value_t = false)]
     internal_run_vm: bool,
+
+    #[arg(long, hide = true)]
+    internal_prepare_image: Option<PathBuf>,
 
     #[arg(long = "vm-root-disk", hide = true, alias = "vm-rootfs")]
     vm_root_disk: Option<PathBuf>,
@@ -88,6 +100,18 @@ struct Args {
     #[arg(long, env = "OPENSHELL_OTLP_ENDPOINT")]
     otlp_endpoint: Option<String>,
 
+    /// OTLP/gRPC collector endpoint for supervisor OCSF event export.
+    #[arg(long, env = "OPENSHELL_OTLP_OCSF_ENDPOINT")]
+    otlp_ocsf_endpoint: Option<String>,
+
+    /// OCSF schema version that supervisors downgrade exported events to.
+    #[arg(
+        long,
+        env = "OPENSHELL_OTLP_OCSF_SCHEMA_VERSION",
+        requires = "otlp_ocsf_endpoint"
+    )]
+    otlp_ocsf_schema_version: Option<String>,
+
     #[arg(long, env = "OPENSHELL_GATEWAY_NAME")]
     gateway_name: Option<String>,
 
@@ -110,9 +134,11 @@ struct Args {
     #[arg(long = "guest-tls-ca", env = "OPENSHELL_VM_TLS_CA")]
     guest_tls_ca: Option<PathBuf>,
 
+    /// Deprecated; client certificates are rejected.
     #[arg(long = "guest-tls-cert", env = "OPENSHELL_VM_TLS_CERT")]
     guest_tls_cert: Option<PathBuf>,
 
+    /// Deprecated; client private keys are rejected.
     #[arg(long = "guest-tls-key", env = "OPENSHELL_VM_TLS_KEY")]
     guest_tls_key: Option<PathBuf>,
 
@@ -189,6 +215,33 @@ struct Args {
     #[arg(long, env = "OPENSHELL_VM_SANDBOX_GID")]
     sandbox_gid: Option<u32>,
 
+    // Corporate forward proxy for sandbox egress. Operator-owned: these reach
+    // the host supervisor on its argv, which the sandbox image and the
+    // user-supplied environment cannot influence.
+    #[arg(long, env = "OPENSHELL_VM_HTTPS_PROXY")]
+    https_proxy: Option<String>,
+
+    #[arg(long, env = "OPENSHELL_VM_NO_PROXY")]
+    no_proxy: Option<String>,
+
+    #[arg(long, env = "OPENSHELL_VM_PROXY_AUTH_FILE")]
+    proxy_auth_file: Option<String>,
+
+    // Value-taking rather than a presence flag so an explicit `false` in
+    // `[openshell.drivers.vm]` survives the gateway -> driver hop and still
+    // trips the "acknowledgement without a credential" check.
+    #[arg(long, env = "OPENSHELL_VM_PROXY_AUTH_ALLOW_INSECURE")]
+    proxy_auth_allow_insecure: Option<bool>,
+
+    #[arg(long, env = "OPENSHELL_VM_PROXY_CONNECT_BY_HOSTNAME")]
+    proxy_connect_by_hostname: Option<bool>,
+
+    #[arg(long, env = "OPENSHELL_VM_PROXY_CA_BUNDLE")]
+    proxy_ca_bundle: Option<String>,
+
+    #[arg(long, env = "OPENSHELL_VM_ENABLE_BIND_MOUNTS", default_value_t = false)]
+    enable_bind_mounts: bool,
+
     #[arg(long, env = "OPENSHELL_VM_ROOTFS_TAR_STAGING_DIR")]
     rootfs_tar_staging_dir: Option<PathBuf>,
 
@@ -202,36 +255,33 @@ struct Args {
     vm_gpu_bdf: Option<String>,
 
     #[arg(long, hide = true)]
-    vm_tap_device: Option<String>,
-
-    #[arg(long, hide = true)]
-    vm_guest_ip: Option<String>,
-
-    #[arg(long, hide = true)]
-    vm_host_ip: Option<String>,
-
-    #[arg(long, hide = true)]
     vm_vsock_cid: Option<u32>,
 
     #[arg(long, hide = true)]
-    vm_guest_mac: Option<String>,
+    vm_vsock_control_port: Option<u32>,
 
     #[arg(long, hide = true)]
-    vm_gateway_port: Option<u16>,
+    vm_vsock_control_socket: Option<PathBuf>,
+
+    #[arg(long, hide = true)]
+    vm_vsock_runtime_initiated: bool,
+
+    #[arg(long, hide = true)]
+    vm_mount: Vec<String>,
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
+    if let Some(request) = args.internal_prepare_image {
+        openshell_driver_vm::driver::run_image_preparation_worker(&request)
+            .await
+            .map_err(|error| miette::miette!("{error}"))?;
+        return Ok(());
+    }
     if args.internal_run_vm {
-        // We intentionally defer procguard arming until `run_vm()` so
-        // that the only arm is the one that knows how to clean up
-        // gvproxy. Racing two watchers against the same parent-death
-        // event causes the bare arm's `exit(1)` to win, skipping the
-        // gvproxy cleanup and leaking the helper. The risk window
-        // before `run_vm` arms procguard is ~a few syscalls long
-        // (`build_vm_launch_config`, `configured_runtime_dir`), which
-        // is negligible next to the parent gRPC server's uptime.
+        // The VM launcher arms procguard after resolving its runtime so its
+        // libkrun worker cannot outlive the launcher.
         maybe_reexec_internal_vm_with_runtime_env()?;
         let config = build_vm_launch_config(&args).map_err(|err| miette::miette!("{err}"))?;
         run_vm(&config).map_err(|err| miette::miette!("{err}"))?;
@@ -254,7 +304,7 @@ async fn main() -> Result<()> {
     // we also die. Without this the driver is reparented to init and
     // keeps its per-sandbox VM launchers alive forever. Launchers have
     // their own procguards (armed in `run_vm`) which cascade cleanup of
-    // gvproxy and the libkrun worker the moment this driver exits.
+    // the libkrun worker the moment this driver exits.
     if let Err(err) = procguard::die_with_parent() {
         tracing::warn!(
             error = %err,
@@ -263,9 +313,19 @@ async fn main() -> Result<()> {
     }
 
     let driver = VmDriver::new(VmDriverConfig {
+        allow_driver_config: args.admission_config_json.allow_driver_config,
+        resource_admission: args.admission_config_json.resource_admission.clone(),
         grpc_endpoint: args
             .grpc_endpoint
             .ok_or_else(|| miette::miette!("OPENSHELL_GRPC_ENDPOINT is required"))?,
+        supervisor_otlp_endpoint: args.otlp_endpoint.clone(),
+        supervisor_gateway_name: args.gateway_name.clone(),
+        supervisor_ocsf_export: args.otlp_ocsf_endpoint.clone().map(|endpoint| {
+            openshell_core::sandbox_env::OcsfOtlpExport {
+                endpoint,
+                schema_version: args.otlp_ocsf_schema_version.clone(),
+            }
+        }),
         state_dir: args.state_dir.clone(),
         launcher_bin: None,
         default_image: args.default_image.clone(),
@@ -297,11 +357,13 @@ async fn main() -> Result<()> {
         sandbox_gid: args.sandbox_gid,
         rootfs_tar_staging_dir: args.rootfs_tar_staging_dir.clone(),
         rootfs_tar_max_bytes: args.rootfs_tar_max_bytes,
+        enable_bind_mounts: args.enable_bind_mounts,
     })
     .await
     .map_err(|err| miette::miette!("{err}"))?;
 
-    match listen_mode {
+    let socket_cleanup = driver.clone();
+    let result = match listen_mode {
         ComputeDriverListenMode::Unix {
             socket_path,
             expected_peer_pid,
@@ -332,7 +394,9 @@ async fn main() -> Result<()> {
                 .await
                 .into_diagnostic()
         }
-    }
+    };
+    socket_cleanup.remove_socket_root();
+    result
 }
 
 async fn shutdown_signal() {
@@ -583,6 +647,12 @@ fn build_vm_launch_config(args: &Args) -> std::result::Result<VmLaunchConfig, St
         Some(other) => return Err(format!("unknown VM backend: {other}")),
     };
 
+    let mounts = args
+        .vm_mount
+        .iter()
+        .map(|m| parse_vm_mount_arg(m))
+        .collect::<Result<Vec<_>, _>>()?;
+
     Ok(VmLaunchConfig {
         root_disk,
         overlay_disk,
@@ -598,12 +668,54 @@ fn build_vm_launch_config(args: &Args) -> std::result::Result<VmLaunchConfig, St
         console_output,
         backend,
         gpu_bdf: args.vm_gpu_bdf.clone(),
-        tap_device: args.vm_tap_device.clone(),
-        guest_ip: args.vm_guest_ip.clone(),
-        host_ip: args.vm_host_ip.clone(),
         vsock_cid: args.vm_vsock_cid,
-        guest_mac: args.vm_guest_mac.clone(),
-        gateway_port: args.vm_gateway_port,
+        vsock_port_map: match (
+            args.vm_vsock_control_port,
+            args.vm_vsock_control_socket.clone(),
+        ) {
+            (Some(guest_port), Some(host_socket)) => Some(VsockPortMap {
+                guest_port,
+                host_socket,
+                host_initiated: !args.vm_vsock_runtime_initiated,
+            }),
+            (None, None) => None,
+            _ => {
+                return Err(
+                    "--vm-vsock-control-port and --vm-vsock-control-socket must be set together"
+                        .to_string(),
+                );
+            }
+        },
+        mounts,
+    })
+}
+
+fn parse_vm_mount_arg(arg: &str) -> std::result::Result<VmMount, String> {
+    // Split from the right: the driver generates the tag and mode, so a tab
+    // in the source can never shift them.
+    let mut parts = arg.rsplitn(3, '\t');
+    let mode = parts
+        .next()
+        .ok_or_else(|| format!("invalid --vm-mount format: {arg}"))?;
+    let tag = parts
+        .next()
+        .ok_or_else(|| format!("invalid --vm-mount format (missing tag): {arg}"))?;
+    let source = parts
+        .next()
+        .ok_or_else(|| format!("invalid --vm-mount format (missing source): {arg}"))?;
+    let read_only = match mode {
+        "ro" => true,
+        "rw" => false,
+        _ => {
+            return Err(format!(
+                "invalid --vm-mount mode '{mode}': expected 'ro' or 'rw'"
+            ));
+        }
+    };
+    Ok(VmMount {
+        host_path: PathBuf::from(source),
+        tag: tag.to_string(),
+        read_only,
     })
 }
 
@@ -663,7 +775,7 @@ fn maybe_reexec_internal_vm_with_runtime_env() -> Result<()> {
 mod tests {
     use super::{
         Args, ComputeDriverListenMode, PeerCredentials, authorize_peer_credentials,
-        compute_driver_listen_mode,
+        compute_driver_listen_mode, parse_vm_mount_arg,
     };
     use clap::Parser;
     use std::path::PathBuf;
@@ -902,5 +1014,39 @@ mod tests {
                 expected_peer_pid: None,
             }
         );
+    }
+
+    #[test]
+    fn parse_vm_mount_arg_parses_readonly() {
+        let m = parse_vm_mount_arg("/host/src\tosfs0\tro").unwrap();
+        assert_eq!(m.host_path, PathBuf::from("/host/src"));
+        assert_eq!(m.tag, "osfs0");
+        assert!(m.read_only);
+    }
+
+    #[test]
+    fn parse_vm_mount_arg_parses_readwrite() {
+        let m = parse_vm_mount_arg("/host/src\tosfs1\trw").unwrap();
+        assert!(!m.read_only);
+    }
+
+    #[test]
+    fn parse_vm_mount_arg_keeps_tag_and_mode_when_source_has_tab() {
+        let m = parse_vm_mount_arg("/host/src\tvfs9\trw\tosfs0\tro").unwrap();
+        assert_eq!(m.host_path, PathBuf::from("/host/src\tvfs9\trw"));
+        assert_eq!(m.tag, "osfs0");
+        assert!(m.read_only);
+    }
+
+    #[test]
+    fn parse_vm_mount_arg_rejects_unknown_mode() {
+        let err = parse_vm_mount_arg("/host/src\tosfs0\treadonly").unwrap_err();
+        assert!(err.contains("expected 'ro' or 'rw'"));
+    }
+
+    #[test]
+    fn parse_vm_mount_arg_rejects_missing_fields() {
+        assert!(parse_vm_mount_arg("/host/src\tosfs0").is_err());
+        assert!(parse_vm_mount_arg("/host/src").is_err());
     }
 }

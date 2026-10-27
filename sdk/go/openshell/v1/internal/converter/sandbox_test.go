@@ -16,22 +16,51 @@ import (
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/durationpb"
 	"google.golang.org/protobuf/types/known/structpb"
+	"google.golang.org/protobuf/types/known/timestamppb"
 )
+
+func TestSandboxConfigurationAdmissionFromProto(t *testing.T) {
+	for _, tc := range []struct {
+		wire pb.ConfigurationAdmissionState
+		want v1.ConfigurationAdmissionState
+	}{
+		{pb.ConfigurationAdmissionState_CONFIGURATION_ADMISSION_STATE_PENDING, v1.ConfigurationAdmissionPending},
+		{pb.ConfigurationAdmissionState_CONFIGURATION_ADMISSION_STATE_ACCEPTED, v1.ConfigurationAdmissionAccepted},
+		{pb.ConfigurationAdmissionState_CONFIGURATION_ADMISSION_STATE_REJECTED, v1.ConfigurationAdmissionRejected},
+		{pb.ConfigurationAdmissionState(99), v1.ConfigurationAdmissionUnknown},
+	} {
+		t.Run(string(tc.want), func(t *testing.T) {
+			wire := &pb.SandboxStatus{ConfigurationAdmission: &pb.SandboxConfigurationAdmission{
+				State: tc.wire, PolicyVersion: 4, PolicyHash: "hash", ConfigRevision: 5,
+				ProviderEnvRevision: 6, Error: "invalid endpoint",
+			}}
+			got := sandboxStatusFromProto(wire)
+			assert.Equal(t, &v1.SandboxConfigurationAdmission{
+				State: tc.want, PolicyVersion: 4, PolicyHash: "hash", ConfigRevision: 5,
+				ProviderEnvRevision: 6, Error: "invalid endpoint",
+			}, got.ConfigurationAdmission)
+			wire.ConfigurationAdmission.Error = "changed"
+			assert.Equal(t, "invalid endpoint", got.ConfigurationAdmission.Error)
+		})
+	}
+	assert.Nil(t, sandboxStatusFromProto(&pb.SandboxStatus{}).ConfigurationAdmission)
+}
 
 func TestSandboxFromProto(t *testing.T) {
 	userNS := true
 	gpuCount := uint32(2)
 	exitCode := int32(0)
 	proto := &pb.Sandbox{
+		HostKeyFingerprint: "SHA256:expected",
 		Metadata: &dm.ObjectMeta{
-			Id:                  "sb-1",
-			Name:                "my-sandbox",
-			CreatedAtMs:         1700000000000,
-			Labels:              map[string]string{"env": "dev"},
-			Annotations:         map[string]string{"owner": "team-a"},
-			ResourceVersion:     3,
-			Workspace:           "prod",
-			DeletionTimestampMs: 1700000060000,
+			Id:              "sb-1",
+			Name:            "my-sandbox",
+			CreatedTime:     TimestampFromMillis(1700000000000),
+			Labels:          map[string]string{"env": "dev"},
+			Annotations:     map[string]string{"owner": "team-a"},
+			ResourceVersion: 3,
+			Workspace:       "prod",
+			DeletionTime:    TimestampFromMillis(1700000060000),
 		},
 		Spec: &pb.SandboxSpec{
 			LogLevel:    "debug",
@@ -59,35 +88,39 @@ func TestSandboxFromProto(t *testing.T) {
 					Count: &gpuCount,
 				},
 			},
-			Command: []string{"/opt/agent", "--serve"},
-			Tty:     false,
+			Command:       []string{"/opt/agent", "--serve"},
+			Tty:           false,
+			RestartPolicy: pb.SandboxRestartPolicy_SANDBOX_RESTART_POLICY_ON_FAILURE,
 		},
 		CreatedFromWorkloadTemplate: &pb.SandboxWorkloadTemplateProvenance{
 			Name:            "gpu-kata",
 			ResourceVersion: "7",
 		},
 		Status: &pb.SandboxStatus{
-			SandboxName:           "sb-compute-1",
-			AgentPod:              "agent-pod-xyz",
-			AgentFd:               "fd-agent",
-			SandboxFd:             "fd-sandbox",
-			Phase:                 pb.SandboxPhase_SANDBOX_PHASE_READY,
-			CurrentPolicyVersion:  7,
-			MainProcessInstanceId: "instance-1",
-			ExitCode:              &exitCode,
+			AgentPod:               "agent-pod-xyz",
+			AgentFd:                "fd-agent",
+			SandboxFd:              "fd-sandbox",
+			Phase:                  pb.SandboxPhase_SANDBOX_PHASE_READY,
+			CurrentPolicyVersion:   7,
+			MainProcessInstanceId:  "instance-1",
+			ExitCode:               &exitCode,
+			RestartCount:           3,
+			NextRestartTime:        TimestampFromMillis(1700000070000),
+			MainProcessStartedTime: TimestampFromMillis(1700000010000),
 			Conditions: []*pb.SandboxCondition{
 				{
-					Type:               "Ready",
-					Status:             "True",
-					Reason:             "AllGood",
-					Message:            "Sandbox is ready",
-					LastTransitionTime: "2024-01-01T00:00:00Z",
+					Type:           "Ready",
+					Status:         "True",
+					Reason:         "AllGood",
+					Message:        "Sandbox is ready",
+					TransitionTime: TimestampFromMillis(1704067200000),
 				},
 			},
 		},
 	}
 
 	s := SandboxFromProto(proto)
+	assert.Equal(t, "SHA256:expected", s.HostKeyFingerprint)
 
 	require.NotNil(t, s)
 	assert.Equal(t, "sb-1", s.ID)
@@ -112,6 +145,7 @@ func TestSandboxFromProto(t *testing.T) {
 	assert.Equal(t, uint32(2), *s.Spec.GPUCount)
 	assert.Equal(t, []string{"/opt/agent", "--serve"}, s.Spec.Command)
 	assert.False(t, s.Spec.TTY)
+	assert.Equal(t, v1.SandboxRestartOnFailure, s.Spec.RestartPolicy)
 
 	// Template
 	require.NotNil(t, s.Spec.Template)
@@ -130,7 +164,6 @@ func TestSandboxFromProto(t *testing.T) {
 	assert.Equal(t, "val", nested["key"])
 
 	// Status
-	assert.Equal(t, "sb-compute-1", s.Status.SandboxName)
 	assert.Equal(t, "agent-pod-xyz", s.Status.AgentPod)
 	assert.Equal(t, "fd-agent", s.Status.AgentFd)
 	assert.Equal(t, "fd-sandbox", s.Status.SandboxFd)
@@ -144,6 +177,9 @@ func TestSandboxFromProto(t *testing.T) {
 	assert.Equal(t, "2024-01-01T00:00:00Z", s.Status.Conditions[0].LastTransitionTime)
 	require.NotNil(t, s.Status.ExitCode)
 	assert.Equal(t, int32(0), *s.Status.ExitCode)
+	assert.Equal(t, uint32(3), s.Status.RestartCount)
+	assert.Equal(t, int64(1700000070000), s.Status.NextRestartAtMs)
+	assert.Equal(t, int64(1700000010000), s.Status.MainProcessStartedAtMs)
 }
 
 func TestSandboxFromProto_TemplateResourcesDeepCopy(t *testing.T) {
@@ -171,6 +207,129 @@ func TestSandboxFromProto_TemplateResourcesDeepCopy(t *testing.T) {
 
 	proto.Spec.Template.DriverConfig.Fields["runtime"] = structpb.NewStringValue("MUTATED")
 	assert.Equal(t, "kata", s.Spec.Template.DriverConfig["runtime"], "DriverConfig must be deep copied")
+}
+
+func TestSandboxFromProto_EndpointStatuses(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		status *pb.SandboxStatus
+	}{
+		{name: "nil status"},
+		{name: "nil endpoints", status: &pb.SandboxStatus{}},
+		{name: "empty endpoints", status: &pb.SandboxStatus{EndpointStatuses: []*pb.EndpointStatus{}}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := SandboxFromProto(&pb.Sandbox{Status: tc.status})
+			require.NotNil(t, s)
+			assert.Empty(t, s.Status.EndpointStatuses)
+		})
+	}
+
+	input := &pb.Sandbox{Status: &pb.SandboxStatus{
+		Phase: pb.SandboxPhase_SANDBOX_PHASE_READY,
+		Conditions: []*pb.SandboxCondition{{
+			Type: "Ready", Status: "True", Reason: "AllGood", Message: "Sandbox is ready",
+		}},
+		EndpointStatuses: []*pb.EndpointStatus{
+			{EndpointId: "endpoint-one", Host: "tools.example.test", Ports: []uint32{443, 8443}, Path: "/mcp", LastResult: pb.EndpointResult_ENDPOINT_RESULT_TRANSPORT_FAILED, LastReportedTime: timestamppb.New(time.Date(2026, 9, 11, 10, 0, 0, 0, time.UTC))},
+			{EndpointId: "endpoint-two", Host: "tools.example.test", Ports: []uint32{443}, Path: "/other", LastResult: pb.EndpointResult_ENDPOINT_RESULT_NO_OBSERVED_EXCHANGE},
+		},
+	}}
+
+	s := SandboxFromProto(input)
+	require.NotNil(t, s)
+	require.Equal(t, []v1.EndpointStatus{
+		{EndpointID: "endpoint-one", Host: "tools.example.test", Ports: []uint32{443, 8443}, Path: "/mcp", LastResult: v1.EndpointTransportFailed, LastReportedAt: "2026-09-11T10:00:00Z"},
+		{EndpointID: "endpoint-two", Host: "tools.example.test", Ports: []uint32{443}, Path: "/other", LastResult: v1.EndpointNoObservedExchange},
+	}, s.Status.EndpointStatuses)
+	assert.Equal(t, v1.SandboxReady, s.Status.Phase)
+	assert.Equal(t, []v1.SandboxCondition{{Type: "Ready", Status: "True", Reason: "AllGood", Message: "Sandbox is ready"}}, s.Status.Conditions)
+
+	// A response and its SDK representation must not share endpoint or port storage.
+	input.Status.EndpointStatuses[0].Host = "changed.example.test"
+	input.Status.EndpointStatuses[0].Ports[0] = 80
+	assert.Equal(t, "tools.example.test", s.Status.EndpointStatuses[0].Host)
+	assert.Equal(t, uint32(443), s.Status.EndpointStatuses[0].Ports[0])
+	s.Status.EndpointStatuses[1].Path = "/changed"
+	s.Status.EndpointStatuses[1].Ports[0] = 8080
+	assert.Equal(t, "/other", input.Status.EndpointStatuses[1].Path)
+	assert.Equal(t, uint32(443), input.Status.EndpointStatuses[1].Ports[0])
+}
+
+func TestSandboxFromProto_TokenGrantFailures(t *testing.T) {
+	upstreamStatus := uint32(409)
+	failure := &pb.EndpointFailure{
+		Domain:             pb.EndpointFailureDomain_ENDPOINT_FAILURE_DOMAIN_TOKEN_GRANT,
+		Code:               "provider_authorization_required",
+		RecoveryAction:     pb.ProviderCredentialRefreshRecoveryAction_PROVIDER_CREDENTIAL_REFRESH_RECOVERY_ACTION_REAUTHORIZE,
+		Provider:           "github",
+		CredentialKey:      "token",
+		Stage:              "token_endpoint",
+		UpstreamHttpStatus: &upstreamStatus,
+		RequestId:          "0b6f1f6e-7c55-4f1c-9a43-2d8f5b1f0e11",
+	}
+	input := &pb.Sandbox{Status: &pb.SandboxStatus{
+		EndpointStatuses: []*pb.EndpointStatus{{EndpointId: "with-failure", LastFailure: failure}, {EndpointId: "without-failure"}},
+		LastTokenGrantFailure: &pb.TokenGrantFailureObservation{
+			DestinationHost: "api.example.test",
+			DestinationPort: 8443,
+			Failure:         failure,
+		},
+	}}
+
+	status := SandboxFromProto(input).Status
+	wantStatus := uint32(409)
+	want := &v1.EndpointFailure{
+		Domain:             v1.EndpointFailureDomainTokenGrant,
+		Code:               "provider_authorization_required",
+		RecoveryAction:     v1.RefreshRecoveryActionReauthorize,
+		Provider:           "github",
+		CredentialKey:      "token",
+		Stage:              "token_endpoint",
+		UpstreamHTTPStatus: &wantStatus,
+		RequestID:          "0b6f1f6e-7c55-4f1c-9a43-2d8f5b1f0e11",
+	}
+	assert.Equal(t, want, status.EndpointStatuses[0].LastFailure)
+	assert.Nil(t, status.EndpointStatuses[1].LastFailure)
+	assert.Equal(t, &v1.TokenGrantFailureObservation{
+		DestinationHost: "api.example.test",
+		DestinationPort: 8443,
+		Failure:         want,
+	}, status.LastTokenGrantFailure)
+
+	// The SDK values must not share the wire message's optional status.
+	upstreamStatus = 500
+	assert.Equal(t, uint32(409), *status.LastTokenGrantFailure.Failure.UpstreamHTTPStatus)
+
+	// Unknown wire domains must not select a closed code set.
+	failure.Domain = pb.EndpointFailureDomain(99)
+	input.Status.LastTokenGrantFailure.Failure = nil
+	status = SandboxFromProto(input).Status
+	assert.Equal(t, v1.EndpointFailureDomainUnspecified, status.EndpointStatuses[0].LastFailure.Domain)
+	assert.Nil(t, status.LastTokenGrantFailure.Failure)
+	input.Status.LastTokenGrantFailure = nil
+	assert.Nil(t, SandboxFromProto(input).Status.LastTokenGrantFailure)
+}
+
+func TestEndpointResultFromProto(t *testing.T) {
+	for _, tc := range []struct {
+		input pb.EndpointResult
+		want  v1.EndpointResult
+	}{
+		{pb.EndpointResult_ENDPOINT_RESULT_UNSPECIFIED, v1.EndpointUnspecified},
+		{pb.EndpointResult_ENDPOINT_RESULT_NO_OBSERVED_EXCHANGE, v1.EndpointNoObservedExchange},
+		{pb.EndpointResult_ENDPOINT_RESULT_HTTP_RESPONSE_RECEIVED, v1.EndpointHTTPResponseReceived},
+		{pb.EndpointResult_ENDPOINT_RESULT_POLICY_DENIED, v1.EndpointPolicyDenied},
+		{pb.EndpointResult_ENDPOINT_RESULT_CREDENTIAL_UNAVAILABLE, v1.EndpointCredentialUnavailable},
+		{pb.EndpointResult_ENDPOINT_RESULT_TLS_FAILED, v1.EndpointTLSFailed},
+		{pb.EndpointResult_ENDPOINT_RESULT_TRANSPORT_FAILED, v1.EndpointTransportFailed},
+		{pb.EndpointResult_ENDPOINT_RESULT_UPSTREAM_REJECTED, v1.EndpointUpstreamRejected},
+		{pb.EndpointResult(99), v1.EndpointUnspecified},
+	} {
+		t.Run(tc.input.String(), func(t *testing.T) {
+			assert.Equal(t, tc.want, endpointResultFromProto(tc.input))
+		})
+	}
 }
 
 func TestSandboxFromProto_NilFields(t *testing.T) {
@@ -292,12 +451,12 @@ func TestSandboxToProto(t *testing.T) {
 	require.NotNil(t, p.Metadata)
 	assert.Equal(t, "sb-1", p.Metadata.Id)
 	assert.Equal(t, "my-sandbox", p.Metadata.Name)
-	assert.Equal(t, int64(1700000000000), p.Metadata.CreatedAtMs)
+	assert.Equal(t, int64(1700000000000), MillisFromProto(p.Metadata.CreatedTime))
 	assert.Equal(t, map[string]string{"env": "dev"}, p.Metadata.Labels)
 	assert.Equal(t, map[string]string{"owner": "team-a"}, p.Metadata.Annotations)
 	assert.Equal(t, uint64(3), p.Metadata.ResourceVersion)
 	assert.Equal(t, "prod", p.Metadata.Workspace)
-	assert.Equal(t, int64(1700000060000), p.Metadata.DeletionTimestampMs)
+	assert.Equal(t, int64(1700000060000), MillisFromProto(p.Metadata.DeletionTime))
 
 	require.NotNil(t, p.Spec)
 	assert.Equal(t, "info", p.Spec.LogLevel)

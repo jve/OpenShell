@@ -26,6 +26,39 @@ pub const SSH_SOCKET_PATH: &str = "OPENSHELL_SSH_SOCKET_PATH";
 /// Log level for the sandbox supervisor (e.g. `"debug"`, `"info"`, `"warn"`).
 pub const LOG_LEVEL: &str = "OPENSHELL_LOG_LEVEL";
 
+/// OTLP/gRPC collector endpoint for supervisor trace export.
+pub const OTLP_ENDPOINT: &str = "OPENSHELL_OTLP_ENDPOINT";
+
+/// OTLP/gRPC collector endpoint for supervisor OCSF event export.
+pub const OTLP_OCSF_ENDPOINT: &str = "OPENSHELL_OTLP_OCSF_ENDPOINT";
+
+/// OCSF schema version that supervisors downgrade exported events to.
+pub const OTLP_OCSF_SCHEMA_VERSION: &str = "OPENSHELL_OTLP_OCSF_SCHEMA_VERSION";
+
+/// Name of the gateway that launched the sandbox, reported as
+/// `openshell.gateway.name` on supervisor telemetry.
+pub const GATEWAY_NAME: &str = "OPENSHELL_GATEWAY_NAME";
+
+/// OCSF event export that a compute driver passes to its supervisors.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OcsfOtlpExport {
+    pub endpoint: String,
+    pub schema_version: Option<String>,
+}
+
+impl OcsfOtlpExport {
+    /// The supervisor environment variables for this export.
+    pub fn environment(&self) -> Vec<(&'static str, String)> {
+        std::iter::once((OTLP_OCSF_ENDPOINT, self.endpoint.clone()))
+            .chain(
+                self.schema_version
+                    .clone()
+                    .map(|version| (OTLP_OCSF_SCHEMA_VERSION, version)),
+            )
+            .collect()
+    }
+}
+
 /// Versioned specification for the exact canonical main process.
 ///
 /// Most drivers use JSON directly. Transports that cannot preserve spaces in
@@ -39,7 +72,8 @@ const MAIN_PROCESS_SPEC_BASE64URL_PREFIX: &str = "base64url:";
 pub struct MainProcessConfig {
     pub version: u32,
     /// Canonical command. Empty means "no command supplied": the supervisor
-    /// resolves the default login shell against the sandbox image. A non-empty
+    /// asks the sandbox boundary to resolve the default login shell against
+    /// the agent image. A non-empty
     /// command is the exact program+args and is run verbatim.
     pub command: Vec<String>,
     pub tty: bool,
@@ -51,8 +85,8 @@ impl MainProcessConfig {
     pub const VERSION: u32 = 1;
 
     /// Default config for a sandbox created without a command. The command is
-    /// left empty on purpose: the supervisor picks a login shell that exists in
-    /// the sandbox image (bash when present, otherwise `/bin/sh`). A TTY is
+    /// left empty on purpose: the sandbox boundary picks a login shell that
+    /// exists in the agent image (bash when present, otherwise `/bin/sh`). A TTY is
     /// requested because the default is an interactive login shell.
     #[must_use]
     pub fn scratch() -> Self {
@@ -99,7 +133,7 @@ impl MainProcessConfig {
             ));
         }
         // An empty command is valid: it means "no command supplied", and the
-        // supervisor resolves the default login shell. Only a present-but-blank
+        // sandbox boundary resolves the default login shell. Only a present-but-blank
         // program is rejected.
         if !config.command.is_empty() && config.command[0].is_empty() {
             return Err(format!(
@@ -134,6 +168,13 @@ pub const TELEMETRY_ENABLED: &str = "OPENSHELL_TELEMETRY_ENABLED";
 /// `"sidecar"`; the default combined supervisor path omits it.
 pub const SUPERVISOR_TOPOLOGY: &str = "OPENSHELL_SUPERVISOR_TOPOLOGY";
 
+/// The isolation backend admitted by the deployment configuration (RFC 0012).
+///
+/// Delivered on a channel separate from the topology descriptor so descriptor
+/// verification against the admitted backend is not self-referential. Required
+/// whenever a topology descriptor is supplied.
+pub const ADMITTED_ISOLATION_BACKEND: &str = "OPENSHELL_ADMITTED_ISOLATION_BACKEND";
+
 /// Network enforcement backend selected by the compute driver.
 pub const NETWORK_ENFORCEMENT_MODE: &str = "OPENSHELL_NETWORK_ENFORCEMENT_MODE";
 
@@ -159,12 +200,6 @@ pub const NETWORK_BINARY_IDENTITY: &str = "OPENSHELL_NETWORK_BINARY_IDENTITY";
 /// container.
 pub const SIDECAR_CONTROL_SOCKET: &str = "OPENSHELL_SIDECAR_CONTROL_SOCKET";
 
-/// Driver-owned JSON list of private control sockets for additional pod workloads.
-pub const WORKLOAD_CONTROL_SOCKETS: &str = "OPENSHELL_WORKLOAD_CONTROL_SOCKETS";
-
-/// Additional regular pod container: supervised locally without a gateway SSH session.
-pub const POD_WORKLOAD: &str = "OPENSHELL_POD_WORKLOAD";
-
 /// Optional TLS server name override used when connecting to the gateway.
 pub const GATEWAY_TLS_SERVER_NAME: &str = "OPENSHELL_GATEWAY_TLS_SERVER_NAME";
 
@@ -172,7 +207,18 @@ pub const GATEWAY_TLS_SERVER_NAME: &str = "OPENSHELL_GATEWAY_TLS_SERVER_NAME";
 /// by workload child processes.
 pub const PROXY_TLS_DIR: &str = "OPENSHELL_PROXY_TLS_DIR";
 
-/// Path to the CA certificate for mTLS communication with the gateway.
+/// Optional path to a durable PEM-encoded interception CA certificate.
+/// Must be configured together with [`PROXY_CA_KEY`].
+pub const PROXY_CA_CERT: &str = "OPENSHELL_PROXY_CA_CERT";
+
+/// Optional path to the private key for [`PROXY_CA_CERT`].
+/// Must be configured together with the certificate path.
+pub const PROXY_CA_KEY: &str = "OPENSHELL_PROXY_CA_KEY";
+
+/// Whether the control-owned SSH Unix socket is shared across trusted UIDs.
+pub const SSH_SOCKET_SHARED: &str = "OPENSHELL_SSH_SOCKET_SHARED";
+
+/// Path to the CA certificate used to authenticate the gateway TLS endpoint.
 pub const TLS_CA: &str = "OPENSHELL_TLS_CA";
 
 /// Path to the client certificate for mTLS communication with the gateway.
@@ -230,6 +276,18 @@ pub const SANDBOX_UID: &str = "OPENSHELL_SANDBOX_UID";
 /// supervisor drops privileges to a group other than the UID's primary group.
 pub const SANDBOX_GID: &str = "OPENSHELL_SANDBOX_GID";
 
+/// Default numeric UID assigned to a sandbox when the image declares no OCI
+/// `USER` (for example, a minimal base image).
+///
+/// Local container drivers (Docker, Podman) supply this in place of an empty
+/// OCI declaration so the supervisor runs the sandbox as a synthesized non-root
+/// account instead of rejecting the image, matching the numeric-identity
+/// behavior of the Kubernetes and VM drivers.
+pub const DEFAULT_SANDBOX_UID: u32 = 1000;
+
+/// Default numeric GID paired with [`DEFAULT_SANDBOX_UID`].
+pub const DEFAULT_SANDBOX_GID: u32 = 1000;
+
 /// Raw OCI `Config.User` declaration from the immutable image selected by a
 /// local container driver.
 ///
@@ -249,6 +307,26 @@ pub const OCI_IMAGE_USER: &str = "OPENSHELL_OCI_IMAGE_USER";
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ocsf_export_environment_carries_the_schema_version_only_when_set() {
+        let mut export = OcsfOtlpExport {
+            endpoint: "http://siem:4317".into(),
+            schema_version: None,
+        };
+        assert_eq!(
+            export.environment(),
+            [(OTLP_OCSF_ENDPOINT, "http://siem:4317".to_string())]
+        );
+        export.schema_version = Some("1.3".into());
+        assert_eq!(
+            export.environment(),
+            [
+                (OTLP_OCSF_ENDPOINT, "http://siem:4317".to_string()),
+                (OTLP_OCSF_SCHEMA_VERSION, "1.3".to_string()),
+            ]
+        );
+    }
 
     #[test]
     fn main_process_transport_preserves_argument_boundaries() {
@@ -304,7 +382,7 @@ mod tests {
 
     #[test]
     fn omitted_command_stays_empty_for_supervisor_resolution() {
-        // No command supplied → empty command; the supervisor resolves the
+        // No command supplied → empty command; the sandbox boundary resolves the
         // default login shell against the sandbox image.
         let empty = crate::proto::compute::v1::DriverSandboxSpec::default();
         assert!(

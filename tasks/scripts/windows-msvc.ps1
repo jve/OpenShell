@@ -50,12 +50,12 @@ if (-not [int]::TryParse($BuildJobsValue, [ref] $WindowsBuildJobs) -or $WindowsB
 }
 $WindowsCargoMutex = [System.Threading.Mutex]::new($false, "Local\OpenShellWindowsMsvcCargo")
 
-$UnsupportedDriverPackageExcludes = "--exclude openshell-driver-docker --exclude openshell-driver-kubernetes --exclude openshell-driver-kubernetes-secrets --exclude openshell-driver-podman --exclude openshell-driver-vault --exclude openshell-driver-vm --exclude openshell-sandbox --exclude openshell-supervisor-network --exclude openshell-supervisor-process --exclude openshell-vfio"
+$UnsupportedDriverPackageExcludes = "--exclude openshell-driver-docker --exclude openshell-driver-kubernetes --exclude openshell-driver-kubernetes-secrets --exclude openshell-driver-podman --exclude openshell-driver-vault --exclude openshell-driver-vm --exclude openshell-sandbox --exclude openshell-vfio"
 $WindowsClippyPackageExcludes = $UnsupportedDriverPackageExcludes
 $WindowsClippyLintArgs = "-D warnings -A dead-code -A unused-imports -A clippy::unused-async"
 $PrebuiltZ3WorkspaceFeatures = "--features openshell-prover/prebuilt-z3"
 $PrebuiltZ3ServerFeatures = "--features openshell-server/prebuilt-z3,openshell-prover/prebuilt-z3"
-$PrebuiltZ3Version = "4.16.0"
+$PrebuiltZ3Version = "5.1.0"
 $Z3WorkspaceFeatures = $PrebuiltZ3WorkspaceFeatures
 $Z3ServerFeatures = $PrebuiltZ3ServerFeatures
 

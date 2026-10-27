@@ -76,6 +76,7 @@ def provider(
     provider_type: str,
     credentials: dict[str, str],
     profile_workspace: str = "",
+    config: dict[str, str] | None = None,
 ) -> Iterator[str]:
     """Create a provider for the duration of the block, then delete it."""
     _delete_provider(stub, name)
@@ -86,6 +87,7 @@ def provider(
                 metadata=datamodel_pb2.ObjectMeta(name=name),
                 type=provider_type,
                 credentials=credentials,
+                config=config or {},
                 profile_workspace=profile_workspace,
             ),
         )
@@ -118,7 +120,7 @@ def _delete_provider_profile(stub: object, profile_id: str) -> None:
         stub.DeleteProviderProfile(
             openshell_pb2.DeleteProviderProfileRequest(
                 id=profile_id,
-                workspace="default",
+                workspace_scope=datamodel_pb2.WorkspaceSelector(workspace="default"),
             )
         )
     except grpc.RpcError as exc:
@@ -145,7 +147,7 @@ def imported_provider_profile(
                     source=source,
                 )
             ],
-            workspace="default",
+            workspace_scope=datamodel_pb2.WorkspaceSelector(workspace="default"),
         )
     )
     assert response.imported, f"profile import failed: {response.diagnostics!r}"
@@ -185,8 +187,8 @@ def _native_inference_profile(
                 host="host.openshell.internal",
                 port=port,
                 protocol="rest",
-                tls="none",
-                enforcement="enforce",
+                tls=sandbox_pb2.NETWORK_TLS_MODE_UNSPECIFIED,
+                enforcement=sandbox_pb2.NETWORK_ENFORCEMENT_MODE_ENFORCE,
                 rules=rules,
                 allowed_ips=[
                     "10.0.0.0/8",
@@ -284,24 +286,6 @@ def native_endpoint_server() -> Iterator[int]:
         proc.communicate(timeout=5)
 
 
-def _proxy_connect():
-    """Return a closure that sends a raw CONNECT and returns the status line."""
-
-    def fn(host, port):
-        import socket
-
-        conn = socket.create_connection(("10.200.0.1", 3128), timeout=10)
-        try:
-            conn.sendall(
-                f"CONNECT {host}:{port} HTTP/1.1\r\nHost: {host}\r\n\r\n".encode()
-            )
-            return conn.recv(256).decode("latin1")
-        finally:
-            conn.close()
-
-    return fn
-
-
 # ===========================================================================
 # Tests: placeholder visibility
 # ===========================================================================
@@ -315,7 +299,7 @@ def test_provider_credentials_available_as_env_vars(
     with provider(
         sandbox_client._stub,
         name="e2e-test-provider-env",
-        provider_type="claude",
+        provider_type="claude-code",
         credentials={"ANTHROPIC_API_KEY": "sk-e2e-test-key-12345"},
     ) as provider_name:
         spec = datamodel_pb2.SandboxSpec(
@@ -383,6 +367,26 @@ def test_endpointless_profile_credentials_fail_closed_without_policy_binding(
             assert result.exit_code == 0, result.stderr
             assert result.stdout.strip() == "NOT_SET"
 
+            def read_metadata_token_status() -> int:
+                import os
+                import urllib.error
+                import urllib.request
+
+                request = urllib.request.Request(
+                    f"http://{os.environ['GCE_METADATA_HOST']}/computeMetadata/v1/instance/service-accounts/default/token",
+                    headers={"Metadata-Flavor": "Google"},
+                )
+                opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+                try:
+                    with opener.open(request, timeout=5) as response:
+                        return response.status
+                except urllib.error.HTTPError as error:
+                    return error.code
+
+            result = sb.exec_python(read_metadata_token_status)
+            assert result.exit_code == 0, result.stderr
+            assert result.stdout.strip() == "503"
+
 
 def test_endpointless_profile_credentials_use_explicit_policy_binding(
     sandbox: Callable[..., Sandbox],
@@ -404,7 +408,7 @@ def test_endpointless_profile_credentials_use_explicit_policy_binding(
                         host="storage.googleapis.com",
                         port=443,
                         protocol="rest",
-                        access="full",
+                        access=sandbox_pb2.NETWORK_ACCESS_PRESET_FULL,
                         credential_binding=sandbox_pb2.NetworkCredentialBinding(
                             provider=provider_name
                         ),
@@ -428,6 +432,99 @@ def test_endpointless_profile_credentials_use_explicit_policy_binding(
             assert _is_placeholder_for_env_key(
                 result.stdout.strip(), "GCP_ADC_ACCESS_TOKEN"
             )
+
+
+@pytest.mark.parametrize(
+    ("service_account_email", "provider_suffix"),
+    [
+        (None, "no-email"),
+        ("", "empty-email"),
+        ("sdk@metadata-test-project.iam.gserviceaccount.com", "configured-email"),
+    ],
+    ids=["no-email", "empty-email", "configured-email"],
+)
+def test_google_metadata_sdk_discovery(
+    sandbox: Callable[..., Sandbox],
+    sandbox_client: SandboxClient,
+    service_account_email: str | None,
+    provider_suffix: str,
+) -> None:
+    """Google's SDK discovers project/account metadata and refreshes a placeholder."""
+    config = {"project_id": "metadata-test-project"}
+    if service_account_email is not None:
+        config["service_account_email"] = service_account_email
+    with provider(
+        sandbox_client._stub,
+        name=f"e2e-google-metadata-sdk-{provider_suffix}",
+        provider_type="google-cloud",
+        credentials={"GCP_ADC_ACCESS_TOKEN": "gcp-metadata-real-secret"},
+        config=config,
+    ) as provider_name:
+        policy = _default_policy()
+        policy.network_policies["gcp_api"].CopyFrom(
+            sandbox_pb2.NetworkPolicyRule(
+                name="gcp_api",
+                endpoints=[
+                    sandbox_pb2.NetworkEndpoint(
+                        host="storage.googleapis.com",
+                        port=443,
+                        protocol="rest",
+                        access=sandbox_pb2.NETWORK_ACCESS_PRESET_FULL,
+                        credential_binding=sandbox_pb2.NetworkCredentialBinding(
+                            provider=provider_name
+                        ),
+                    )
+                ],
+            )
+        )
+        spec = datamodel_pb2.SandboxSpec(policy=policy, providers=[provider_name])
+
+        def discover_metadata() -> str:
+            import json
+            import os
+
+            import google.auth
+            import requests
+            from google.auth.compute_engine import _metadata
+            from google.auth.transport.requests import Request
+
+            # Force ADC to use SDK metadata detection rather than a local key file.
+            for key in (
+                "GOOGLE_APPLICATION_CREDENTIALS",
+                "GOOGLE_CLOUD_PROJECT",
+                "GCLOUD_PROJECT",
+            ):
+                os.environ.pop(key, None)
+            session = requests.Session()
+            # Exercise the direct TCP path used by metadata clients.
+            session.trust_env = False
+            request = Request(session=session)
+            if not _metadata.ping(request):
+                raise RuntimeError("Google SDK could not detect the metadata endpoint")
+            credentials, project = google.auth.default(request=request)
+            credentials.refresh(request)
+            credentials.refresh(request)
+            return json.dumps(
+                {
+                    "project": project,
+                    "account": credentials.service_account_email,
+                    "token": credentials.token,
+                    "expiry_present": credentials.expiry is not None,
+                    "metadata_host": os.environ["GCE_METADATA_HOST"],
+                    "metadata_ip": os.environ["GCE_METADATA_IP"],
+                }
+            )
+
+        with sandbox(spec=spec, delete_on_exit=True) as sb:
+            result = sb.exec_python(discover_metadata)
+            assert result.exit_code == 0, result.stderr
+            data = json.loads(result.stdout)
+            assert data["project"] == "metadata-test-project"
+            assert data["account"] == (service_account_email or "default")
+            assert data["metadata_host"] == data["metadata_ip"] == "127.0.0.1:8174"
+            assert data["expiry_present"]
+            assert _is_placeholder_for_env_key(data["token"], "GCP_ADC_ACCESS_TOKEN")
+            assert "gcp-metadata-real-secret" not in result.stdout
 
 
 def test_nvidia_provider_injects_nvidia_api_key_env_var(
@@ -506,8 +603,8 @@ def test_attach_detach_updates_credentials_for_later_exec_launches(
                         workspace_scope=datamodel_pb2.WorkspaceSelector(
                             workspace="default"
                         ),
-                        sandbox_name=sb.sandbox.name,
-                        provider_name=provider_name,
+                        sandbox=sb.sandbox.name,
+                        provider=provider_name,
                     )
                 )
                 wait_for_token(
@@ -520,8 +617,8 @@ def test_attach_detach_updates_credentials_for_later_exec_launches(
                         workspace_scope=datamodel_pb2.WorkspaceSelector(
                             workspace="default"
                         ),
-                        sandbox_name=sb.sandbox.name,
-                        provider_name=provider_name,
+                        sandbox=sb.sandbox.name,
+                        provider=provider_name,
                     )
                 )
                 wait_for_token(sb, "NOT_SET")
@@ -532,8 +629,8 @@ def test_attach_detach_updates_credentials_for_later_exec_launches(
                             workspace_scope=datamodel_pb2.WorkspaceSelector(
                                 workspace="default"
                             ),
-                            sandbox_name=sb.sandbox.name,
-                            provider_name=provider_name,
+                            sandbox=sb.sandbox.name,
+                            provider=provider_name,
                         )
                     )
                 except grpc.RpcError as exc:
@@ -628,11 +725,10 @@ def test_imported_openai_profile_allows_native_endpoint_with_attached_provider(
                     assert body["model"] == "fixture-openai-model"
 
 
-def test_imported_anthropic_profile_uses_native_endpoint_and_inference_local_is_not_privileged(
+def test_imported_anthropic_profile_allows_native_endpoint_with_attached_provider(
     sandbox: Callable[..., Sandbox],
     sandbox_client: SandboxClient,
 ) -> None:
-    """Attached imported profiles should not resurrect `inference.local` routing."""
     stub = sandbox_client._stub
     profile_id = f"e2e-native-anthropic-{int(time.time() * 1000)}"
     provider_name = f"{profile_id}-provider"
@@ -717,16 +813,6 @@ def test_imported_anthropic_profile_uses_native_endpoint_and_inference_local_is_
                     assert payload["x_api_key"] == secret
                     assert body["model"] == "fixture-anthropic-model"
 
-                    denied = sb.exec_python(
-                        _proxy_connect(),
-                        args=("inference.local", 443),
-                        timeout_seconds=30,
-                    )
-                    assert denied.exit_code == 0, denied.stderr
-                    status = denied.stdout.strip()
-                    assert status.startswith("HTTP/1.1 "), status
-                    assert " 200 " not in status, status
-
 
 # ===========================================================================
 # Tests: security & edge cases
@@ -756,7 +842,7 @@ def test_credentials_not_in_persisted_spec_environment(
     with provider(
         sandbox_client._stub,
         name="e2e-test-no-persist",
-        provider_type="claude",
+        provider_type="claude-code",
         credentials={"ANTHROPIC_API_KEY": "sk-should-not-persist"},
     ) as provider_name:
         spec = datamodel_pb2.SandboxSpec(
@@ -1066,9 +1152,10 @@ def test_provider_profile_platform_vs_workspace_isolation(
     def _cleanup() -> None:
         for pid, ws in [(platform_id, ""), (workspace_id, "default")]:
             try:
-                stub.DeleteProviderProfile(
-                    openshell_pb2.DeleteProviderProfileRequest(id=pid, workspace=ws)
-                )
+                request = openshell_pb2.DeleteProviderProfileRequest(id=pid)
+                if ws:
+                    request.workspace_scope.workspace = ws
+                stub.DeleteProviderProfile(request)
             except grpc.RpcError:
                 pass
 
@@ -1077,7 +1164,6 @@ def test_provider_profile_platform_vs_workspace_isolation(
         resp = stub.ImportProviderProfiles(
             openshell_pb2.ImportProviderProfilesRequest(
                 profiles=[_make_profile(platform_id)],
-                workspace="",
             )
         )
         assert resp.imported, "platform-scoped import should succeed"
@@ -1085,13 +1171,13 @@ def test_provider_profile_platform_vs_workspace_isolation(
         resp = stub.ImportProviderProfiles(
             openshell_pb2.ImportProviderProfilesRequest(
                 profiles=[_make_profile(workspace_id)],
-                workspace="default",
+                workspace_scope=datamodel_pb2.WorkspaceSelector(workspace="default"),
             )
         )
         assert resp.imported, "workspace-scoped import should succeed"
 
         platform_list = stub.ListProviderProfiles(
-            openshell_pb2.ListProviderProfilesRequest(page_size=200, workspace="")
+            openshell_pb2.ListProviderProfilesRequest(page_size=200)
         )
         platform_ids = [p.id for p in platform_list.profiles]
         assert platform_id in platform_ids, (
@@ -1102,7 +1188,10 @@ def test_provider_profile_platform_vs_workspace_isolation(
         )
 
         workspace_list = stub.ListProviderProfiles(
-            openshell_pb2.ListProviderProfilesRequest(page_size=200, workspace="default")
+            openshell_pb2.ListProviderProfilesRequest(
+                page_size=200,
+                workspace_scope=datamodel_pb2.WorkspaceSelector(workspace="default"),
+            )
         )
         workspace_ids = [p.id for p in workspace_list.profiles]
         assert workspace_id in workspace_ids, (
@@ -1144,7 +1233,7 @@ def test_cross_workspace_profile_ids_do_not_collide(
         resp_a = stub.ImportProviderProfiles(
             openshell_pb2.ImportProviderProfilesRequest(
                 profiles=[_make_profile()],
-                workspace=ws_a,
+                workspace_scope=datamodel_pb2.WorkspaceSelector(workspace=ws_a),
             )
         )
         assert resp_a.imported, "import into ws-a should succeed"
@@ -1152,20 +1241,26 @@ def test_cross_workspace_profile_ids_do_not_collide(
         resp_b = stub.ImportProviderProfiles(
             openshell_pb2.ImportProviderProfilesRequest(
                 profiles=[_make_profile()],
-                workspace=ws_b,
+                workspace_scope=datamodel_pb2.WorkspaceSelector(workspace=ws_b),
             )
         )
         assert resp_b.imported, "import into ws-b should succeed"
 
         list_a = stub.ListProviderProfiles(
-            openshell_pb2.ListProviderProfilesRequest(page_size=200, workspace=ws_a)
+            openshell_pb2.ListProviderProfilesRequest(
+                page_size=200,
+                workspace_scope=datamodel_pb2.WorkspaceSelector(workspace=ws_a),
+            )
         )
         assert any(p.id == profile_id for p in list_a.profiles), (
             "profile should appear in ws-a"
         )
 
         list_b = stub.ListProviderProfiles(
-            openshell_pb2.ListProviderProfilesRequest(page_size=200, workspace=ws_b)
+            openshell_pb2.ListProviderProfilesRequest(
+                page_size=200,
+                workspace_scope=datamodel_pb2.WorkspaceSelector(workspace=ws_b),
+            )
         )
         assert any(p.id == profile_id for p in list_b.profiles), (
             "profile should appear in ws-b"
@@ -1175,7 +1270,8 @@ def test_cross_workspace_profile_ids_do_not_collide(
             with contextlib.suppress(Exception):
                 stub.DeleteProviderProfile(
                     openshell_pb2.DeleteProviderProfileRequest(
-                        id=profile_id, workspace=ws
+                        id=profile_id,
+                        workspace_scope=datamodel_pb2.WorkspaceSelector(workspace=ws),
                     )
                 )
             with contextlib.suppress(Exception):

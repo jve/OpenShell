@@ -24,7 +24,6 @@ PREFLIGHT_OFF=(--helm-set agentSandbox.preflight.enabled=false)
 # These Dockerfiles do not produce release runtime images.
 SKIP_DOCKERFILES=(
   --skip-files 'deploy/docker/Dockerfile.ci'
-  --skip-files 'deploy/docker/Dockerfile.*-macos'
 )
 
 # Explicit OpenShell variants, including dev/E2E regression coverage.
@@ -33,7 +32,7 @@ HELM_PROFILES=(
   cert-manager credential-driver-kubernetes-secrets credential-driver-vault
   gateway gateway-tls high-availability openshift-route-cert-manager spire
   tls-disabled workspace-managed workspace-operator
-  corporate-proxy-e2e keycloak sidecar sidecar-kata skaffold
+  corporate-proxy-e2e keycloak skaffold
 )
 
 # Reject ignore entries broader than one concrete basename.

@@ -26,12 +26,21 @@ const STOPPED_READY_MARKER: &str = "gateway-start-stopped-ready";
 const START_FILE: &str = "/sandbox/gateway-start-state";
 const SANDBOX_NAMESPACE_LABEL: &str = "openshell.ai/sandbox-namespace";
 const SANDBOX_NAME_LABEL: &str = "openshell.ai/sandbox-name";
+const SANDBOX_ROLE_LABEL_FILTER: &str = "label=openshell.ai/isolation-role=sandbox";
 
 fn sandbox_container_id(namespace: &str, sandbox_name: &str) -> Result<String, String> {
     let namespace_filter = format!("label={SANDBOX_NAMESPACE_LABEL}={namespace}");
     let sandbox_name_filter = format!("label={SANDBOX_NAME_LABEL}={sandbox_name}");
     let output = Command::new("docker")
-        .args(["ps", "-aq", "--filter", MANAGED_BY_LABEL_FILTER, "--filter"])
+        .args([
+            "ps",
+            "-aq",
+            "--filter",
+            MANAGED_BY_LABEL_FILTER,
+            "--filter",
+            SANDBOX_ROLE_LABEL_FILTER,
+            "--filter",
+        ])
         .arg(namespace_filter)
         .args(["--filter"])
         .arg(sandbox_name_filter)
@@ -153,7 +162,7 @@ async fn docker_gateway_restart_preserves_running_and_stopped_intent() {
         "sandbox state was not written before restart:\n{before_restart}"
     );
 
-    wait_for_container_running(&namespace, &sandbox.name, true, Duration::from_secs(60))
+    wait_for_container_running(&namespace, &sandbox.name, true, Duration::from_mins(1))
         .await
         .expect("sandbox container should be running before gateway restart");
 
@@ -182,13 +191,13 @@ async fn docker_gateway_restart_preserves_running_and_stopped_intent() {
         .expect("gateway shutdown should stop a running-intent Docker sandbox");
 
     gateway.start().expect("restart e2e gateway");
-    wait_for_healthy(Duration::from_secs(120))
+    wait_for_healthy(Duration::from_mins(2))
         .await
         .expect("gateway should become healthy after restart");
-    wait_for_container_running(&namespace, &sandbox.name, true, Duration::from_secs(120))
+    wait_for_container_running(&namespace, &sandbox.name, true, Duration::from_mins(2))
         .await
         .expect("gateway startup should restart the running-intent Docker sandbox container");
-    wait_for_sandbox_phase(&stopped_sandbox.name, "Stopped", Duration::from_secs(120))
+    wait_for_sandbox_phase(&stopped_sandbox.name, "Stopped", Duration::from_mins(2))
         .await
         .expect("explicitly stopped Docker sandbox should remain stopped after restart");
     wait_for_container_running(
@@ -211,7 +220,7 @@ async fn docker_gateway_restart_preserves_running_and_stopped_intent() {
         &sandbox.name,
         &["cat", START_FILE],
         "before-restart",
-        Duration::from_secs(240),
+        Duration::from_mins(4),
     )
     .await
     .expect("sandbox should become ready again with its state preserved");

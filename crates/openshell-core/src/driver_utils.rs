@@ -7,58 +7,6 @@ use std::path::{Path, PathBuf};
 
 use crate::proto::compute::v1::DriverSandbox;
 
-/// Built-in sandbox network topologies used to derive a callback endpoint
-/// when an operator does not configure a per-driver `grpc_endpoint` override.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum GatewayCallbackTopology {
-    /// A Docker container reaches the host through Docker's gateway alias.
-    Docker,
-    /// A Podman container reaches the host through Podman's gateway alias.
-    Podman,
-    /// A libkrun guest reaches the host through gvproxy's gateway alias.
-    Vm,
-}
-
-/// Build the endpoint a sandbox uses to call its gateway for a known topology.
-///
-/// The result is deliberately derived by the gateway rather than baked into
-/// individual driver defaults. A configured `grpc_endpoint` remains an
-/// operator override for remote or non-standard deployments.
-#[must_use]
-pub fn gateway_callback_endpoint(
-    topology: GatewayCallbackTopology,
-    gateway_port: u16,
-    gateway_tls_enabled: bool,
-) -> String {
-    let scheme = if gateway_tls_enabled { "https" } else { "http" };
-    let host = match topology {
-        GatewayCallbackTopology::Docker | GatewayCallbackTopology::Vm => "host.openshell.internal",
-        GatewayCallbackTopology::Podman => "host.containers.internal",
-    };
-    format!("{scheme}://{host}:{gateway_port}")
-}
-
-#[cfg(test)]
-mod callback_endpoint_tests {
-    use super::{GatewayCallbackTopology, gateway_callback_endpoint};
-
-    #[test]
-    fn derives_endpoint_for_each_builtin_topology() {
-        assert_eq!(
-            gateway_callback_endpoint(GatewayCallbackTopology::Docker, 17670, false),
-            "http://host.openshell.internal:17670"
-        );
-        assert_eq!(
-            gateway_callback_endpoint(GatewayCallbackTopology::Podman, 17670, true),
-            "https://host.containers.internal:17670"
-        );
-        assert_eq!(
-            gateway_callback_endpoint(GatewayCallbackTopology::Vm, 17670, true),
-            "https://host.openshell.internal:17670"
-        );
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Sandbox container/pod label keys (openshell.ai/ namespace)
 // ---------------------------------------------------------------------------
@@ -110,10 +58,21 @@ pub const CONDITION_WORKSPACE_VALIDATION_FAILED: &str = "WorkspaceValidationFail
 
 /// Supervisor exit status reserved for OCI workspace validation failures.
 ///
-/// Local container drivers translate this status into
+/// Local container drivers translate a supervisor exit with this status into
 /// [`CONDITION_WORKSPACE_VALIDATION_FAILED`] so users receive the specific
 /// provisioning failure rather than a generic container exit.
 pub const SUPERVISOR_EXIT_WORKSPACE_VALIDATION_FAILED: i32 = 78;
+
+/// Error context for a rejected image-provided OCI working directory.
+///
+/// The supervisor recognizes it in a failed agent start and exits with
+/// [`SUPERVISOR_EXIT_WORKSPACE_VALIDATION_FAILED`].
+pub const WORKSPACE_VALIDATION_ERROR_CONTEXT: &str = "image workspace validation failed";
+
+/// Driver condition message for [`CONDITION_WORKSPACE_VALIDATION_FAILED`].
+/// Fixed text, because supervisor output may contain secrets.
+pub const WORKSPACE_VALIDATION_FAILED_MESSAGE: &str =
+    "OCI WorkingDir is not usable by the sandbox identity";
 
 /// Ready-condition reason when a container was terminated by an external signal.
 ///
@@ -134,7 +93,10 @@ pub const CONDITION_STOPPED: &str = "ContainerStopped";
 /// All compute drivers must launch this binary as the container entrypoint to
 /// start the sandboxed environment.  The value must be kept in sync with the
 /// path used when building the `openshell-sandbox` image layer.
-pub const SUPERVISOR_IMAGE_BINARY_PATH: &str = "/openshell-sandbox";
+pub const SANDBOX_RUNTIME_IMAGE_BINARY_PATH: &str = "/openshell-sandbox";
+
+/// Legacy name for [`SANDBOX_RUNTIME_IMAGE_BINARY_PATH`].
+pub const SUPERVISOR_IMAGE_BINARY_PATH: &str = SANDBOX_RUNTIME_IMAGE_BINARY_PATH;
 
 /// Directory inside sandbox containers where the supervisor binary is mounted.
 ///
@@ -153,21 +115,14 @@ pub const SUPERVISOR_CONTAINER_BINARY: &str = "/opt/openshell/bin/openshell-sand
 // ---------------------------------------------------------------------------
 // In-container mount paths for guest TLS materials and the sandbox token.
 //
-// All container-based drivers (Docker, Podman, Kubernetes) mount the gateway's
-// mTLS client credentials at these fixed paths inside every sandbox container.
-// The supervisor reads these paths on startup to establish its gRPC-over-mTLS
-// connection back to the gateway. The paths must remain stable across driver
-// versions since the supervisor binary is built and packaged separately.
+// Container-based drivers mount the gateway CA at this fixed path inside every
+// supervisor container. The supervisor reads it on startup to authenticate the
+// gateway TLS endpoint. Sandbox identity is provided separately by a bearer
+// token.
 // ---------------------------------------------------------------------------
 
-/// Container-side mount path for the guest mTLS CA certificate.
+/// Container-side mount path for the gateway CA certificate.
 pub const TLS_CA_MOUNT_PATH: &str = "/etc/openshell/tls/client/ca.crt";
-
-/// Container-side mount path for the guest mTLS client certificate.
-pub const TLS_CERT_MOUNT_PATH: &str = "/etc/openshell/tls/client/tls.crt";
-
-/// Container-side mount path for the guest mTLS client private key.
-pub const TLS_KEY_MOUNT_PATH: &str = "/etc/openshell/tls/client/tls.key";
 
 /// Container-side mount path for the per-sandbox JWT token.
 pub const SANDBOX_TOKEN_MOUNT_PATH: &str = "/etc/openshell/auth/sandbox.jwt";
@@ -189,6 +144,18 @@ pub const UPSTREAM_PROXY_AUTH_MOUNT_PATH: &str = "/etc/openshell/auth/upstream-p
 /// credential, a CA certificate is not secret, so a plain read-only bind
 /// mount is used rather than a driver secret.
 pub const PROXY_CA_MOUNT_PATH: &str = "/etc/openshell/tls/proxy/ca-bundle.pem";
+
+/// Container-side mount path for an operator-supplied additional destination
+/// CA bundle.
+///
+/// Drivers with an `additional_ca_bundle` operator setting bind-mount the
+/// host PEM file here (read-only) and pass the path on the supervisor's argv
+/// via `--additional-ca-bundle`. The supervisor folds it into its upstream
+/// TLS trust store alongside the system CA bundle, for direct (non-proxied)
+/// inspected HTTPS egress to destinations signed by a private CA — unlike
+/// [`PROXY_CA_MOUNT_PATH`], this applies regardless of whether a corporate
+/// forward proxy is configured.
+pub const ADDITIONAL_CA_MOUNT_PATH: &str = "/etc/openshell/tls/additional/ca-bundle.pem";
 
 /// A validated corporate upstream-proxy address.
 ///
@@ -610,7 +577,9 @@ fn read_regular_file_bounded(path: &str, max_bytes: u64) -> Result<String, Bound
 /// between them live in one place instead of being restated per driver.
 /// Field names map 1:1 onto the documented TOML keys `https_proxy`,
 /// `no_proxy`, `proxy_auth_file`, `proxy_auth_allow_insecure`,
-/// `proxy_connect_by_hostname`, and `proxy_ca_bundle`.
+/// `proxy_connect_by_hostname`, and `proxy_ca_bundle`. The trailing
+/// `auth_setting_label` is not a TOML key; it only names the credential
+/// setting in diagnostics.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct UpstreamProxySettings<'a> {
     /// `https_proxy`: the corporate forward proxy URL.
@@ -627,6 +596,14 @@ pub struct UpstreamProxySettings<'a> {
     pub connect_by_hostname: Option<bool>,
     /// `proxy_ca_bundle`: host path to a PEM CA bundle trusted for the proxy.
     pub ca_bundle: Option<&'a str>,
+    /// Operator-facing name of this driver's credential setting, used only in
+    /// diagnostics. `None` means `proxy_auth_file`, the local-driver default.
+    ///
+    /// Drivers that deliver the credential by another mechanism set this so an
+    /// error never points the operator at a key their driver rejects: the
+    /// Kubernetes driver takes credentials from a Secret and denies unknown
+    /// config keys, so `proxy_auth_file` would be actively misleading there.
+    pub auth_setting_label: Option<&'a str>,
 }
 
 /// Validate operator-supplied corporate upstream-proxy settings, fail-closed.
@@ -652,9 +629,11 @@ pub fn validate_upstream_proxy_settings(
         let addr = parse_upstream_proxy_url(url).map_err(|err| match err {
             UpstreamProxyUrlError::Empty => "https_proxy must not be empty when set".to_string(),
             UpstreamProxyUrlError::InlineCredentials => {
-                "https_proxy must not embed credentials in the URL; supply them via \
-                 proxy_auth_file so they are not stored in config or sandbox metadata"
-                    .to_string()
+                let auth_setting = settings.auth_setting_label.unwrap_or("proxy_auth_file");
+                format!(
+                    "https_proxy must not embed credentials in the URL; supply them via \
+                     {auth_setting} so they are not stored in config or sandbox metadata"
+                )
             }
             err => format!("https_proxy {err}"),
         })?;
@@ -1272,8 +1251,10 @@ mod tests {
     fn ca_bundle_file_accepts_a_real_certificate() {
         // The positive case that pins host acceptance to guest acceptance:
         // what the driver stages is exactly what rustls will trust.
-        let cert = rcgen::generate_simple_self_signed(vec!["proxy.corp.example".to_string()])
-            .expect("test CA");
+        let cert = openshell_crypto::pki::generate_simple_self_signed(vec![
+            "proxy.corp.example".to_string(),
+        ])
+        .expect("test CA");
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("proxy-ca.pem");
         std::fs::write(&path, cert.cert.pem()).unwrap();
@@ -1380,6 +1361,24 @@ mod tests {
         let err = validate_upstream_proxy_settings(&proxy_settings(Some("http://u:p@proxy:3128")))
             .expect_err("inline credentials would be stored in gateway config");
         assert!(err.contains("proxy_auth_file"), "{err}");
+    }
+
+    #[test]
+    fn upstream_proxy_settings_name_the_driver_credential_setting_in_diagnostics() {
+        // A driver that takes credentials elsewhere must not send the operator
+        // looking for `proxy_auth_file`; the Kubernetes driver denies unknown
+        // config keys, so naming it there would be an actively wrong hint.
+        let err = validate_upstream_proxy_settings(&UpstreamProxySettings {
+            url: Some("http://u:p@proxy:3128"),
+            auth_setting_label: Some("proxy_auth_secret_name and proxy_auth_secret_key"),
+            ..UpstreamProxySettings::default()
+        })
+        .expect_err("inline credentials would be stored in gateway config");
+        assert!(
+            err.contains("proxy_auth_secret_name and proxy_auth_secret_key"),
+            "{err}"
+        );
+        assert!(!err.contains("proxy_auth_file"), "{err}");
     }
 
     #[test]

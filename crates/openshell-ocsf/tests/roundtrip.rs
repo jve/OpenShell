@@ -11,22 +11,23 @@ use std::net::{IpAddr, Ipv4Addr};
 
 use openshell_ocsf::{
     ActionId, ActivityId, AiModel, ApiActivityBuilder, AppLifecycleBuilder, Attack, AuthTypeId,
-    BaseEventBuilder, ConfidenceId, ConfigStateChangeBuilder, ConnectionInfo,
-    DetectionFindingBuilder, DispositionId, Endpoint, EventContext, FindingInfo,
-    HttpActivityBuilder, HttpMethod, HttpRequest, HttpResponse, LaunchTypeId,
+    AuthenticationBuilder, BaseEventBuilder, ConfidenceId, ConfigStateChangeBuilder,
+    ConnectionInfo, DetectionFindingBuilder, DispositionId, Endpoint, EventContext, EventOrigin,
+    FindingInfo, HttpActivityBuilder, HttpMethod, HttpRequest, HttpResponse, LaunchTypeId,
     NetworkActivityBuilder, OcsfEvent, Process, ProcessActivityBuilder, RiskLevelId,
-    SecurityLevelId, SeverityId, SshActivityBuilder, StateId, StatusId, Url,
+    SecurityLevelId, Service, SeverityId, SshActivityBuilder, StateId, StatusId, Url, User,
 };
 
 fn ctx() -> EventContext {
     EventContext {
         sandbox_id: "sb-7f3a9c2e14b8".to_string(),
         sandbox_name: "agent-workspace-01".to_string(),
-        container_image: "ghcr.io/nvidia/openshell-community/sandboxes/base:latest".to_string(),
+        container_image: "nvcr.io/nvidia/base/ubuntu:24.04".to_string(),
         hostname: "openshell-sb-7f3a9c2e14b8".to_string(),
         product_version: "0.42.1".to_string(),
         proxy_ip: IpAddr::V4(Ipv4Addr::LOCALHOST),
         proxy_port: 8888,
+        origin: EventOrigin::Supervisor,
     }
 }
 
@@ -205,6 +206,33 @@ fn api_activity_round_trips() {
         .build();
 
     assert_round_trips("api_activity", &event);
+}
+
+#[test]
+fn authentication_round_trips() {
+    let event = AuthenticationBuilder::new(
+        &ctx(),
+        User::other("sb-7f3a9c2e14b8", "Sandbox").with_name("agent-workspace-01"),
+        Service::new("openshell-gateway"),
+    )
+    .auth_protocol_other("sandbox_jwt")
+    .action(ActionId::Denied)
+    .disposition(DispositionId::Unauthorized)
+    .severity(SeverityId::Medium)
+    .status(StatusId::Failure)
+    .status_detail("stale_identity")
+    .src_endpoint(Endpoint::from_ip(
+        IpAddr::V4(Ipv4Addr::new(203, 0, 113, 7)),
+        51236,
+    ))
+    .http_request(HttpRequest {
+        http_method: HttpMethod::Post,
+        url: Some(Url::from_path("/openshell.v1.OpenShell/GetSandboxConfig")),
+    })
+    .message("authentication failed")
+    .build();
+
+    assert_round_trips("authentication", &event);
 }
 
 #[test]

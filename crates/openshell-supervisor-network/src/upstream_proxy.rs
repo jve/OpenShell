@@ -83,6 +83,9 @@ const CONNECT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
 pub struct ProxyEndpoint {
     host: String,
     port: u16,
+    /// Optional driver-pinned address used only for the TCP dial. The
+    /// configured host remains authoritative for TLS identity and logging.
+    dial_ip: Option<IpAddr>,
     /// Pre-computed `Basic <base64>` header value from the proxy auth file.
     /// Never logged.
     proxy_authorization: Option<String>,
@@ -106,6 +109,7 @@ impl std::fmt::Debug for ProxyEndpoint {
         f.debug_struct("ProxyEndpoint")
             .field("host", &self.host)
             .field("port", &self.port)
+            .field("dial_ip", &self.dial_ip)
             .field("proxy_authorization", &self.proxy_authorization.is_some())
             .field("tls", &self.tls.is_some())
             .finish()
@@ -215,12 +219,8 @@ impl NoProxy {
     /// outside that range.
     ///
     /// The automatic loopback bypass is derived from resolved addresses, never
-    /// from the host string: `resolved` may come from the sandbox's own
-    /// `/etc/hosts` (see `resolve_socket_addrs`), which the workload controls,
-    /// so treating the name `localhost` as proof of loopback would let a
-    /// spoofed mapping dial a policy-allowed public address while escaping the
-    /// operator proxy. A spoofed `localhost` falls through to the entries below
-    /// and is proxied unless an explicit `NO_PROXY` entry matches.
+    /// from the host string. This keeps the bypass valid even for callers whose
+    /// independently IP-constrained resolution may honor sandbox `/etc/hosts`.
     fn direct_addrs(
         &self,
         host: &str,
@@ -334,6 +334,9 @@ pub struct UpstreamProxyArgs {
     /// `http://host:port` or `https://host:port` corporate proxy URL, or
     /// `None` for direct egress.
     pub https_proxy: Option<String>,
+    /// Optional compute-driver-selected IP for reaching the proxy from the
+    /// supervisor's network namespace without changing its TLS identity.
+    pub proxy_dial_ip: Option<IpAddr>,
     /// Comma-separated `NO_PROXY` list.
     pub no_proxy: Option<String>,
     /// Path to the root-only credential mount (`user:pass`).
@@ -354,6 +357,7 @@ pub struct UpstreamProxyArgs {
 // Supervisor CLI flag names for the corporate-proxy settings, used as the
 // dispatch keys in `from_lookup` and in operator-facing error messages.
 const ARG_HTTPS_PROXY: &str = "--upstream-proxy";
+const ARG_PROXY_DIAL_IP: &str = "--upstream-proxy-dial-ip";
 const ARG_NO_PROXY: &str = "--upstream-no-proxy";
 const ARG_PROXY_AUTH_FILE: &str = "--upstream-proxy-auth-file";
 const ARG_PROXY_AUTH_ALLOW_INSECURE: &str = "--upstream-proxy-auth-allow-insecure";
@@ -391,6 +395,8 @@ impl UpstreamProxyConfig {
         Self::from_lookup(|name| {
             if name == ARG_HTTPS_PROXY {
                 args.https_proxy.clone()
+            } else if name == ARG_PROXY_DIAL_IP {
+                args.proxy_dial_ip.map(|ip| ip.to_string())
             } else if name == ARG_NO_PROXY {
                 args.no_proxy.clone()
             } else if name == ARG_PROXY_AUTH_FILE {
@@ -424,6 +430,12 @@ impl UpstreamProxyConfig {
         let https = var(ARG_HTTPS_PROXY)?
             .map(|url| parse_proxy_url(&url, ARG_HTTPS_PROXY))
             .transpose()?;
+        let proxy_dial_ip = var(ARG_PROXY_DIAL_IP)?
+            .map(|raw| {
+                raw.parse::<IpAddr>()
+                    .map_err(|error| format!("{ARG_PROXY_DIAL_IP} is invalid: {error}"))
+            })
+            .transpose()?;
         let auth_file = var(ARG_PROXY_AUTH_FILE)?;
         let auth_allow_insecure = var(ARG_PROXY_AUTH_ALLOW_INSECURE)?;
         let connect_by_hostname_raw = var(ARG_PROXY_CONNECT_BY_HOSTNAME)?;
@@ -435,6 +447,7 @@ impl UpstreamProxyConfig {
             // silently running with direct egress.
             for (name, value) in [
                 (ARG_PROXY_AUTH_FILE, &auth_file),
+                (ARG_PROXY_DIAL_IP, &proxy_dial_ip.map(|ip| ip.to_string())),
                 (ARG_PROXY_AUTH_ALLOW_INSECURE, &auth_allow_insecure),
                 (ARG_PROXY_CONNECT_BY_HOSTNAME, &connect_by_hostname_raw),
                 (ARG_NO_PROXY, &no_proxy_list),
@@ -446,6 +459,7 @@ impl UpstreamProxyConfig {
             }
             return Ok(None);
         };
+        https.dial_ip = proxy_dial_ip;
 
         // CONNECT-target mode. The default binds the tunnel to a validated
         // address; hostname CONNECT re-opens proxy-side DNS resolution and
@@ -592,6 +606,7 @@ fn parse_proxy_url(raw: &str, var_name: &str) -> Result<(ProxyEndpoint, bool), S
         ProxyEndpoint {
             host: addr.host,
             port: addr.port,
+            dial_ip: None,
             proxy_authorization: None,
             tls: None,
         },
@@ -1000,7 +1015,10 @@ async fn connect_via_inner(
     port: u16,
     target: ConnectTarget,
 ) -> std::io::Result<PrefixedStream> {
-    let tcp = TcpStream::connect((endpoint.host.as_str(), endpoint.port)).await?;
+    let tcp = match endpoint.dial_ip {
+        Some(ip) => TcpStream::connect(SocketAddr::new(ip, endpoint.port)).await?,
+        None => TcpStream::connect((endpoint.host.as_str(), endpoint.port)).await?,
+    };
     set_tcp_nodelay_best_effort(&tcp);
     // For an `https://` proxy, wrap the connection in TLS (verifying the proxy
     // certificate against the configured roots) before the CONNECT handshake.
@@ -1113,6 +1131,7 @@ mod tests {
         ARG_PROXY_AUTH_ALLOW_INSECURE as PROXY_AUTH_ALLOW_INSECURE,
         ARG_PROXY_AUTH_FILE as PROXY_AUTH_FILE, ARG_PROXY_CA_BUNDLE as PROXY_CA_BUNDLE,
         ARG_PROXY_CONNECT_BY_HOSTNAME as PROXY_CONNECT_BY_HOSTNAME,
+        ARG_PROXY_DIAL_IP as PROXY_DIAL_IP,
     };
 
     fn config_from(pairs: &[(&str, &str)]) -> Result<Option<UpstreamProxyConfig>, String> {
@@ -1759,11 +1778,10 @@ mod tests {
         assert!(!bypasses(&cfg, "example.com"));
     }
 
-    /// A sandbox controls its own `/etc/hosts`, and `resolve_socket_addrs`
-    /// consults it before DNS, so `localhost` can resolve to any address the
-    /// network policy happens to allow. The name must not authorize a direct
-    /// dial that escapes the operator proxy — only genuinely loopback
-    /// resolved addresses may.
+    /// Only genuinely loopback resolved addresses may authorize the automatic
+    /// direct-dial bypass. Callers with independently IP-constrained resolution
+    /// can still honor sandbox `/etc/hosts`, so this check must remain based on
+    /// the resolved address rather than the hostname.
     #[test]
     fn spoofed_localhost_resolution_does_not_bypass_proxy() {
         let cfg = config_ok(&[(HTTPS_PROXY, "http://proxy:8080")]);
@@ -1822,6 +1840,7 @@ mod tests {
         ProxyEndpoint {
             host: addr.ip().to_string(),
             port: addr.port(),
+            dial_ip: None,
             proxy_authorization: auth.map(str::to_string),
             tls: None,
         }
@@ -2227,23 +2246,27 @@ mod tests {
 
     // -- TLS (https://) proxies --
 
-    /// A fake `https://` proxy: a TLS server with a self-signed cert for
-    /// 127.0.0.1 that answers CONNECT with 200. Returns the listen address,
+    /// A fake `https://` proxy: a TLS server with a self-signed cert for the
+    /// requested identity that answers CONNECT with 200. Returns the listen address,
     /// the server task (yielding the received CONNECT request), and the
     /// server certificate PEM to use as the corporate CA bundle.
-    async fn fake_tls_proxy() -> (SocketAddr, tokio::task::JoinHandle<String>, String) {
-        let key = rcgen::KeyPair::generate().unwrap();
-        let cert = rcgen::CertificateParams::new(vec!["127.0.0.1".to_string()])
-            .unwrap()
-            .self_signed(&key)
-            .unwrap();
+    async fn fake_tls_proxy(
+        tls_identity: &str,
+    ) -> (SocketAddr, tokio::task::JoinHandle<String>, String) {
+        openshell_crypto::tls::ensure_default_provider();
+        let key = openshell_crypto::pki::generate_keypair().unwrap();
+        let cert = openshell_crypto::pki::self_signed(
+            rcgen::CertificateParams::new(vec![tls_identity.to_string()]).unwrap(),
+            &key,
+        )
+        .unwrap();
         let cert_pem = cert.pem();
 
-        let server_config = rustls::ServerConfig::builder()
+        let server_config = openshell_crypto::tls::server_builder()
             .with_no_client_auth()
             .with_single_cert(
                 vec![cert.der().clone()],
-                rustls::pki_types::PrivateKeyDer::try_from(key.serialize_der()).unwrap(),
+                rustls::pki_types::PrivateKeyDer::try_from(key.serialize_der().unwrap()).unwrap(),
             )
             .unwrap();
         let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(server_config));
@@ -2273,18 +2296,23 @@ mod tests {
 
     #[tokio::test]
     async fn connect_via_https_proxy_with_corporate_ca_bundle() {
-        let (addr, handle, cert_pem) = fake_tls_proxy().await;
+        const PROXY_IDENTITY: &str = "proxy.corp.test";
+        let (addr, handle, cert_pem) = fake_tls_proxy(PROXY_IDENTITY).await;
         let ca_file = tempfile::NamedTempFile::new().unwrap();
         std::fs::write(ca_file.path(), cert_pem).unwrap();
 
-        let proxy_url = format!("https://{addr}");
+        let proxy_url = format!("https://{PROXY_IDENTITY}:{}", addr.port());
         let ca_path = ca_file.path().to_string_lossy().into_owned();
+        let dial_ip = addr.ip().to_string();
         let cfg = config_ok(&[
             (HTTPS_PROXY, proxy_url.as_str()),
+            (PROXY_DIAL_IP, dial_ip.as_str()),
             (PROXY_CA_BUNDLE, ca_path.as_str()),
         ]);
         let endpoint = &cfg.https;
         assert!(endpoint.tls.is_some());
+        assert_eq!(endpoint.host, PROXY_IDENTITY);
+        assert_eq!(endpoint.dial_ip, Some(addr.ip()));
 
         let stream = connect_via(endpoint, "api.example.com", 443, ConnectTarget::Hostname)
             .await
@@ -2299,7 +2327,7 @@ mod tests {
     async fn connect_via_https_proxy_rejects_untrusted_cert() {
         // No corporate CA bundle: the self-signed proxy cert must not verify
         // against the built-in / system roots, so the handshake fails closed.
-        let (addr, _handle, _cert_pem) = fake_tls_proxy().await;
+        let (addr, _handle, _cert_pem) = fake_tls_proxy("127.0.0.1").await;
         let proxy_url = format!("https://{addr}");
         let cfg = config_ok(&[(HTTPS_PROXY, proxy_url.as_str())]);
         let endpoint = &cfg.https;

@@ -27,10 +27,22 @@ const (
 	RefreshStrategyGoogleServiceAccountJWT = types.RefreshStrategyGoogleServiceAccountJWT
 )
 
+// RefreshRecoveryAction describes the action required after a credential failure.
+type RefreshRecoveryAction = types.RefreshRecoveryAction
+
+// RefreshRecoveryAction values.
+const (
+	RefreshRecoveryActionUnspecified      = types.RefreshRecoveryActionUnspecified
+	RefreshRecoveryActionRetry            = types.RefreshRecoveryActionRetry
+	RefreshRecoveryActionReauthorize      = types.RefreshRecoveryActionReauthorize
+	RefreshRecoveryActionFixConfiguration = types.RefreshRecoveryActionFixConfiguration
+	RefreshRecoveryActionInvestigate      = types.RefreshRecoveryActionInvestigate
+)
+
 // RefreshInterface defines operations for managing provider credential refresh.
 type RefreshInterface interface {
 	GetStatus(ctx context.Context, workspace, provider, credentialKey string) ([]*RefreshStatus, error)
 	Configure(ctx context.Context, workspace string, config *RefreshConfig) (*RefreshStatus, error)
 	Rotate(ctx context.Context, workspace, provider, credentialKey string) (*RefreshStatus, error)
-	Delete(ctx context.Context, workspace, provider, credentialKey string) (bool, error)
+	Delete(ctx context.Context, workspace, provider, credentialKey string, opts ...DeleteOptions) (*DeletionResult, error)
 }

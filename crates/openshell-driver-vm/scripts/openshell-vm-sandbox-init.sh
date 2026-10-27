@@ -3,9 +3,9 @@
 # SPDX-License-Identifier: Apache-2.0
 
 # Minimal init for sandbox VMs. Runs as PID 1 inside the guest, mounts the
-# essential filesystems, configures networking (gvproxy DHCP or TAP static),
-# optionally loads NVIDIA GPU drivers, then execs the OpenShell sandbox
-# supervisor.
+# essential filesystems, optionally loads NVIDIA GPU drivers, then execs the
+# portable VM sandbox. Workload networking crosses the authenticated
+# boundary channel; the VM does not receive a network interface.
 
 set -euo pipefail
 
@@ -14,26 +14,9 @@ set -euo pipefail
 unset KRUN_INIT_PID1
 
 BOOT_START=$(date +%s%3N 2>/dev/null || date +%s)
-# gvisor-tap-vsock subnet layout:
-#   192.168.127.1   — gateway: gvproxy's DNS / DHCP / HTTP API. Does NOT
-#                     proxy arbitrary host ports.
-#   192.168.127.254 — host-loopback: NAT-rewritten to host's 127.0.0.1 by
-#                     gvproxy's TCP/UDP/ICMP forwarder. Use this address
-#                     (or any of the host.* hostnames below) to reach a
-#                     service the host is listening on.
-# The host.openshell.internal / host.containers.internal /
-# host.docker.internal DNS records served by gvproxy's embedded resolver
-# point at 192.168.127.254. We mirror that in /etc/hosts so the supervisor
-# can reach the gateway even when gvproxy's DNS is not in resolv.conf
-# (e.g. DHCP failed and we fell back to 8.8.8.8).
-GVPROXY_GATEWAY_IP="192.168.127.1"
-GVPROXY_HOST_LOOPBACK_IP="192.168.127.254"
-GATEWAY_IP="$GVPROXY_GATEWAY_IP"
+SANDBOX_OWNER_NORMALIZED_MARKER="/opt/openshell/.sandbox-owner-normalized"
 
 GPU_ENABLED="${GPU_ENABLED:-false}"
-VM_NET_IP="${VM_NET_IP:-}"
-VM_NET_GW="${VM_NET_GW:-}"
-VM_NET_DNS="${VM_NET_DNS:-}"
 
 ts() {
     local now
@@ -133,6 +116,10 @@ ensure_target_runtime() {
         cp /opt/openshell/bin/openshell-sandbox "$image_root/opt/openshell/bin/openshell-sandbox"
         chmod 0755 "$image_root/opt/openshell/bin/openshell-sandbox"
     fi
+    if [ -x /opt/openshell/bin/openshell-vm-init ]; then
+        cp /opt/openshell/bin/openshell-vm-init "$image_root/opt/openshell/bin/openshell-vm-init"
+        chmod 0755 "$image_root/opt/openshell/bin/openshell-vm-init"
+    fi
 
     touch "$image_root/etc/passwd" "$image_root/etc/group" "$image_root/etc/shadow" "$image_root/etc/gshadow"
     if [ "$replace_account" -eq 1 ]; then
@@ -175,25 +162,30 @@ prepare_guest_image_rootfs() {
 
     rm -rf "$image_root" "$partial_root"
 
+    # Build the rootfs under $partial_root and rename it into place last. The
+    # host only caches a prepared disk that has $image_root, and guest exit
+    # codes do not reach the host, so $image_root must not exist until every
+    # step has succeeded.
     case "$source" in
         local-docker)
-            mkdir -p "$image_root"
-            tar -xpf "$payload_dir/source-rootfs.tar" -C "$image_root"
+            mkdir -p "$partial_root"
+            tar -xpf "$payload_dir/source-rootfs.tar" -C "$partial_root"
             ;;
         oci-layout)
             if [ ! -x /opt/openshell/bin/umoci ]; then
                 ts "FATAL: umoci not found in VM bootstrap image"
                 exit 1
             fi
+            # `umoci raw unpack` extracts the image filesystem directly into
+            # the target directory; unlike `umoci unpack`, it does not create
+            # a bundle with a rootfs/ subdirectory.
             /opt/openshell/bin/umoci raw unpack \
                 --image "$payload_dir/oci:openshell" \
                 "$partial_root"
-            if [ ! -d "$partial_root/rootfs" ]; then
-                ts "FATAL: umoci unpack did not produce rootfs directory"
+            if [ ! -d "$partial_root" ]; then
+                ts "FATAL: umoci unpack did not produce a rootfs directory"
                 exit 1
             fi
-            mv "$partial_root/rootfs" "$image_root"
-            rm -rf "$partial_root"
             ;;
         *)
             ts "FATAL: unknown guest image payload source: ${source:-missing}"
@@ -201,104 +193,23 @@ prepare_guest_image_rootfs() {
             ;;
     esac
 
-    ensure_target_runtime "$image_root"
+    ensure_target_runtime "$partial_root"
     if [ -f "$payload_dir/identity" ]; then
-        cp "$payload_dir/identity" "$image_root/.openshell-rootfs-variant"
+        cp "$payload_dir/identity" "$partial_root/.openshell-rootfs-variant"
     fi
     rm -rf "$payload_dir"
-}
-
-# Driver-owned arguments appended to the supervisor's command line.
-#
-# The VM driver cannot build the supervisor's argv the way the container
-# drivers do, so it writes the arguments it chose into the overlay upperdir
-# and this script appends them verbatim. Populated by
-# read_supervisor_extra_args; empty until then.
-SUPERVISOR_EXTRA_ARGS=()
-
-# Upper bound on driver-supplied supervisor arguments.
-#
-# The corporate proxy settings are the only producer today and top out at ten
-# entries. The cap exists so a corrupt or oversized file cannot expand into an
-# unbounded command line.
-SUPERVISOR_EXTRA_ARGS_MAX=32
-
-read_supervisor_extra_args() {
-    # Read the driver-authored supervisor argument list, one argument per
-    # line, verbatim -- no word splitting, globbing, or expansion, so values
-    # containing spaces (e.g. a NO_PROXY list) survive intact.
-    #
-    # Security: this is the operator-owned egress boundary. The driver writes
-    # this file into the overlay upperdir on every launch, including an empty
-    # file when it has no arguments to pass, so the upperdir copy always
-    # shadows the read-only image layer. A sandbox image can therefore neither
-    # supply its own supervisor arguments by baking a file at this path nor
-    # disable the operator's by omitting one. A missing file means the driver
-    # passed nothing; a file it cannot read means the overlay is broken, and
-    # we fail closed rather than start a supervisor with a silently truncated
-    # egress configuration.
-    local args_file
-    args_file="$(root_path /opt/openshell/supervisor-args)"
-
-    SUPERVISOR_EXTRA_ARGS=()
-    if [ ! -f "$args_file" ]; then
-        return 0
-    fi
-    if [ ! -r "$args_file" ]; then
-        ts "FATAL: supervisor argument list ${args_file} is not readable"
-        exit 1
-    fi
-
-    local arg
-    while IFS= read -r arg; do
-        # render_guest_supervisor_args never emits a blank line, so one means
-        # the file was truncated or tampered with after the driver wrote it.
-        if [ -z "$arg" ]; then
-            ts "FATAL: empty entry in supervisor argument list"
-            exit 1
-        fi
-        if [ "${#SUPERVISOR_EXTRA_ARGS[@]}" -ge "$SUPERVISOR_EXTRA_ARGS_MAX" ]; then
-            ts "FATAL: supervisor argument list exceeds ${SUPERVISOR_EXTRA_ARGS_MAX} entries"
-            exit 1
-        fi
-        SUPERVISOR_EXTRA_ARGS+=("$arg")
-    done < "$args_file"
-
-    if [ "${#SUPERVISOR_EXTRA_ARGS[@]}" -gt 0 ]; then
-        ts "supervisor arguments from driver: ${#SUPERVISOR_EXTRA_ARGS[@]} entries"
-    fi
+    mv "$partial_root" "$image_root"
 }
 
 exec_supervisor_in_newroot() {
     local chroot_bin
-    local bootstrap="/.openshell-bootstrap"
-    local supervisor="${bootstrap}/opt/openshell/bin/openshell-sandbox"
-    local loader
-    local lib_path
+    local supervisor="/.openshell-bootstrap/opt/openshell/bin/openshell-sandbox"
 
     for chroot_bin in /usr/sbin/chroot /usr/bin/chroot /sbin/chroot /bin/chroot; do
         [ -x "$chroot_bin" ] || continue
 
         if [ -x "/newroot${supervisor}" ]; then
-            for loader in \
-                "${bootstrap}/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2" \
-                "${bootstrap}/usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2" \
-                "${bootstrap}/lib64/ld-linux-x86-64.so.2" \
-                "${bootstrap}/lib/ld-linux-x86-64.so.2" \
-                "${bootstrap}/lib/aarch64-linux-gnu/ld-linux-aarch64.so.1" \
-                "${bootstrap}/usr/lib/aarch64-linux-gnu/ld-linux-aarch64.so.1" \
-                "${bootstrap}/lib/ld-linux-aarch64.so.1" \
-                "${bootstrap}/lib64/ld-linux-aarch64.so.1"; do
-                if [ -x "/newroot${loader}" ]; then
-                    lib_path="${bootstrap}/lib:${bootstrap}/lib64:${bootstrap}/usr/lib:${bootstrap}/usr/lib64:${bootstrap}/lib/aarch64-linux-gnu:${bootstrap}/lib/x86_64-linux-gnu:${bootstrap}/usr/lib/aarch64-linux-gnu:${bootstrap}/usr/lib/x86_64-linux-gnu"
-                    exec "$chroot_bin" /newroot "$loader" --library-path "$lib_path" "$supervisor" "$@"
-                fi
-            done
             exec "$chroot_bin" /newroot "$supervisor" "$@"
-        fi
-
-        if [ -x /newroot/opt/openshell/bin/openshell-sandbox ]; then
-            exec "$chroot_bin" /newroot /opt/openshell/bin/openshell-sandbox "$@"
         fi
     done
 
@@ -367,170 +278,6 @@ setup_overlay_root() {
 
     ROOT_PREFIX="/newroot"
     run_post_overlay_setup
-}
-
-parse_endpoint() {
-    local endpoint="$1"
-    local scheme rest authority path host port
-
-    case "$endpoint" in
-        *://*)
-            scheme="${endpoint%%://*}"
-            rest="${endpoint#*://}"
-            ;;
-        *)
-            return 1
-            ;;
-    esac
-
-    authority="${rest%%/*}"
-    path="${rest#"$authority"}"
-    if [ "$path" = "$rest" ]; then
-        path=""
-    fi
-
-    if [[ "$authority" =~ ^\[([^]]+)\]:(.+)$ ]]; then
-        host="${BASH_REMATCH[1]}"
-        port="${BASH_REMATCH[2]}"
-    elif [[ "$authority" =~ ^\[([^]]+)\]$ ]]; then
-        host="${BASH_REMATCH[1]}"
-        port=""
-    elif [[ "$authority" == *:* ]]; then
-        host="${authority%%:*}"
-        port="${authority##*:}"
-    else
-        host="$authority"
-        port=""
-    fi
-
-    if [ -z "$port" ]; then
-        case "$scheme" in
-            https) port="443" ;;
-            *) port="80" ;;
-        esac
-    fi
-
-    printf '%s\n%s\n%s\n%s\n' "$scheme" "$host" "$port" "$path"
-}
-
-tcp_probe() {
-    local host="$1"
-    local port="$2"
-
-    if command -v timeout >/dev/null 2>&1; then
-        timeout 2 bash -c "exec 3<>/dev/tcp/\$1/\$2" _ "$host" "$port" >/dev/null 2>&1
-    else
-        bash -c "exec 3<>/dev/tcp/\$1/\$2" _ "$host" "$port" >/dev/null 2>&1
-    fi
-}
-
-ensure_host_gateway_aliases() {
-    # Seed /etc/hosts with the well-known gvproxy hostnames so the supervisor
-    # can reach the OpenShell server even when gvproxy's built-in DNS is not
-    # in resolv.conf (e.g. when DHCP fails and we fall back to 8.8.8.8).
-    #
-    # Critical distinction: host.* aliases point at the gvproxy *host-loopback*
-    # IP (192.168.127.254), not the gateway IP (192.168.127.1). Only the
-    # host-loopback IP carries NAT rewriting to the host's 127.0.0.1 — the
-    # gateway IP only listens on gvproxy's own service ports (DNS:53, DHCP,
-    # HTTP API:80). Pinning host.containers.internal to the gateway IP
-    # silently breaks guest→host port reachability for arbitrary ports.
-    local host_aliases="host.openshell.internal host.containers.internal host.docker.internal"
-    local gateway_aliases="gateway.containers.internal"
-    local filter='(^|[[:space:]])(host\.openshell\.internal|host\.containers\.internal|host\.docker\.internal|gateway\.containers\.internal)([[:space:]]|$)'
-
-    write_host_gateway_aliases "$(root_path /etc/hosts)" "$(root_path "/tmp/openshell-hosts.$$.tmp")" || true
-    if [ -n "${ROOT_PREFIX:-}" ]; then
-        write_host_gateway_aliases "/etc/hosts" "/tmp/openshell-hosts.$$.tmp" || true
-    fi
-}
-
-write_host_gateway_aliases() {
-    local hosts_path="$1"
-    local hosts_tmp="$2"
-    mkdir -p "$(dirname "$hosts_path")" 2>/dev/null || true
-    mkdir -p "$(dirname "$hosts_tmp")" 2>/dev/null || true
-    if [ -f "$hosts_path" ]; then
-        grep -vE "$filter" "$hosts_path" > "$hosts_tmp" || true
-    else
-        : > "$hosts_tmp"
-    fi
-
-    # In TAP/GPU mode, GATEWAY_IP is overridden to VM_NET_GW (the host-side
-    # of the TAP), and the gateway is reachable directly there. In gvproxy
-    # mode, host.openshell.internal etc. need GVPROXY_HOST_LOOPBACK_IP
-    # (192.168.127.254) which is gvproxy's host-NAT entry, while
-    # gateway.containers.internal points at the gvproxy gateway itself.
-    if [ "${GATEWAY_IP}" = "${GVPROXY_GATEWAY_IP}" ]; then
-        printf '%s %s\n' "$GVPROXY_HOST_LOOPBACK_IP" "$host_aliases" >> "$hosts_tmp"
-        printf '%s %s\n' "$GVPROXY_GATEWAY_IP" "$gateway_aliases" >> "$hosts_tmp"
-    else
-        # TAP networking: gateway and host are both reachable at GATEWAY_IP.
-        printf '%s %s %s\n' "$GATEWAY_IP" "$host_aliases" "$gateway_aliases" >> "$hosts_tmp"
-    fi
-    if ! cat "$hosts_tmp" > "$hosts_path" 2>/dev/null; then
-        rm -f "$hosts_tmp"
-        ts "WARNING: could not update ${hosts_path}"
-        return 1
-    fi
-    rm -f "$hosts_tmp"
-}
-
-rewrite_openshell_endpoint_if_needed() {
-    local endpoint="${OPENSHELL_ENDPOINT:-}"
-    [ -n "$endpoint" ] || return 0
-
-    local parsed
-    if ! parsed="$(parse_endpoint "$endpoint")"; then
-        ts "WARNING: could not parse OPENSHELL_ENDPOINT=$endpoint"
-        return 0
-    fi
-
-    local scheme host port path
-    scheme="$(printf '%s\n' "$parsed" | sed -n '1p')"
-    host="$(printf '%s\n' "$parsed" | sed -n '2p')"
-    port="$(printf '%s\n' "$parsed" | sed -n '3p')"
-    path="$(printf '%s\n' "$parsed" | sed -n '4p')"
-
-    if tcp_probe "$host" "$port"; then
-        return 0
-    fi
-
-    # Probe candidates in preference order. Hostnames first for informative
-    # log output, then a bare IP as a final safety net. In gvproxy mode the
-    # bare IP is the host-loopback (192.168.127.254). In TAP/GPU mode it's
-    # the TAP host gateway.
-    local fallback_ip="$GVPROXY_HOST_LOOPBACK_IP"
-    if [ "${GATEWAY_IP}" != "${GVPROXY_GATEWAY_IP}" ]; then
-        fallback_ip="$GATEWAY_IP"
-    fi
-    local candidates="host.openshell.internal host.containers.internal host.docker.internal"
-    if [ "$scheme" != "https" ]; then
-        candidates="${candidates} ${fallback_ip}"
-    fi
-
-    for candidate in $candidates; do
-        if [ "$candidate" = "$host" ]; then
-            continue
-        fi
-        if tcp_probe "$candidate" "$port"; then
-            local authority="$candidate"
-            if ! { [ "$scheme" = "http" ] && [ "$port" = "80" ]; } \
-                && ! { [ "$scheme" = "https" ] && [ "$port" = "443" ]; }; then
-                authority="${authority}:${port}"
-            fi
-            export OPENSHELL_ENDPOINT="${scheme}://${authority}${path}"
-            ts "rewrote OPENSHELL_ENDPOINT to ${OPENSHELL_ENDPOINT}"
-            return 0
-        fi
-    done
-
-    if [ "$scheme" = "https" ]; then
-        ts "WARNING: could not preflight HTTPS OpenShell endpoint ${host}:${port}; preserving hostname for TLS verification"
-        return 0
-    fi
-
-    ts "WARNING: could not reach OpenShell endpoint ${host}:${port}"
 }
 
 create_gpu_device_nodes_mknod() {
@@ -702,6 +449,40 @@ configure_hostname() {
     ts "hostname=${sandbox_hostname}"
 }
 
+# OCI images commonly ship an empty /etc/hosts and rely on the container
+# runtime to bind-mount a generated one. No runtime does that here, and /etc is
+# read-only once the supervisor applies policy, so init supplies the loopback
+# names when the file is missing or empty. A non-empty file is the image
+# author's and is kept as is. Without these entries `localhost` fails to
+# resolve: the guest resolver is the loopback relay, which has no record for it.
+configure_hosts() {
+    local hosts_file
+    hosts_file="$(root_path /etc/hosts)"
+
+    # An absolute symlink target resolves against init's own root, not the
+    # workload root, so following one could write outside the workload. Leave
+    # an image-authored link alone.
+    if [ -L "$hosts_file" ]; then
+        ts "WARN: ${hosts_file} is a symlink; leaving it unchanged"
+        return 0
+    fi
+    if [ -s "$hosts_file" ]; then
+        return 0
+    fi
+
+    # Missing loopback names degrade the workload but do not make the sandbox
+    # unsafe, so a write failure is reported and boot continues. The shell's
+    # own error stays visible on the console to explain the failure.
+    if ! printf '%s\n' \
+        '127.0.0.1 localhost' \
+        '::1 localhost ip6-localhost ip6-loopback' \
+        >"$hosts_file"; then
+        ts "WARN: could not write ${hosts_file}; localhost will not resolve"
+        return 0
+    fi
+    ts "populated empty /etc/hosts with loopback names"
+}
+
 run_openshell_init_dropins() {
     # Run executable drop-ins from /opt/openshell/init.d in deterministic
     # ASCII-sorted order. Drop-ins are *executed* in a child shell rather
@@ -776,6 +557,74 @@ run_openshell_init_dropins() {
     done < <(LC_ALL=C sort -u "$manifest")
 }
 
+# Create a virtiofs mount point under ROOT_PREFIX without following symlinks,
+# so an image cannot redirect a validated target onto another guest path.
+# Directories created under /sandbox are handed to the sandbox user.
+prepare_virtiofs_target() {
+    local target="$1" owner="$2"
+    local path="${ROOT_PREFIX:-}" component
+    local -a components
+    IFS=/ read -r -a components <<<"${target#/}"
+    for component in "${components[@]}"; do
+        [ -n "$component" ] || continue
+        path="${path}/${component}"
+        if [ -L "$path" ]; then
+            ts >&2 "FATAL: virtiofs mount target ${target} traverses symlink ${path#"${ROOT_PREFIX:-}"}"
+            exit 1
+        fi
+        if [ ! -e "$path" ]; then
+            if ! mkdir "$path"; then
+                ts >&2 "FATAL: failed to create virtiofs mount point ${target}"
+                exit 1
+            fi
+            case "${path#"${ROOT_PREFIX:-}"}" in
+                /sandbox/*)
+                    if ! chown "$owner" "$path"; then
+                        ts >&2 "FATAL: failed to hand virtiofs mount point parent ${path#"${ROOT_PREFIX:-}"} to ${owner}"
+                        exit 1
+                    fi
+                    ;;
+            esac
+        elif [ ! -d "$path" ]; then
+            ts >&2 "FATAL: virtiofs mount target ${target} is not a directory"
+            exit 1
+        fi
+    done
+    printf '%s\n' "$path"
+}
+
+# Runs after every /sandbox ownership fixup and the root-run init drop-ins so
+# nothing in init walks into host-backed shares.
+mount_virtiofs_shares() {
+    local manifest
+    manifest="$(root_path /.openshell/mounts.manifest)"
+    # The driver always writes the manifest; it is empty without mounts.
+    [ -s "$manifest" ] || return 0
+
+    ts "mounting virtiofs shares"
+    local tag target mode mount_opts guest_target owner
+    owner="$(sandbox_owner)"
+    while IFS=$'\t' read -r tag target mode; do
+        [ -n "$tag" ] || continue
+        case "$mode" in
+            ro)  mount_opts="-o ro" ;;
+            rw)  mount_opts="" ;;
+            *)
+                ts "FATAL: unknown virtiofs mount mode '${mode}' for tag ${tag}"
+                exit 1
+                ;;
+        esac
+        guest_target="$(prepare_virtiofs_target "$target" "$owner")" || exit 1
+        # shellcheck disable=SC2086
+        if mount -t virtiofs $mount_opts "$tag" "$guest_target"; then
+            ts "  mounted virtiofs ${tag} -> ${target} (${mode})"
+        else
+            ts "FATAL: failed to mount virtiofs ${tag} at ${target}"
+            exit 1
+        fi
+    done < "$manifest"
+}
+
 run_post_overlay_setup() {
     # Source QEMU-injected environment variables if present. The file lives in
     # the overlay upperdir so the cached bootstrap rootfs remains immutable.
@@ -801,117 +650,29 @@ run_post_overlay_setup() {
     mount -t cgroup2 cgroup2 "$(root_path /sys/fs/cgroup)" 2>/dev/null &
     wait
 
-    # Allow nftables LOG rules to work in non-init network namespaces.
-    # Without this, the kernel's nf_log_syslog silently suppresses output
-    # from the sandbox's network namespace.
-    if [ -f /proc/sys/net/netfilter/nf_log_all_netns ]; then
-        echo 1 > /proc/sys/net/netfilter/nf_log_all_netns 2>/dev/null || true
-    fi
-
     reconcile_sandbox_account
     setup_sandbox_workdir
 
     configure_hostname
-    ip link set lo up 2>/dev/null || true
-
-# Networking: use TAP static config if VM_NET_IP is set (QEMU path),
-# otherwise fall back to gvproxy DHCP on eth0 (libkrun path).
-if [ -n "${VM_NET_IP}" ] && [ -n "${VM_NET_GW}" ]; then
-    ts "configuring TAP networking (static ${VM_NET_IP} gw ${VM_NET_GW})"
-    GATEWAY_IP="${VM_NET_GW}"
-
-    TAP_NIC=""
-    NIC_WAIT=0
-    while [ -z "$TAP_NIC" ] && [ "$NIC_WAIT" -lt 10 ]; do
-        for candidate in eth0 ens3 enp0s2; do
-            if ip link show "$candidate" >/dev/null 2>&1 && [ "$candidate" != "lo" ]; then
-                TAP_NIC="$candidate"
-                break
-            fi
-        done
-        if [ -z "$TAP_NIC" ]; then
-            for sys_nic in /sys/class/net/*; do
-                [ -e "$sys_nic" ] || continue
-                candidate="${sys_nic##*/}"
-                if ip link show "$candidate" >/dev/null 2>&1 && [ "$candidate" != "lo" ]; then
-                    TAP_NIC="$candidate"
-                    break
-                fi
-            done
-        fi
-        if [ -z "$TAP_NIC" ]; then
-            sleep 1
-            NIC_WAIT=$((NIC_WAIT + 1))
-        fi
-    done
-
-    if [ -n "$TAP_NIC" ]; then
-        ts "using NIC ${TAP_NIC} for TAP networking"
-        ip link set "$TAP_NIC" up 2>/dev/null || true
-        ip addr add "${VM_NET_IP}/30" dev "$TAP_NIC" 2>/dev/null || true
-        ip route add default via "${VM_NET_GW}" 2>/dev/null || true
-    else
-        ts "WARNING: no network interface found for TAP networking"
+    configure_hosts
+    if ! /opt/openshell/bin/openshell-vm-init prepare-network; then
+        ts "FATAL: failed to bring up the loopback interface"
+        exit 1
     fi
 
-    if [ -n "${VM_NET_DNS}" ]; then
-        echo "nameserver ${VM_NET_DNS}" > "$(root_path /etc/resolv.conf)"
-    elif [ ! -s "$(root_path /etc/resolv.conf)" ]; then
-        echo "nameserver 8.8.8.8" > "$(root_path /etc/resolv.conf)"
-        echo "nameserver 8.8.4.4" >> "$(root_path /etc/resolv.conf)"
+    # The capability-free sandbox owns a loopback-only DNS relay. Guest init
+    # grants the low port before handing control to the zero-capability UID.
+    if ! echo 0 > /proc/sys/net/ipv4/ip_unprivileged_port_start; then
+        ts "FATAL: failed to permit the unprivileged DNS relay to bind port 53"
+        exit 1
     fi
+    cat >"$(root_path /etc/resolv.conf)" <<'EOF'
+nameserver 127.0.0.53
+options timeout:2 attempts:2
+EOF
 
-    ensure_host_gateway_aliases
-elif ip link show eth0 >/dev/null 2>&1; then
-    ts "detected eth0 (gvproxy networking)"
-    ip link set eth0 up 2>/dev/null || true
-
-    if command -v udhcpc >/dev/null 2>&1; then
-        UDHCPC_SCRIPT="$(root_path /run/openshell-udhcpc.script)"
-        mkdir -p "$(dirname "$UDHCPC_SCRIPT")"
-        cat > "$UDHCPC_SCRIPT" <<'DHCP_SCRIPT'
-#!/bin/sh
-case "$1" in
-    bound|renew)
-        ip addr flush dev "$interface"
-        ip addr add "$ip/$mask" dev "$interface"
-        if [ -n "$router" ]; then
-            ip route add default via "$router" dev "$interface"
-        fi
-        if [ -n "$dns" ]; then
-            resolv_conf="${OPENSHELL_RESOLV_CONF:-/etc/resolv.conf}"
-            mkdir -p "$(dirname "$resolv_conf")" 2>/dev/null || true
-            : > "$resolv_conf" 2>/dev/null || true
-            for d in $dns; do
-                echo "nameserver $d" >> "$resolv_conf" 2>/dev/null || true
-            done
-        fi
-        ;;
-esac
-DHCP_SCRIPT
-        chmod +x "$UDHCPC_SCRIPT"
-
-        if ! OPENSHELL_RESOLV_CONF="$(root_path /etc/resolv.conf)" \
-            udhcpc -i eth0 -f -q -n -T 1 -t 3 -A 1 -s "$UDHCPC_SCRIPT" 2>&1; then
-            ts "WARNING: DHCP failed, falling back to static config"
-            ip addr add 192.168.127.2/24 dev eth0 2>/dev/null || true
-            ip route add default via "$GVPROXY_GATEWAY_IP" 2>/dev/null || true
-        fi
-    else
-        ts "no DHCP client, using static config"
-        ip addr add 192.168.127.2/24 dev eth0 2>/dev/null || true
-        ip route add default via "$GVPROXY_GATEWAY_IP" 2>/dev/null || true
-    fi
-
-    if [ ! -s "$(root_path /etc/resolv.conf)" ]; then
-        echo "nameserver 8.8.8.8" > "$(root_path /etc/resolv.conf)"
-        echo "nameserver 8.8.4.4" >> "$(root_path /etc/resolv.conf)"
-    fi
-
-    ensure_host_gateway_aliases
-else
-    ts "WARNING: no network interface found; supervisor will start without guest egress"
-fi
+# The boundary transport mediates network and DNS requests. Only loopback is
+# configured in the guest; no public resolver or guest NIC is needed.
 
 export HOME=/sandbox
 export USER=sandbox
@@ -938,34 +699,44 @@ fi
 
 run_openshell_init_dropins
 
-rewrite_openshell_endpoint_if_needed
+mount_virtiofs_shares
 
-# Log supervisor connectivity state for debugging stuck-in-Provisioning issues
-if [ -n "${OPENSHELL_ENDPOINT:-}" ]; then
-    _ep_parsed="$(parse_endpoint "$OPENSHELL_ENDPOINT" 2>/dev/null || true)"
-    if [ -n "$_ep_parsed" ]; then
-        _ep_host="$(printf '%s\n' "$_ep_parsed" | sed -n '2p')"
-        _ep_port="$(printf '%s\n' "$_ep_parsed" | sed -n '3p')"
-        if tcp_probe "$_ep_host" "$_ep_port"; then
-            ts "gateway reachable at ${_ep_host}:${_ep_port}"
-        else
-            ts "WARNING: gateway NOT reachable at ${_ep_host}:${_ep_port} — supervisor may fail to connect"
-        fi
-    fi
-    ts "OPENSHELL_ENDPOINT=${OPENSHELL_ENDPOINT}"
-fi
 if [ -n "${OPENSHELL_SANDBOX_ID:-}" ]; then
     ts "OPENSHELL_SANDBOX_ID=${OPENSHELL_SANDBOX_ID}"
 fi
 
-read_supervisor_extra_args
-set -- --workdir /sandbox "${SUPERVISOR_EXTRA_ARGS[@]+"${SUPERVISOR_EXTRA_ARGS[@]}"}"
-
-ts "starting openshell-sandbox supervisor"
-if [ "${ROOT_PREFIX:-}" = "/newroot" ]; then
-    exec_supervisor_in_newroot "$@"
+ts "starting OpenShell VM sandbox"
+_sandbox_owner="$(sandbox_owner)"
+_sandbox_uid="${_sandbox_owner%%:*}"
+_sandbox_gid="${_sandbox_owner##*:}"
+_sandbox_bootstrap_guest="${OPENSHELL_VM_SANDBOX_BOOTSTRAP:-/.openshell/state/bootstrap.json}"
+_sandbox_bootstrap="$(root_path "$_sandbox_bootstrap_guest")"
+_sandbox_state_dir="${_sandbox_bootstrap%/*}"
+if [ ! -f "$_sandbox_bootstrap" ]; then
+    ts "FATAL: capability-free sandbox bootstrap is missing"
+    exit 1
 fi
-exec /opt/openshell/bin/openshell-sandbox "$@"
+chown "${_sandbox_uid}:${_sandbox_gid}" "$_sandbox_state_dir"
+chmod 0700 "$_sandbox_state_dir"
+for _sandbox_private_file in "$_sandbox_state_dir"/*; do
+    [ -f "$_sandbox_private_file" ] || continue
+    chown "${_sandbox_uid}:${_sandbox_gid}" "$_sandbox_private_file"
+    chmod 0600 "$_sandbox_private_file"
+done
+if [ "${OPENSHELL_VM_INIT_MODE:-sandbox}" = "capability-probe" ]; then
+    ts "starting capability-free VM qualification as ${_sandbox_uid}:${_sandbox_gid}"
+    if [ "${ROOT_PREFIX:-}" = "/newroot" ]; then
+        exec_supervisor_in_newroot capability-probe-launch "$_sandbox_uid" "$_sandbox_gid"
+    fi
+    exec /opt/openshell/bin/openshell-sandbox \
+        capability-probe-launch "$_sandbox_uid" "$_sandbox_gid"
+fi
+if [ "${ROOT_PREFIX:-}" = "/newroot" ]; then
+    exec_supervisor_in_newroot \
+        launch-capability-free "$_sandbox_uid" "$_sandbox_gid" "$_sandbox_bootstrap_guest"
+fi
+exec /opt/openshell/bin/openshell-sandbox \
+    launch-capability-free "$_sandbox_uid" "$_sandbox_gid" "$_sandbox_bootstrap_guest"
 }
 
 if [ "${1:-}" != "--post-overlay" ]; then

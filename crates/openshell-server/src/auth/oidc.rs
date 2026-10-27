@@ -10,15 +10,18 @@
 //! This module owns authentication (verifying who the caller is).
 //! Authorization (deciding what the caller can do) is in `authz.rs`.
 
-use super::authenticator::Authenticator;
+use super::authenticator::{AuthFailureReason, AuthMechanism};
+use super::authenticator::{AuthRejection, Authentication, Authenticator, bearer_credential};
 use super::identity::{Identity, IdentityProvider};
 use super::principal::{Principal, UserPrincipal};
 use async_trait::async_trait;
-use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode, decode_header};
+use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode_header};
 use openshell_core::OidcConfig;
+use openshell_crypto::jwt::decode;
 use reqwest::Client;
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
+use std::net::IpAddr;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -31,7 +34,8 @@ use tracing::{debug, error, info, warn};
 /// These are structural bypasses for gRPC infrastructure that doesn't map to a
 /// single RPC method. Per-method bypasses (e.g. `Health`) are declared at the
 /// handler with `auth_mode: "unauthenticated"` in the proto annotation.
-const UNAUTHENTICATED_PREFIXES: &[&str] = &["/grpc.reflection.", "/grpc.health."];
+const UNAUTHENTICATED_PREFIXES: &[&str] =
+    &[crate::multiplex::REFLECTION_PATH_PREFIX, "/grpc.health."];
 
 /// Returns `true` if the method needs no authentication at all.
 pub fn is_unauthenticated_method(path: &str) -> bool {
@@ -51,6 +55,11 @@ const STALE_KEY_GRACE_MULTIPLIER: u32 = 3;
 /// a burst or steady stream of unknown-`kid` lookups can amplify requests
 /// against the issuer's JWKS endpoint.
 const KID_MISS_REFRESH_COOLDOWN: Duration = Duration::from_secs(1);
+
+/// OIDC metadata is small. These limits bound memory consumption before JSON
+/// deserialization while leaving ample room for large enterprise key sets.
+const OIDC_DISCOVERY_MAX_BYTES: usize = 64 * 1024;
+const JWKS_MAX_BYTES: usize = 1024 * 1024;
 
 /// Cached JWKS key set fetched from the OIDC issuer.
 ///
@@ -90,6 +99,176 @@ impl std::fmt::Debug for JwksCache {
 struct OidcDiscovery {
     issuer: String,
     jwks_uri: String,
+}
+
+fn is_numeric_loopback(host: &str) -> bool {
+    match host.parse::<IpAddr>() {
+        Ok(IpAddr::V4(address)) => address.is_loopback(),
+        Ok(IpAddr::V6(address)) => {
+            address.is_loopback()
+                || address
+                    .to_ipv4_mapped()
+                    .is_some_and(|mapped| mapped.is_loopback())
+        }
+        Err(_) => false,
+    }
+}
+
+fn validate_oidc_url(
+    value: &str,
+    description: &str,
+    dangerously_allow_insecure_http: bool,
+) -> Result<url::Url, String> {
+    let parsed = url::Url::parse(value)
+        .map_err(|error| format!("{description} must be an absolute URL: {error}"))?;
+
+    if parsed.host_str().is_none() || !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err(format!(
+            "{description} must include a host and must not include credentials"
+        ));
+    }
+
+    match parsed.scheme() {
+        "https" => Ok(parsed),
+        "http"
+            if dangerously_allow_insecure_http
+                && parsed.host_str().is_some_and(is_numeric_loopback) =>
+        {
+            Ok(parsed)
+        }
+        "http" if dangerously_allow_insecure_http => Err(format!(
+            "{description} may use insecure HTTP only with a numeric loopback address"
+        )),
+        "http" => Err(format!(
+            "{description} must use HTTPS; numeric-loopback HTTP requires the development-only dangerously_allow_insecure_http acknowledgement"
+        )),
+        scheme => Err(format!(
+            "{description} must use HTTPS, not the '{scheme}' scheme"
+        )),
+    }
+}
+
+fn validate_jwks_origin(
+    value: &str,
+    dangerously_allow_insecure_http: bool,
+) -> Result<url::Url, String> {
+    let origin = validate_oidc_url(
+        value,
+        "OIDC JWKS allowed origin",
+        dangerously_allow_insecure_http,
+    )?;
+    if origin.path() != "/" || origin.query().is_some() || origin.fragment().is_some() {
+        return Err(format!(
+            "OIDC JWKS allowed origin '{value}' must not include a path, query, or fragment"
+        ));
+    }
+    Ok(origin)
+}
+
+fn validate_jwks_url(
+    value: &str,
+    issuer: &url::Url,
+    config: &OidcConfig,
+) -> Result<url::Url, String> {
+    let jwks = validate_oidc_url(
+        value,
+        "OIDC discovery jwks_uri",
+        config.dangerously_allow_insecure_http,
+    )?;
+    if jwks.fragment().is_some() {
+        return Err("OIDC discovery jwks_uri must not include a fragment".to_string());
+    }
+    if jwks.origin() == issuer.origin() {
+        return Ok(jwks);
+    }
+
+    for allowed in &config.jwks_allowed_origins {
+        let allowed = validate_jwks_origin(allowed, config.dangerously_allow_insecure_http)?;
+        if jwks.origin() == allowed.origin() {
+            return Ok(jwks);
+        }
+    }
+
+    Err(format!(
+        "OIDC discovery jwks_uri origin '{}' does not match issuer origin '{}'; add the JWKS origin to jwks_allowed_origins only if it is trusted",
+        jwks.origin().ascii_serialization(),
+        issuer.origin().ascii_serialization(),
+    ))
+}
+
+fn is_json_content_type(value: &reqwest::header::HeaderValue) -> bool {
+    let Ok(value) = value.to_str() else {
+        return false;
+    };
+    let media_type = value.split(';').next().map(str::trim).unwrap_or_default();
+    media_type.eq_ignore_ascii_case("application/json")
+        || media_type
+            .to_ascii_lowercase()
+            .strip_prefix("application/")
+            .is_some_and(|subtype| subtype.ends_with("+json"))
+}
+
+async fn fetch_bounded_json<T: serde::de::DeserializeOwned>(
+    client: &Client,
+    url: &url::Url,
+    description: &str,
+    max_bytes: usize,
+) -> Result<T, String> {
+    let mut response = client
+        .get(url.clone())
+        .send()
+        .await
+        .map_err(|error| format!("{description} request failed: {error}"))?;
+
+    if !response.status().is_success() {
+        return Err(format!(
+            "{description} request returned HTTP {}",
+            response.status()
+        ));
+    }
+    if !response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .is_some_and(is_json_content_type)
+    {
+        return Err(format!(
+            "{description} response must use an application/json or application/*+json content type"
+        ));
+    }
+    if response
+        .content_length()
+        .is_some_and(|length| length > max_bytes as u64)
+    {
+        return Err(format!(
+            "{description} response exceeds the {max_bytes}-byte limit"
+        ));
+    }
+
+    let initial_capacity = response
+        .content_length()
+        .and_then(|length| usize::try_from(length).ok())
+        .unwrap_or_default()
+        .min(max_bytes);
+    let mut body = Vec::with_capacity(initial_capacity);
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|error| format!("{description} response body failed: {error}"))?
+    {
+        let next_length = body
+            .len()
+            .checked_add(chunk.len())
+            .ok_or_else(|| format!("{description} response length overflow"))?;
+        if next_length > max_bytes {
+            return Err(format!(
+                "{description} response exceeds the {max_bytes}-byte limit"
+            ));
+        }
+        body.extend_from_slice(&chunk);
+    }
+
+    serde_json::from_slice(&body)
+        .map_err(|error| format!("{description} response parse failed: {error}"))
 }
 
 /// JWKS key set.
@@ -399,6 +578,17 @@ impl JwksCache {
     /// Create a new JWKS cache, discovering the JWKS URI and fetching the
     /// initial key set.
     pub async fn new(config: &OidcConfig) -> Result<Self, String> {
+        openshell_crypto::tls::ensure_default_provider();
+        let http = Client::builder()
+            .timeout(Duration::from_secs(10))
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .map_err(|e| format!("failed to create HTTP client: {e}"))?;
+
+        Self::new_with_client(config, http).await
+    }
+
+    async fn new_with_client(config: &OidcConfig, http: Client) -> Result<Self, String> {
         if config.jwks_ttl_secs == 0 {
             return Err(
                 "jwks_ttl_secs must be greater than zero (0 would refresh on every request and \
@@ -407,27 +597,35 @@ impl JwksCache {
             );
         }
 
-        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
-        let http = Client::builder()
-            .timeout(Duration::from_secs(10))
-            .build()
-            .map_err(|e| format!("failed to create HTTP client: {e}"))?;
+        let issuer_url = validate_oidc_url(
+            &config.issuer,
+            "OIDC issuer",
+            config.dangerously_allow_insecure_http,
+        )?;
+        if issuer_url.query().is_some() || issuer_url.fragment().is_some() {
+            return Err("OIDC issuer must not include a query or fragment".to_string());
+        }
+        // Validate every configured exception at startup, even when the
+        // discovery document ultimately uses the issuer origin.
+        for allowed in &config.jwks_allowed_origins {
+            validate_jwks_origin(allowed, config.dangerously_allow_insecure_http)?;
+        }
 
         // Discover JWKS URI from the OIDC discovery endpoint.
-        let discovery_url = format!(
+        let discovery_url = url::Url::parse(&format!(
             "{}/.well-known/openid-configuration",
             config.issuer.trim_end_matches('/')
-        );
+        ))
+        .map_err(|error| format!("failed to construct OIDC discovery URL: {error}"))?;
         info!(url = %discovery_url, "Discovering OIDC configuration");
 
-        let discovery: OidcDiscovery = http
-            .get(&discovery_url)
-            .send()
-            .await
-            .map_err(|e| format!("OIDC discovery request failed: {e}"))?
-            .json()
-            .await
-            .map_err(|e| format!("OIDC discovery response parse failed: {e}"))?;
+        let discovery: OidcDiscovery = fetch_bounded_json(
+            &http,
+            &discovery_url,
+            "OIDC discovery",
+            OIDC_DISCOVERY_MAX_BYTES,
+        )
+        .await?;
 
         // Validate the discovery document's issuer matches our configured issuer.
         let expected = config.issuer.trim_end_matches('/');
@@ -438,11 +636,13 @@ impl JwksCache {
             ));
         }
 
-        info!(jwks_uri = %discovery.jwks_uri, "OIDC JWKS URI discovered");
+        let jwks_uri = validate_jwks_url(&discovery.jwks_uri, &issuer_url, config)?;
+
+        info!(jwks_uri = %jwks_uri, "OIDC JWKS URI discovered");
 
         let cache = Self {
             keys: Arc::new(RwLock::new(HashMap::new())),
-            jwks_uri: discovery.jwks_uri,
+            jwks_uri: jwks_uri.to_string(),
             ttl: Duration::from_secs(config.jwks_ttl_secs),
             last_refresh: Arc::new(RwLock::new(
                 Instant::now()
@@ -474,15 +674,10 @@ impl JwksCache {
     async fn refresh_keys(&self) -> Result<(), String> {
         debug!(uri = %self.jwks_uri, "Refreshing JWKS keys");
 
-        let jwk_set: JwkSet = self
-            .http
-            .get(&self.jwks_uri)
-            .send()
-            .await
-            .map_err(|e| format!("JWKS fetch failed: {e}"))?
-            .json()
-            .await
-            .map_err(|e| format!("JWKS parse failed: {e}"))?;
+        let jwks_uri = url::Url::parse(&self.jwks_uri)
+            .map_err(|error| format!("cached JWKS URI became invalid: {error}"))?;
+        let jwk_set: JwkSet =
+            fetch_bounded_json(&self.http, &jwks_uri, "JWKS", JWKS_MAX_BYTES).await?;
 
         let mut new_keys = HashMap::new();
         let mut poisoned_kids = HashSet::new();
@@ -599,23 +794,32 @@ impl JwksCache {
     ///
     /// This is the authentication step — it verifies the caller's identity
     /// but does not check authorization (that's `authz::AuthzPolicy::check`).
-    pub async fn validate_token(&self, token: &str) -> Result<Identity, Status> {
+    pub async fn validate_token(&self, token: &str) -> Result<Identity, AuthRejection> {
         crate::install_jsonwebtoken_crypto_provider();
 
         self.refresh_if_stale().await.map_err(|e| {
             warn!(error = %e, "JWKS refresh failed");
-            Status::internal("OIDC key refresh failed")
+            reject(
+                AuthFailureReason::IdentityProviderUnavailable,
+                Status::internal("OIDC key refresh failed"),
+            )
         })?;
 
         // Decode the header to find the key ID.
         let header = decode_header(token).map_err(|e| {
             debug!(error = %e, "Failed to decode JWT header");
-            Status::unauthenticated("invalid token")
+            reject(
+                AuthFailureReason::MalformedCredential,
+                Status::unauthenticated("invalid token"),
+            )
         })?;
 
         let kid = header.kid.ok_or_else(|| {
             debug!("JWT has no kid in header");
-            Status::unauthenticated("invalid token: missing kid")
+            reject(
+                AuthFailureReason::MalformedCredential,
+                Status::unauthenticated("invalid token: missing kid"),
+            )
         })?;
 
         // Refresh once on kid miss.
@@ -624,7 +828,10 @@ impl JwksCache {
             drop(keys_guard);
             self.refresh_keys_coalesced().await.map_err(|e| {
                 warn!(error = %e, "JWKS refresh on kid miss failed");
-                Status::internal("OIDC key refresh failed")
+                reject(
+                    AuthFailureReason::IdentityProviderUnavailable,
+                    Status::internal("OIDC key refresh failed"),
+                )
             })?;
             keys_guard = self.keys.read().await;
         }
@@ -634,7 +841,10 @@ impl JwksCache {
             .map(|(dk, alg)| (dk.clone(), *alg))
             .ok_or_else(|| {
                 debug!(kid = %kid, "JWT kid not found in JWKS");
-                Status::unauthenticated("invalid token: unknown signing key")
+                reject(
+                    AuthFailureReason::InvalidCredential,
+                    Status::unauthenticated("invalid token: unknown signing key"),
+                )
             })?;
         drop(keys_guard);
 
@@ -644,7 +854,10 @@ impl JwksCache {
                 expected = ?cached_algorithm,
                 "JWT algorithm mismatch for cached signing key"
             );
-            return Err(Status::unauthenticated("invalid token"));
+            return Err(reject(
+                AuthFailureReason::InvalidCredential,
+                Status::unauthenticated("invalid token"),
+            ));
         }
 
         let mut validation = Validation::new(cached_algorithm);
@@ -654,7 +867,10 @@ impl JwksCache {
 
         let token_data = decode::<OidcClaims>(token, &decoding_key, &validation).map_err(|e| {
             debug!(error = %e, "JWT validation failed");
-            Status::unauthenticated(format!("invalid token: {e}"))
+            reject(
+                decode_failure_reason(e.kind()),
+                Status::unauthenticated(format!("invalid token: {e}")),
+            )
         })?;
 
         let mut claims = token_data.claims;
@@ -676,10 +892,31 @@ impl JwksCache {
     }
 }
 
+fn reject(reason: AuthFailureReason, status: Status) -> AuthRejection {
+    AuthRejection::new(AuthMechanism::Oidc, reason, status)
+}
+
+fn decode_failure_reason(kind: &jsonwebtoken::errors::ErrorKind) -> AuthFailureReason {
+    use jsonwebtoken::errors::ErrorKind;
+    match kind {
+        ErrorKind::ExpiredSignature => AuthFailureReason::ExpiredCredential,
+        ErrorKind::InvalidIssuer | ErrorKind::InvalidAudience => {
+            AuthFailureReason::AudienceOrIssuerMismatch
+        }
+        ErrorKind::InvalidToken
+        | ErrorKind::MissingRequiredClaim(_)
+        | ErrorKind::InvalidClaimFormat(_)
+        | ErrorKind::Base64(_)
+        | ErrorKind::Json(_)
+        | ErrorKind::Utf8(_) => AuthFailureReason::MalformedCredential,
+        _ => AuthFailureReason::InvalidCredential,
+    }
+}
+
 /// Authenticator that validates `Authorization: Bearer <jwt>` headers against
 /// the configured OIDC issuer.
 ///
-/// Returns `Ok(None)` when no Bearer header is present, so the chain can fall
+/// Returns `NotApplicable` when no Bearer header is present, so the chain can fall
 /// through to other authenticators (e.g. the gateway-minted sandbox JWT
 /// authenticator).
 pub struct OidcAuthenticator {
@@ -698,23 +935,307 @@ impl Authenticator for OidcAuthenticator {
         &self,
         headers: &http::HeaderMap,
         _path: &str,
-    ) -> Result<Option<Principal>, Status> {
-        let Some(token) = headers
-            .get("authorization")
-            .and_then(|v| v.to_str().ok())
-            .and_then(|v| v.strip_prefix("Bearer "))
-        else {
-            return Ok(None);
+    ) -> Result<Authentication, AuthRejection> {
+        let Some(token) = bearer_credential(headers) else {
+            return Ok(Authentication::NotApplicable);
         };
 
         let identity = self.cache.validate_token(token).await?;
-        Ok(Some(Principal::User(UserPrincipal { identity })))
+        Ok(Authentication::Accepted(Principal::User(UserPrincipal {
+            identity,
+        })))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn transport_test_config(issuer: impl Into<String>) -> OidcConfig {
+        OidcConfig {
+            issuer: issuer.into(),
+            dangerously_allow_insecure_http: false,
+            jwks_allowed_origins: Vec::new(),
+            audience: "test-audience".to_string(),
+            jwks_ttl_secs: 3600,
+            roles_claim: "roles".to_string(),
+            admin_role: "admin".to_string(),
+            user_role: "user".to_string(),
+            scopes_claim: String::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn oidc_rejects_http_issuer_without_development_acknowledgement() {
+        let error = JwksCache::new(&transport_test_config("http://127.0.0.1:9/issuer"))
+            .await
+            .expect_err("cleartext issuers must fail before discovery");
+
+        assert!(
+            error.contains("must use HTTPS"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn oidc_rejects_non_loopback_http_even_when_acknowledged() {
+        let mut config = transport_test_config("http://192.0.2.1/issuer");
+        config.dangerously_allow_insecure_http = true;
+
+        let error = JwksCache::new(&config)
+            .await
+            .expect_err("the escape hatch must remain limited to numeric loopback");
+
+        assert!(
+            error.contains("only with a numeric loopback"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn oidc_rejects_http_jwks_from_https_discovery() {
+        let issuer = url::Url::parse("https://idp.example.com/issuer").unwrap();
+        let config = transport_test_config(issuer.as_str());
+
+        let error = validate_jwks_url("http://idp.example.com/jwks", &issuer, &config)
+            .expect_err("HTTPS discovery must not establish an HTTP trust root");
+
+        assert!(
+            error.contains("must use HTTPS"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn oidc_rejects_cross_origin_jwks_unless_origin_is_allowlisted() {
+        let issuer = url::Url::parse("https://accounts.example.com/issuer").unwrap();
+        let mut config = transport_test_config(issuer.as_str());
+        let jwks = "https://keys.example.com/oauth/jwks";
+
+        let error = validate_jwks_url(jwks, &issuer, &config)
+            .expect_err("untrusted cross-origin JWKS must be rejected");
+        assert!(
+            error.contains("does not match issuer origin"),
+            "unexpected error: {error}"
+        );
+
+        config.jwks_allowed_origins = vec!["https://keys.example.com".to_string()];
+        assert_eq!(
+            validate_jwks_url(jwks, &issuer, &config)
+                .expect("an explicitly trusted origin should be accepted")
+                .as_str(),
+            jwks
+        );
+    }
+
+    #[test]
+    fn oidc_json_content_types_are_strict() {
+        use reqwest::header::HeaderValue;
+
+        assert!(is_json_content_type(&HeaderValue::from_static(
+            "application/json; charset=utf-8"
+        )));
+        assert!(is_json_content_type(&HeaderValue::from_static(
+            "application/jwk-set+json"
+        )));
+        assert!(!is_json_content_type(&HeaderValue::from_static(
+            "text/html"
+        )));
+    }
+
+    #[tokio::test]
+    async fn oidc_loads_discovery_and_jwks_from_tls_idp_with_rotated_local_ca() {
+        use rcgen::{BasicConstraints, CertificateParams, IsCa};
+        use rustls::pki_types::PrivateKeyDer;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let mut old_ca_params = CertificateParams::new(Vec::<String>::new()).unwrap();
+        old_ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        let old_ca_key = openshell_crypto::pki::generate_keypair().unwrap();
+        let old_ca_cert = openshell_crypto::pki::self_signed(old_ca_params, &old_ca_key).unwrap();
+
+        let mut ca_params = CertificateParams::new(Vec::<String>::new()).unwrap();
+        ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        let ca_key = openshell_crypto::pki::generate_keypair().unwrap();
+        let ca_cert = openshell_crypto::pki::self_signed(ca_params, &ca_key).unwrap();
+
+        let server_params = CertificateParams::new(vec!["localhost".to_string()]).unwrap();
+        let server_key = openshell_crypto::pki::generate_keypair().unwrap();
+        let server_cert =
+            openshell_crypto::pki::signed_by(server_params, &server_key, &ca_cert, &ca_key)
+                .unwrap();
+        let server_config = openshell_crypto::tls::server_builder()
+            .with_no_client_auth()
+            .with_single_cert(
+                vec![server_cert.der().clone()],
+                PrivateKeyDer::Pkcs8(server_key.serialize_der().unwrap().into()),
+            )
+            .unwrap();
+        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(server_config));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let issuer = format!("https://localhost:{port}/issuer");
+        let discovery = serde_json::json!({
+            "issuer": issuer,
+            "jwks_uri": format!("{issuer}/jwks"),
+        })
+        .to_string();
+        let jwks = serde_json::json!({
+            "keys": [{
+                "kid": TEST_KID,
+                "kty": "RSA",
+                "n": TEST_RSA_KEY.modulus_b64,
+                "e": TEST_RSA_KEY.exponent_b64,
+            }],
+        })
+        .to_string();
+
+        let server = tokio::spawn(async move {
+            let mut responses_served = 0;
+            while responses_served < 2 {
+                let (stream, _) = listener.accept().await.unwrap();
+                let Ok(mut stream) = acceptor.accept(stream).await else {
+                    // A client with the retired CA aborts the TLS handshake.
+                    continue;
+                };
+                responses_served += 1;
+                let mut request = Vec::new();
+                let mut chunk = [0_u8; 1024];
+                loop {
+                    let read = stream.read(&mut chunk).await.unwrap();
+                    if read == 0 {
+                        break;
+                    }
+                    request.extend_from_slice(&chunk[..read]);
+                    if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                let request = String::from_utf8_lossy(&request);
+                let body = if request.starts_with("GET /issuer/.well-known/openid-configuration ") {
+                    &discovery
+                } else if request.starts_with("GET /issuer/jwks ") {
+                    &jwks
+                } else {
+                    panic!("unexpected TLS IdP request: {request}");
+                };
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                stream.write_all(response.as_bytes()).await.unwrap();
+                stream.shutdown().await.unwrap();
+            }
+        });
+
+        let old_client = Client::builder()
+            .add_root_certificate(
+                reqwest::Certificate::from_pem(old_ca_cert.pem().as_bytes()).unwrap(),
+            )
+            .build()
+            .unwrap();
+        old_client
+            .get(format!("{issuer}/.well-known/openid-configuration"))
+            .send()
+            .await
+            .expect_err("a client retaining only the retired CA must reject the IdP");
+
+        // Initialization succeeds after the client receives the rotated trust
+        // anchor, and both discovery and JWKS stay on the authenticated channel.
+        let client = Client::builder()
+            .add_root_certificate(reqwest::Certificate::from_pem(ca_cert.pem().as_bytes()).unwrap())
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .unwrap();
+        let config = transport_test_config(issuer.clone());
+        let cache = JwksCache::new_with_client(&config, client)
+            .await
+            .expect("TLS discovery and JWKS should accept the rotated CA");
+
+        let token = mint_rs256(
+            &claims_for(&issuer, "test-audience", now_secs() + 3600),
+            TEST_KID,
+        );
+        cache
+            .validate_token(&token)
+            .await
+            .expect("the key loaded over TLS should validate tokens");
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn oidc_rejects_redirected_discovery() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/issuer/.well-known/openid-configuration"))
+            .respond_with(
+                ResponseTemplate::new(302).append_header("location", "http://127.0.0.1:9"),
+            )
+            .mount(&server)
+            .await;
+        let mut config = transport_test_config(format!("{}/issuer", server.uri()));
+        config.dangerously_allow_insecure_http = true;
+
+        let error = JwksCache::new(&config)
+            .await
+            .expect_err("redirects must not move OIDC trust establishment");
+
+        assert!(
+            error.contains("HTTP 302"),
+            "unexpected redirect error: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn oidc_rejects_oversized_discovery_response() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/issuer/.well-known/openid-configuration"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_raw(vec![b' '; OIDC_DISCOVERY_MAX_BYTES + 1], "application/json"),
+            )
+            .mount(&server)
+            .await;
+        let mut config = transport_test_config(format!("{}/issuer", server.uri()));
+        config.dangerously_allow_insecure_http = true;
+
+        let error = JwksCache::new(&config)
+            .await
+            .expect_err("oversized metadata must be rejected before parsing");
+
+        assert!(
+            error.contains("exceeds the 65536-byte limit"),
+            "unexpected size error: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn oidc_rejects_non_json_discovery_response() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/issuer/.well-known/openid-configuration"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw("{}", "text/html"))
+            .mount(&server)
+            .await;
+        let mut config = transport_test_config(format!("{}/issuer", server.uri()));
+        config.dangerously_allow_insecure_http = true;
+
+        let error = JwksCache::new(&config)
+            .await
+            .expect_err("metadata with an unsafe media type must be rejected");
+
+        assert!(error.contains("content type"), "unexpected error: {error}");
+    }
 
     #[test]
     fn health_is_unauthenticated() {
@@ -731,10 +1252,13 @@ mod tests {
     #[test]
     fn reflection_is_unauthenticated() {
         assert!(is_unauthenticated_method(
+            "/grpc.reflection.v1.ServerReflection/ServerReflectionInfo"
+        ));
+        assert!(!is_unauthenticated_method(
             "/grpc.reflection.v1alpha.ServerReflection/ServerReflectionInfo"
         ));
-        assert!(is_unauthenticated_method(
-            "/grpc.reflection.v1.ServerReflection/ServerReflectionInfo"
+        assert!(!is_unauthenticated_method(
+            "/grpc.reflection.v2.ServerReflection/ServerReflectionInfo"
         ));
     }
 
@@ -901,7 +1425,7 @@ mod tests {
         header.kid = Some(kid.to_owned());
         let key = jsonwebtoken::EncodingKey::from_rsa_pem(TEST_RSA_KEY.private_pem.as_bytes())
             .expect("load RSA signing key");
-        jsonwebtoken::encode(&header, claims, &key).expect("sign RS256 token")
+        openshell_crypto::jwt::encode(&header, claims, &key).expect("sign RS256 token")
     }
 
     fn claims_for(issuer: &str, audience: &str, exp: i64) -> serde_json::Value {
@@ -946,6 +1470,8 @@ mod tests {
 
         JwksCache::new(&OidcConfig {
             issuer,
+            dangerously_allow_insecure_http: true,
+            jwks_allowed_origins: Vec::new(),
             audience: TEST_AUDIENCE.to_owned(),
             jwks_ttl_secs: 3600,
             roles_claim: "realm_access.roles".to_owned(),
@@ -999,10 +1525,12 @@ mod tests {
         };
         let forged = format!("{}.{forged_payload}.{}", segments[0], segments[2]);
 
-        cache
+        let rejection = cache
             .validate_token(&forged)
             .await
             .expect_err("a swapped payload must fail the signature check");
+        assert_eq!(rejection.mechanism, AuthMechanism::Oidc);
+        assert_eq!(rejection.reason, AuthFailureReason::InvalidCredential);
     }
 
     #[tokio::test]
@@ -1014,7 +1542,7 @@ mod tests {
         crate::install_jsonwebtoken_crypto_provider();
         let mut header = jsonwebtoken::Header::new(Algorithm::RS256);
         header.kid = Some(TEST_KID.to_owned());
-        let token = jsonwebtoken::encode(
+        let token = openshell_crypto::jwt::encode(
             &header,
             &claims_for(&server.uri(), TEST_AUDIENCE, now_secs() + 3600),
             &jsonwebtoken::EncodingKey::from_rsa_pem(other.private_pem.as_bytes())
@@ -1022,10 +1550,12 @@ mod tests {
         )
         .expect("sign with unrelated key");
 
-        cache
+        let rejection = cache
             .validate_token(&token)
             .await
             .expect_err("a token signed by a key outside the JWKS must be rejected");
+        assert_eq!(rejection.mechanism, AuthMechanism::Oidc);
+        assert_eq!(rejection.reason, AuthFailureReason::InvalidCredential);
     }
 
     #[tokio::test]
@@ -1039,10 +1569,12 @@ mod tests {
             TEST_KID,
         );
 
-        cache
+        let rejection = cache
             .validate_token(&token)
             .await
             .expect_err("an expired token must be rejected");
+        assert_eq!(rejection.mechanism, AuthMechanism::Oidc);
+        assert_eq!(rejection.reason, AuthFailureReason::ExpiredCredential);
     }
 
     #[tokio::test]
@@ -1055,10 +1587,15 @@ mod tests {
             TEST_KID,
         );
 
-        cache
+        let rejection = cache
             .validate_token(&token)
             .await
             .expect_err("a token from another issuer must be rejected");
+        assert_eq!(rejection.mechanism, AuthMechanism::Oidc);
+        assert_eq!(
+            rejection.reason,
+            AuthFailureReason::AudienceOrIssuerMismatch
+        );
     }
 
     #[tokio::test]
@@ -1071,10 +1608,15 @@ mod tests {
             TEST_KID,
         );
 
-        cache
+        let rejection = cache
             .validate_token(&token)
             .await
             .expect_err("a token minted for another audience must be rejected");
+        assert_eq!(rejection.mechanism, AuthMechanism::Oidc);
+        assert_eq!(
+            rejection.reason,
+            AuthFailureReason::AudienceOrIssuerMismatch
+        );
     }
 
     #[tokio::test]
@@ -1087,19 +1629,64 @@ mod tests {
             "rotated-away-key",
         );
 
-        cache
+        let rejection = cache
             .validate_token(&token)
             .await
             .expect_err("a token naming a kid absent from the JWKS must be rejected");
+        assert_eq!(rejection.mechanism, AuthMechanism::Oidc);
+        assert_eq!(rejection.reason, AuthFailureReason::InvalidCredential);
+    }
+
+    #[tokio::test]
+    async fn unparseable_token_is_rejected_as_malformed() {
+        let server = wiremock::MockServer::start().await;
+        let cache = cache_with_mock_issuer(&server).await;
+
+        let rejection = cache
+            .validate_token("not-a-jwt")
+            .await
+            .expect_err("an unparseable token must be rejected");
+        assert_eq!(rejection.reason, AuthFailureReason::MalformedCredential);
+        assert_eq!(rejection.status.code(), tonic::Code::Unauthenticated);
+    }
+
+    #[tokio::test]
+    async fn jwks_outage_is_rejected_as_identity_provider_unavailable() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+
+        let server = wiremock::MockServer::start().await;
+        let cache = cache_with_mock_issuer(&server).await;
+        server.reset().await;
+        Mock::given(method("GET"))
+            .and(path("/jwks"))
+            .respond_with(ResponseTemplate::new(503))
+            .mount(&server)
+            .await;
+
+        let token = mint_rs256(
+            &claims_for(&server.uri(), TEST_AUDIENCE, now_secs() + 3600),
+            "rotated-in-key",
+        );
+        let rejection = cache
+            .validate_token(&token)
+            .await
+            .expect_err("a token cannot be verified while the JWKS is unreachable");
+        assert_eq!(
+            rejection.reason,
+            AuthFailureReason::IdentityProviderUnavailable
+        );
+        assert_eq!(rejection.status.code(), tonic::Code::Internal);
     }
 
     mod jwks_validation {
         use super::*;
         use base64::Engine;
         use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-        use jsonwebtoken::{EncodingKey, Header, encode};
+        use jsonwebtoken::{EncodingKey, Header};
         use openshell_core::OidcConfig;
-        use rcgen::{KeyPair, PKCS_ECDSA_P256_SHA256, PKCS_ECDSA_P384_SHA384, PKCS_ED25519};
+        use openshell_crypto::jwt::encode;
+        use rcgen::{PKCS_ECDSA_P256_SHA256, PKCS_ECDSA_P384_SHA384, PKCS_ED25519};
         use rsa::traits::PublicKeyParts;
         use std::time::{SystemTime, UNIX_EPOCH};
         use wiremock::matchers::{method, path};
@@ -1204,19 +1791,19 @@ mod tests {
         fn ec_test_key(kid: &str, curve: &str) -> TestSigningKey {
             let (key_pair, algorithm, coord_len) = match curve {
                 "P-256" => (
-                    KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).unwrap(),
+                    openshell_crypto::pki::generate_keypair_for(&PKCS_ECDSA_P256_SHA256).unwrap(),
                     Algorithm::ES256,
                     32,
                 ),
                 "P-384" => (
-                    KeyPair::generate_for(&PKCS_ECDSA_P384_SHA384).unwrap(),
+                    openshell_crypto::pki::generate_keypair_for(&PKCS_ECDSA_P384_SHA384).unwrap(),
                     Algorithm::ES384,
                     48,
                 ),
                 other => panic!("unsupported curve {other}"),
             };
             let encoding_key =
-                EncodingKey::from_ec_pem(key_pair.serialize_pem().as_bytes()).unwrap();
+                EncodingKey::from_ec_pem(key_pair.serialize_pem().unwrap().as_bytes()).unwrap();
             let (x, y) = ec_coords_from_spki(&key_pair.public_key_der(), coord_len);
             let jwk = serde_json::json!({
                 "kty": "EC",
@@ -1235,9 +1822,9 @@ mod tests {
         }
 
         fn ed25519_test_key(kid: &str) -> TestSigningKey {
-            let key_pair = KeyPair::generate_for(&PKCS_ED25519).unwrap();
+            let key_pair = openshell_crypto::pki::generate_keypair_for(&PKCS_ED25519).unwrap();
             let encoding_key =
-                EncodingKey::from_ed_pem(key_pair.serialize_pem().as_bytes()).unwrap();
+                EncodingKey::from_ed_pem(key_pair.serialize_pem().unwrap().as_bytes()).unwrap();
             let spki = key_pair.public_key_der();
             let x = URL_SAFE_NO_PAD.encode(&spki[spki.len() - 32..]);
             let jwk = serde_json::json!({
@@ -1283,6 +1870,8 @@ mod tests {
         fn test_oidc_config(issuer: &str) -> OidcConfig {
             OidcConfig {
                 issuer: issuer.to_string(),
+                dangerously_allow_insecure_http: true,
+                jwks_allowed_origins: Vec::new(),
                 audience: "test-audience".to_string(),
                 jwks_ttl_secs: 3600,
                 roles_claim: "roles".to_string(),
@@ -1454,7 +2043,7 @@ mod tests {
             });
             let unknown_kid_token = encode(&header, &claims, &good.encoding_key).unwrap();
             let err = cache.validate_token(&unknown_kid_token).await.unwrap_err();
-            assert_eq!(err.code(), tonic::Code::Unauthenticated);
+            assert_eq!(err.status.code(), tonic::Code::Unauthenticated);
 
             assert!(cache.validate_token(&token).await.is_ok());
         }
@@ -1539,7 +2128,7 @@ mod tests {
                 .checked_sub(grace + Duration::from_secs(1))
                 .unwrap();
             let err = cache.validate_token(&token).await.unwrap_err();
-            assert_eq!(err.code(), tonic::Code::Unauthenticated);
+            assert_eq!(err.status.code(), tonic::Code::Unauthenticated);
         }
 
         #[tokio::test]
@@ -1601,7 +2190,7 @@ mod tests {
 
             let previous_refresh = *cache.last_kid_miss_refresh.read().await;
             let err = cache.validate_token(&unknown_kid_token).await.unwrap_err();
-            assert_eq!(err.code(), tonic::Code::Unauthenticated);
+            assert_eq!(err.status.code(), tonic::Code::Unauthenticated);
             assert!(*cache.last_kid_miss_refresh.read().await > previous_refresh);
 
             // Keep the remaining lookups deterministically inside the same
@@ -1611,7 +2200,7 @@ mod tests {
                 Instant::now().checked_add(Duration::from_mins(1)).unwrap();
             for _ in 0..4 {
                 let err = cache.validate_token(&unknown_kid_token).await.unwrap_err();
-                assert_eq!(err.code(), tonic::Code::Unauthenticated);
+                assert_eq!(err.status.code(), tonic::Code::Unauthenticated);
             }
 
             let requests = server.received_requests().await.unwrap();
@@ -1632,7 +2221,7 @@ mod tests {
             let token = sign_token(&ec, &issuer, &config.audience, "user-1");
             let forged = token_with_header_alg(&token, Algorithm::HS256);
             let err = cache.validate_token(&forged).await.unwrap_err();
-            assert_eq!(err.code(), tonic::Code::Unauthenticated);
+            assert_eq!(err.status.code(), tonic::Code::Unauthenticated);
         }
 
         #[tokio::test]
@@ -1649,7 +2238,8 @@ mod tests {
             });
             let token = encode(&header, &claims, &key.encoding_key).unwrap();
             let err = cache.validate_token(&token).await.unwrap_err();
-            assert_eq!(err.code(), tonic::Code::Unauthenticated);
+            assert_eq!(err.status.code(), tonic::Code::Unauthenticated);
+            assert_eq!(err.reason, AuthFailureReason::MalformedCredential);
         }
 
         #[tokio::test]
@@ -1661,7 +2251,7 @@ mod tests {
             let (cache, issuer, config, _server) = cache_from_jwks(jwks).await;
             let token = sign_token(&signing, &issuer, &config.audience, "user-1");
             let err = cache.validate_token(&token).await.unwrap_err();
-            assert_eq!(err.code(), tonic::Code::Unauthenticated);
+            assert_eq!(err.status.code(), tonic::Code::Unauthenticated);
         }
 
         #[tokio::test]
@@ -1689,7 +2279,7 @@ mod tests {
             rs256_variant.algorithm = Algorithm::RS256;
             let mismatched = sign_token(&rs256_variant, &issuer, &config.audience, "user-1");
             let err = cache.validate_token(&mismatched).await.unwrap_err();
-            assert_eq!(err.code(), tonic::Code::Unauthenticated);
+            assert_eq!(err.status.code(), tonic::Code::Unauthenticated);
         }
 
         #[tokio::test]
@@ -1722,7 +2312,7 @@ mod tests {
 
             let sign_token_str = sign_token(&sign_key, &issuer, &config.audience, "sign-user");
             let err = cache.validate_token(&sign_token_str).await.unwrap_err();
-            assert_eq!(err.code(), tonic::Code::Unauthenticated);
+            assert_eq!(err.status.code(), tonic::Code::Unauthenticated);
         }
 
         #[tokio::test]
@@ -1736,7 +2326,7 @@ mod tests {
             let (cache, issuer, config, _server) = cache_from_jwks(jwks).await;
             let token = sign_token(&key, &issuer, &config.audience, "user-1");
             let err = cache.validate_token(&token).await.unwrap_err();
-            assert_eq!(err.code(), tonic::Code::Unauthenticated);
+            assert_eq!(err.status.code(), tonic::Code::Unauthenticated);
         }
 
         #[tokio::test]
@@ -1785,7 +2375,7 @@ mod tests {
             });
             let second_token = encode(&header, &claims, &second.encoding_key).unwrap();
             let err = cache.validate_token(&second_token).await.unwrap_err();
-            assert_eq!(err.code(), tonic::Code::Unauthenticated);
+            assert_eq!(err.status.code(), tonic::Code::Unauthenticated);
         }
 
         #[tokio::test]
@@ -1797,11 +2387,11 @@ mod tests {
 
             let rsa_token = sign_token(&rsa, &issuer, &config.audience, "rsa-user");
             let err = cache.validate_token(&rsa_token).await.unwrap_err();
-            assert_eq!(err.code(), tonic::Code::Unauthenticated);
+            assert_eq!(err.status.code(), tonic::Code::Unauthenticated);
 
             let eddsa_token = sign_token(&eddsa, &issuer, &config.audience, "eddsa-user");
             let err = cache.validate_token(&eddsa_token).await.unwrap_err();
-            assert_eq!(err.code(), tonic::Code::Unauthenticated);
+            assert_eq!(err.status.code(), tonic::Code::Unauthenticated);
         }
     }
 }

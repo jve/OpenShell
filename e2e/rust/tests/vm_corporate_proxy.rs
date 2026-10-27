@@ -10,8 +10,7 @@
 //! chain end to end:
 //!
 //! gateway TOML → VM driver config → driver subprocess argv → per-sandbox
-//! overlay staging (credential, CA, supervisor argument list) → guest init
-//! script → supervisor CLI parsing → policy evaluation → proxied CONNECT
+//! host supervisor configuration → policy evaluation → proxied CONNECT
 //!
 //! and asserts the properties only a real run can establish:
 //!
@@ -25,32 +24,26 @@
 //! 6. An incoherent setting is fatal at gateway startup rather than
 //!    degrading to a direct dial.
 //!
-//! Fixtures run as host processes and are reached from the guest through
-//! gvproxy's `host.openshell.internal` alias, which is also what proves the
-//! documented host-loopback reachability rule for the libkrun backend. That
-//! rule is libkrun-specific: QEMU/TAP sandboxes (GPU) cannot reach a
-//! gateway-host proxy at all, and the driver rejects such a configuration at
-//! launch — see `qemu_backend_rejects_a_gateway_host_proxy` in the driver.
+//! Fixtures run as host processes and are reached by the host supervisor.
+//! `host.openshell.internal` is normalized to host loopback for both libkrun
+//! and QEMU guests because no workload networking leaves the VM.
 
 use std::fmt::Write as _;
 use std::io::Write as _;
+use std::net::{Ipv4Addr, SocketAddrV4, TcpListener};
 use std::path::PathBuf;
 use std::time::Duration;
 
 use openshell_e2e::harness::cli::wait_for_healthy;
 use openshell_e2e::harness::gateway::ManagedGateway;
 use openshell_e2e::harness::host_process::HostPythonFixture;
-use openshell_e2e::harness::port::find_free_port;
 use openshell_e2e::harness::sandbox::SandboxGuard;
 use serial_test::serial;
 use tempfile::NamedTempFile;
 
-/// The gvproxy host alias seeded into every guest's `/etc/hosts`. A host-bound
-/// fixture is reachable from the guest only through this name.
+/// The OpenShell alias for the gateway host.
 const HOST_ALIAS: &str = "host.openshell.internal";
-/// The address `HOST_ALIAS` resolves to inside the guest, and therefore the
-/// CONNECT target the supervisor validates and sends to the proxy.
-const GVPROXY_HOST_LOOPBACK_IP: &str = "192.168.127.254";
+const HOST_LOOPBACK_IP: &str = "127.0.0.1";
 
 const PROXY_USER: &str = "proxyuser";
 const PROXY_PASS: &str = "proxypass";
@@ -70,27 +63,37 @@ struct FixturePorts {
 
 impl FixturePorts {
     fn pick() -> Self {
+        // Keep all four listeners bound while allocating ports. Calling the
+        // single-port helper repeatedly can return the same released port,
+        // making an allowed CONNECT look like one to the denied fixture.
+        let listeners: Vec<_> = (0..4)
+            .map(|_| {
+                TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))
+                    .expect("reserve corporate proxy fixture port")
+            })
+            .collect();
+        let ports: Vec<_> = listeners
+            .iter()
+            .map(|listener| {
+                listener
+                    .local_addr()
+                    .expect("fixture listener address")
+                    .port()
+            })
+            .collect();
         Self {
-            proxy: find_free_port(),
-            allowed: find_free_port(),
-            denied: find_free_port(),
-            bypass: find_free_port(),
+            proxy: ports[0],
+            allowed: ports[1],
+            denied: ports[2],
+            bypass: ports[3],
         }
     }
 }
 
-/// Python that maps the guest-side host address back to the host loopback.
-///
-/// The supervisor sends the *validated* CONNECT target, which inside the guest
-/// is gvproxy's host-loopback address. That address means nothing on the host
-/// where the proxy fixture runs, so the fixture rewrites it to `127.0.0.1`
-/// when dialing — standing in for the corporate network's own routing to the
-/// destination. The target the fixture *logs* is left untouched, so the
-/// validated-IP assertion still tests the supervisor's behaviour rather than
-/// the fixture's.
+/// Python helper retained by the shared proxy fixture shape.
 const HOST_REWRITE: &str = "
 def dial_host(host):
-    return '127.0.0.1' if host == '192.168.127.254' else host
+    return host
 ";
 
 /// A forward proxy that requires Basic auth and logs every CONNECT it sees.
@@ -570,7 +573,7 @@ impl GatewayProxyConfig {
             let _ = writeln!(extra, "no_proxy = \"{no_proxy}\"");
         }
         let guard = Self::apply_raw(&extra)?;
-        wait_for_healthy(Duration::from_secs(120)).await?;
+        wait_for_healthy(Duration::from_mins(2)).await?;
         Ok(guard)
     }
 
@@ -589,7 +592,7 @@ impl GatewayProxyConfig {
             .ok_or_else(|| "managed gateway metadata disappeared".to_string())?;
         gateway.stop()?;
         gateway.start()?;
-        wait_for_healthy(Duration::from_secs(120)).await?;
+        wait_for_healthy(Duration::from_mins(2)).await?;
         self.restored = true;
         Ok(())
     }
@@ -671,7 +674,7 @@ fn assert_proxied_egress(output: &str, proxy_logs: &str, ports: &FixturePorts) {
     // staged into the overlay reached the supervisor.
     assert!(
         proxy_logs.contains(&format!(
-            "CONNECT {GVPROXY_HOST_LOOPBACK_IP}:{} auth=ok",
+            "CONNECT {HOST_LOOPBACK_IP}:{} auth=ok",
             ports.allowed
         )),
         "proxy should have seen an authenticated validated-IP CONNECT to the approved upstream:\n{proxy_logs}"
@@ -713,7 +716,7 @@ async fn vm_corporate_proxy_routes_approved_tls_egress() {
 
     let ports = FixturePorts::pick();
 
-    // ── Host fixtures, reached from the guest through the gvproxy alias ──
+    // ── Host fixtures, reached by the host supervisor ──
     let proxy = HostPythonFixture::start(&proxy_script(ports.proxy), ports.proxy)
         .await
         .expect("start fake corporate proxy");
@@ -832,10 +835,7 @@ async fn vm_corporate_proxy_trusts_ca_bundle_for_https_proxy() {
         sandbox.create_output
     );
     assert!(
-        proxy_logs.contains(&format!(
-            "CONNECT {GVPROXY_HOST_LOOPBACK_IP}:{} ok",
-            ports.allowed
-        )),
+        proxy_logs.contains(&format!("CONNECT {HOST_LOOPBACK_IP}:{} ok", ports.allowed)),
         "https proxy should have seen a validated-IP CONNECT to the approved upstream:\n{proxy_logs}"
     );
     assert!(

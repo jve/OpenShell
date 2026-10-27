@@ -1,0 +1,111 @@
+<!--
+SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+SPDX-License-Identifier: Apache-2.0
+-->
+
+# Protobuf API conventions
+
+This directory defines OpenShell's gRPC contracts. These conventions are the
+source of truth for public protobuf API design. Apply them to new APIs and when
+changing existing APIs; generated SDK naming follows from these definitions.
+
+## Entity references
+
+- Use `name` for the primary resource targeted by an RPC.
+- Use the resource's role for a related resource reference, such as `sandbox`,
+  `provider`, `service`, or `rule`.
+- Do not append `_name` to a canonical entity reference. Its value is already
+  the canonical name. Descriptive values, local map keys, implementation
+  labels, and configured registration names that are not entity references may
+  retain the suffix. Examples include `display_name`, `file_name`,
+  `driver_name`, `runtime_class_name`, `rule_name`, and `middleware_name`.
+- Public callers reference entities by canonical name. Keep immutable IDs at
+  authentication, persistence, compute-driver, and other internal boundaries.
+
+For example:
+
+```proto
+message GetSandboxRequest {
+  openshell.datamodel.v1.WorkspaceSelector workspace_scope = 2;
+  string name = 1;
+}
+
+message ExposeServiceRequest {
+  openshell.datamodel.v1.WorkspaceSelector workspace_scope = 5;
+  string sandbox = 1;
+  string name = 2;
+}
+```
+
+`GetSandboxRequest.name` identifies the RPC's primary resource.
+`ExposeServiceRequest.sandbox` identifies a related sandbox while `name`
+identifies the service being exposed.
+
+## Workspace scope
+
+- Public workspace-scoped requests declare `workspace_scope` before every
+  other field. Existing wire field numbers do not need to follow declaration
+  order.
+- Type `workspace_scope` as
+  `openshell.datamodel.v1.WorkspaceSelector`.
+- Requests operating in one workspace require a non-empty canonical
+  `WorkspaceSelector.workspace`. The `default` workspace is an explicit name,
+  not an omitted-value fallback.
+- Accept `WorkspaceSelector.all_workspaces` only on collection-list RPCs that
+  explicitly document and authorize cross-workspace access. The supported
+  public collections are sandboxes, sandbox templates, providers, and
+  services.
+- Requests whose primary resource is a workspace use `name`, not
+  `workspace_scope`.
+- Document every request that permits an omitted selector. Current exceptions
+  are platform provider-profile scope and authenticated sandbox bootstrap.
+
+## Field and message design
+
+- Prefer a dedicated request and response message for each RPC, including
+  requests that are currently empty.
+- Use `google.protobuf.Timestamp` for absolute time and
+  `google.protobuf.Duration` for elapsed time.
+- Use optional presence when omitted and explicitly empty values have different
+  meanings. Do not infer presence from a protobuf scalar's default value.
+- Keep public request fields in semantic reading order. Field numbers preserve
+  wire identity and may therefore differ from declaration order.
+- Document authorization-sensitive selector variants and omission semantics on
+  the containing request.
+
+## Schema evolution
+
+- Treat field numbers and fully qualified message names as durable wire
+  identities.
+- When removing or renaming a field, reserve its old number and source name. Do
+  not reuse either for a different meaning.
+- Review changes against both the public descriptor closure and durable stored
+  protobuf closure. The `public_and_durable_schema_inventories_are_complete`
+  test in `openshell-server` owns both inventories.
+- Regenerate Rust, Python, Go, and TypeScript bindings after contract changes.
+  Run `mise run pre-commit`, the affected SDK checks, and relevant server tests
+  before submitting the change.
+
+## Supervisor host protocol
+
+[`supervisor_host.proto`](supervisor_host.proto) is the private stream between
+a gateway and the supervisor process it shares among its sandboxes: the
+supervisor attaches, the gateway sends complete assignment snapshots, and the
+supervisor reports what it hosts. It is a version-locked deployment protocol
+served on the gateway listener but authorized only for the gateway-minted
+supervisor token (`auth_mode: "supervisor"`). It is not imported by
+`openshell.proto`, so SDK generation and
+gRPC reflection exclude it; the server's schema inventory test classifies it
+explicitly. `SandboxInstanceAssignment.launch_material` carries the existing
+JSON sandbox instance registration of `openshell-supervisor-control` and is
+marked secret.
+
+## Isolation backend protocol
+
+[`isolation_backend.proto`](isolation_backend.proto) defines backend discovery,
+boundary binding, and optional suspend/resume RPCs.
+[`sandbox_protocol.proto`](sandbox_protocol.proto) defines typed workload
+control, process I/O, and network mediation over the bound boundary. Both are
+supervisor-to-backend contracts, not gateway RPCs. Backend authors can generate bindings independently
+from these definitions. The negotiated Sandbox Protocol version covers the gRPC
+services, typed messages, streaming, and lifecycle semantics.

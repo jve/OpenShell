@@ -7,20 +7,12 @@ on:
   workflow_dispatch:
     inputs:
       candidate_ref:
-        description: Pre-release tag to scan (vMAJOR.MINOR.PATCH-pre.N)
+        description: Release tag to scan
         required: true
         type: string
-      stable_ref:
-        description: Optional previous stable tag override for Codex
-        default: ""
-        type: string
-      allow_full_bootstrap:
-        description: Allow a full Codex scan when no previous stable tag exists
-        default: false
-        type: boolean
-      allow-high-critical:
-        description: Report HIGH/CRITICAL findings without failing; scanner errors still fail
-        default: false
+      fail-on-static-findings:
+        description: Fail when CodeQL, Trivy, or Zizmor reports HIGH/CRITICAL findings
+        default: true
         type: boolean
       images:
         description: Newline-separated image references for Trivy
@@ -33,20 +25,12 @@ on:
   workflow_call:
     inputs:
       candidate_ref:
-        description: Pre-release tag to scan (vMAJOR.MINOR.PATCH-pre.N)
+        description: Release tag to scan
         required: true
         type: string
-      stable_ref:
-        description: Optional previous stable tag override for Codex
-        default: ""
-        type: string
-      allow_full_bootstrap:
-        description: Allow a full Codex scan when no previous stable tag exists
-        default: false
-        type: boolean
-      allow-high-critical:
-        description: Report HIGH/CRITICAL findings without failing; scanner errors still fail
-        default: false
+      fail-on-static-findings:
+        description: Fail when CodeQL, Trivy, or Zizmor reports HIGH/CRITICAL findings
+        default: true
         type: boolean
       images:
         description: Newline-separated image references for Trivy
@@ -57,8 +41,6 @@ on:
         default: ""
         type: string
     secrets:
-      CODEX_SECURITY_API_KEY:
-        required: true
       CACHIX_AUTH_TOKEN:
         required: false
 
@@ -67,22 +49,6 @@ permissions:
 
 # Only the finding threshold is overridable; execution failures remain fatal.
 jobs:
-  codex:
-    name: Codex Security
-    uses: ./.github/workflows/codex-security.yml
-    permissions:
-      actions: read
-      contents: read
-      security-events: write
-    with:
-      candidate_ref: ${{ inputs.candidate_ref }}
-      stable_ref: ${{ inputs.stable_ref }}
-      allow_full_bootstrap: ${{ inputs.allow_full_bootstrap }}
-      fail-on-findings: ${{ !inputs.allow-high-critical }}
-      upload_sarif: true
-    secrets:
-      CODEX_SECURITY_API_KEY: ${{ secrets.CODEX_SECURITY_API_KEY }}
-
   codeql:
     name: CodeQL
     uses: ./.github/workflows/codeql.yml
@@ -91,7 +57,7 @@ jobs:
       security-events: write
     with:
       candidate_ref: ${{ inputs.candidate_ref }}
-      fail-on-findings: ${{ !inputs.allow-high-critical }}
+      fail-on-findings: ${{ inputs.fail-on-static-findings }}
 
   trivy:
     name: Trivy
@@ -102,7 +68,7 @@ jobs:
       security-events: write
     with:
       candidate_ref: ${{ inputs.candidate_ref }}
-      fail-on-findings: ${{ !inputs.allow-high-critical }}
+      fail-on-findings: ${{ inputs.fail-on-static-findings }}
       severity: HIGH,CRITICAL
       ignore-unfixed: false
       images: ${{ inputs.images }}
@@ -128,6 +94,6 @@ jobs:
       security-events: write
     with:
       candidate_ref: ${{ inputs.candidate_ref }}
-      fail-on-findings: ${{ !inputs.allow-high-critical }}
+      fail-on-findings: ${{ inputs.fail-on-static-findings }}
     secrets:
       CACHIX_AUTH_TOKEN: ${{ secrets.CACHIX_AUTH_TOKEN }}

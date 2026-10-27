@@ -1,0 +1,2532 @@
+// SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
+use super::super::tests::{mcp_policy_with_versions, test_provider, test_sandbox, with_sandbox};
+use super::super::{handle_get_sandbox_config, handle_report_policy_status, handle_update_config};
+use super::*;
+use crate::grpc::OpenShellService;
+use crate::grpc::test_support::{authed_request, test_server_state};
+use openshell_core::endpoint_status::endpoint_id;
+use openshell_core::proto::open_shell_client::OpenShellClient;
+use openshell_core::proto::open_shell_server::OpenShellServer;
+use openshell_core::proto::{
+    EndpointObservation, GetSandboxConfigRequest, GetSandboxRequest, NetworkEndpoint,
+    NetworkPolicyRule, PolicyStatus, ReportPolicyStatusRequest, SandboxCondition, SandboxPhase,
+    SupervisorHello, SupervisorMessage, TokenGrantFailureObservation, UpdateConfigRequest,
+    supervisor_message,
+};
+use tokio_stream::wrappers::TcpListenerStream;
+use tonic::Code;
+
+fn timestamp(value: &str) -> prost_types::Timestamp {
+    value.parse().expect("valid test timestamp")
+}
+
+fn test_initial_endpoint_status(endpoint_id: &str, host: &str, path: &str) -> EndpointStatus {
+    EndpointStatus {
+        endpoint_id: endpoint_id.to_string(),
+        host: host.to_string(),
+        ports: vec![443],
+        path: path.to_string(),
+        last_result: EndpointResult::NoObservedExchange as i32,
+        last_reported_time: None,
+        last_failure: None,
+    }
+}
+
+fn ready_condition() -> SandboxCondition {
+    SandboxCondition {
+        r#type: "Ready".to_string(),
+        status: "True".to_string(),
+        reason: "SupervisorReady".to_string(),
+        ..Default::default()
+    }
+}
+
+fn register_session(state: &ServerState, sandbox_id: &str, session_id: &str) {
+    let (session_tx, _session_rx) = tokio::sync::mpsc::channel(1);
+    let (shutdown_tx, _shutdown_rx) = tokio::sync::oneshot::channel();
+    state.supervisor_sessions.register(
+        sandbox_id.to_string(),
+        session_id.to_string(),
+        session_tx,
+        shutdown_tx,
+    );
+}
+
+async fn stored_sandbox(state: &ServerState, sandbox_id: &str) -> Sandbox {
+    state
+        .store
+        .get_message::<Sandbox>(sandbox_id)
+        .await
+        .expect("load sandbox")
+        .expect("sandbox remains present")
+}
+
+async fn public_status(state: &Arc<ServerState>, sandbox_id: &str) -> SandboxStatus {
+    crate::grpc::sandbox::handle_get_sandbox(
+        state,
+        authed_request(GetSandboxRequest {
+            name: sandbox_id.to_string(),
+            workspace_scope: Some(openshell_core::proto::workspace_selector(
+                "default".to_string(),
+            )),
+        }),
+    )
+    .await
+    .expect("public sandbox status")
+    .into_inner()
+    .sandbox
+    .expect("sandbox remains present")
+    .status
+    .expect("status remains present")
+}
+
+async fn acknowledge_loaded_policy(state: &Arc<ServerState>, sandbox_id: &str, version: u32) {
+    handle_report_policy_status(
+        state,
+        with_sandbox(
+            Request::new(ReportPolicyStatusRequest {
+                sandbox_id: sandbox_id.to_string(),
+                version,
+                status: PolicyStatus::Loaded as i32,
+                load_error: String::new(),
+            }),
+            sandbox_id,
+        ),
+    )
+    .await
+    .expect("acknowledge loaded policy");
+}
+
+async fn sandbox_with_accepted_endpoint_result(
+    sandbox_id: &str,
+    acknowledge_before_observation: bool,
+) -> (Arc<ServerState>, ReportEndpointStatusRequest) {
+    let state = test_server_state().await;
+    let mut policy = mcp_policy_with_versions(&["2025-11-25"]);
+    let endpoint = &mut policy
+        .network_policies
+        .get_mut("mcp")
+        .expect("MCP rule")
+        .endpoints[0];
+    endpoint.host = "tools.example.com".to_string();
+    endpoint.path = "/mcp".to_string();
+    let mut sandbox = test_sandbox(sandbox_id, sandbox_id, policy.clone(), Vec::new());
+    sandbox.status = Some(SandboxStatus {
+        phase: SandboxPhase::Ready as i32,
+        conditions: vec![ready_condition()],
+        ..Default::default()
+    });
+    state
+        .store
+        .put_message(&sandbox)
+        .await
+        .expect("store sandbox");
+    state
+        .store
+        .put_policy_revision(
+            &format!("{sandbox_id}-v1"),
+            sandbox_id,
+            "default",
+            1,
+            &policy.encode_to_vec(),
+            &deterministic_policy_hash(&policy),
+        )
+        .await
+        .expect("store policy revision");
+    if acknowledge_before_observation {
+        acknowledge_loaded_policy(&state, sandbox_id, 1).await;
+    }
+
+    register_session(&state, sandbox_id, "session-a");
+    reset_endpoint_status_for_supervisor_session(&state, sandbox_id, "session-a")
+        .await
+        .expect("reset session evidence");
+    assert!(
+        state
+            .supervisor_sessions
+            .initialize_endpoint_status_authority(sandbox_id, "session-a")
+    );
+    let sandbox = stored_sandbox(&state, sandbox_id).await;
+    let context = active_endpoint_context(&state, &sandbox)
+        .await
+        .expect("active endpoint configuration");
+    let endpoint_id = context
+        .endpoints
+        .keys()
+        .next()
+        .expect("MCP endpoint")
+        .clone();
+    let report = ReportEndpointStatusRequest {
+        sandbox_id: sandbox_id.to_string(),
+        policy_hash: context.policy_hash,
+        provider_env_revision: context.provider_env_revision,
+        observations: vec![EndpointObservation {
+            endpoint_id: endpoint_id.clone(),
+            result: EndpointResult::HttpResponseReceived as i32,
+            failure: None,
+        }],
+        observed_endpoint_ids: vec![endpoint_id],
+        supervisor_session_id: "session-a".to_string(),
+        report_sequence: 1,
+        token_grant_status: None,
+    };
+    handle_report_endpoint_status(
+        &state,
+        with_sandbox(Request::new(report.clone()), sandbox_id),
+    )
+    .await
+    .expect("accept endpoint result");
+    (state, report)
+}
+
+async fn assert_loaded_ack_preserves_endpoint_evidence(
+    state: &Arc<ServerState>,
+    report: ReportEndpointStatusRequest,
+    version: u32,
+) {
+    let before = public_status(state, &report.sandbox_id).await;
+    assert_eq!(before.endpoint_statuses.len(), 1);
+    assert_eq!(
+        before.endpoint_statuses[0].last_result,
+        EndpointResult::HttpResponseReceived as i32
+    );
+    assert!(before.endpoint_statuses[0].last_reported_time.is_some());
+    let cursor = state
+        .supervisor_sessions
+        .endpoint_report_cursor(&report.sandbox_id, &report.supervisor_session_id);
+
+    acknowledge_loaded_policy(state, &report.sandbox_id, version).await;
+
+    let after = public_status(state, &report.sandbox_id).await;
+    assert_eq!(after.current_policy_version, version);
+    assert_eq!(after.endpoint_statuses, before.endpoint_statuses);
+    assert_eq!(after.phase, before.phase);
+    assert_eq!(after.conditions, before.conditions);
+    assert_eq!(
+        state
+            .supervisor_sessions
+            .endpoint_report_cursor(&report.sandbox_id, &report.supervisor_session_id),
+        cursor
+    );
+
+    // The endpoint RPC may have committed before its acknowledgement was lost.
+    // A later policy acknowledgement cannot invalidate that immutable retry.
+    let committed = stored_sandbox(state, &report.sandbox_id).await;
+    handle_report_endpoint_status(
+        state,
+        with_sandbox(Request::new(report.clone()), &report.sandbox_id),
+    )
+    .await
+    .expect("retry accepted endpoint report");
+    assert_eq!(stored_sandbox(state, &report.sandbox_id).await, committed);
+}
+
+#[tokio::test]
+async fn loaded_policy_retry_preserves_endpoint_evidence() {
+    let (state, report) =
+        sandbox_with_accepted_endpoint_result("endpoint-loaded-retry", true).await;
+
+    assert_loaded_ack_preserves_endpoint_evidence(&state, report, 1).await;
+}
+
+#[tokio::test]
+async fn unchanged_policy_revision_preserves_endpoint_evidence() {
+    let sandbox_id = "endpoint-unchanged-revision";
+    let (state, report) = sandbox_with_accepted_endpoint_result(sandbox_id, true).await;
+    let sandbox = stored_sandbox(&state, sandbox_id).await;
+    let revision = handle_update_config(
+        &state,
+        authed_request(UpdateConfigRequest {
+            sandbox: sandbox_id.to_string(),
+            policy: sandbox.spec.expect("sandbox spec").policy,
+            annotations: HashMap::from([("audit".to_string(), "v2".to_string())]),
+            workspace_scope: Some(openshell_core::proto::workspace_selector(
+                "default".to_string(),
+            )),
+            ..Default::default()
+        }),
+    )
+    .await
+    .expect("create metadata-only policy revision")
+    .into_inner();
+    assert_eq!(revision.version, 2);
+    assert_eq!(revision.policy_hash, report.policy_hash);
+
+    assert_loaded_ack_preserves_endpoint_evidence(&state, report, 2).await;
+}
+
+#[tokio::test]
+async fn initial_loaded_policy_ack_preserves_endpoint_evidence() {
+    let (state, report) =
+        sandbox_with_accepted_endpoint_result("endpoint-initial-ack", false).await;
+    assert_eq!(
+        stored_sandbox(&state, &report.sandbox_id)
+            .await
+            .current_policy_version(),
+        0
+    );
+
+    // Policy and endpoint reports use independent tasks, so the first exchange
+    // may reach the gateway before the initial loaded-policy acknowledgement.
+    assert_loaded_ack_preserves_endpoint_evidence(&state, report, 1).await;
+}
+
+#[tokio::test]
+async fn loaded_policy_comparison_uses_one_provider_profile_snapshot() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let sandbox_id = "endpoint-policy-catalog-snapshot";
+    let (state, report) = sandbox_with_accepted_endpoint_result(sandbox_id, true).await;
+    let policy = stored_sandbox(&state, sandbox_id)
+        .await
+        .spec
+        .expect("sandbox spec")
+        .policy
+        .expect("sandbox policy");
+    state
+        .store
+        .put_policy_revision(
+            "same-policy-new-revision",
+            sandbox_id,
+            "default",
+            2,
+            &policy.encode_to_vec(),
+            &report.policy_hash,
+        )
+        .await
+        .expect("store equivalent policy revision");
+    let fetch_count = Arc::new(AtomicUsize::new(0));
+    let mut state = Arc::into_inner(state).expect("uniquely owned test state");
+    let mut profile_a = openshell_providers::example_profiles::load("github").to_proto();
+    profile_a.id = "snapshot-provider".to_string();
+    profile_a.display_name = "catalog-a".to_string();
+    let mut profile_b = profile_a.clone();
+    profile_b.display_name = "catalog-b".to_string();
+    state.provider_profile_sources =
+        crate::provider_profile_sources::ProviderProfileSources::from_test_snapshot_sequence(
+            vec![
+                ("catalog-a".to_string(), vec![profile_a]),
+                ("catalog-b".to_string(), vec![profile_b]),
+            ],
+            Arc::clone(&fetch_count),
+        );
+    let state = Arc::new(state);
+    let before = public_status(&state, sandbox_id).await;
+
+    acknowledge_loaded_policy(&state, sandbox_id, 2).await;
+
+    assert_eq!(fetch_count.load(Ordering::SeqCst), 1);
+    let after = public_status(&state, sandbox_id).await;
+    assert_eq!(after.current_policy_version, 2);
+    assert_eq!(after.endpoint_statuses, before.endpoint_statuses);
+    assert_eq!(after.phase, before.phase);
+    assert_eq!(after.conditions, before.conditions);
+}
+
+#[tokio::test]
+async fn loaded_policy_hash_cycle_resets_endpoint_evidence() {
+    let sandbox_id = "endpoint-policy-hash-cycle";
+    let (state, report) = sandbox_with_accepted_endpoint_result(sandbox_id, true).await;
+    let sandbox = stored_sandbox(&state, sandbox_id).await;
+    let original_policy = sandbox
+        .spec
+        .expect("sandbox spec")
+        .policy
+        .expect("sandbox policy");
+    let original_status = public_status(&state, sandbox_id).await;
+    let mut changed_policy = original_policy.clone();
+    changed_policy
+        .network_policies
+        .get_mut("mcp")
+        .expect("MCP rule")
+        .endpoints[0]
+        .rules[0]
+        .allow
+        .as_mut()
+        .expect("MCP allow rule")
+        .method = "tools/call".to_string();
+
+    // A changed permission resets evidence even when the public endpoint address
+    // stays the same. Returning to the old hash cannot revive its old cursor.
+    for (policy, version) in [(changed_policy, 2), (original_policy, 3)] {
+        let revision = handle_update_config(
+            &state,
+            authed_request(UpdateConfigRequest {
+                sandbox: sandbox_id.to_string(),
+                policy: Some(policy),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    "default".to_string(),
+                )),
+                ..Default::default()
+            }),
+        )
+        .await
+        .expect("update policy permission")
+        .into_inner();
+        assert_eq!(revision.version, version);
+        if version == 2 {
+            assert_ne!(revision.policy_hash, report.policy_hash);
+        } else {
+            assert_eq!(revision.policy_hash, report.policy_hash);
+        }
+        acknowledge_loaded_policy(&state, sandbox_id, version).await;
+        let status = public_status(&state, sandbox_id).await;
+        assert_eq!(status.current_policy_version, version);
+        assert_eq!(status.endpoint_statuses.len(), 1);
+        assert_eq!(
+            status.endpoint_statuses[0],
+            EndpointStatus {
+                last_result: EndpointResult::NoObservedExchange as i32,
+                last_reported_time: None,
+                ..original_status.endpoint_statuses[0].clone()
+            }
+        );
+        assert_eq!(status.phase, original_status.phase);
+        assert_eq!(status.conditions, original_status.conditions);
+    }
+
+    let reset = stored_sandbox(&state, sandbox_id).await;
+    handle_report_endpoint_status(&state, with_sandbox(Request::new(report), sandbox_id))
+        .await
+        .expect("acknowledge already committed endpoint report");
+    assert_eq!(stored_sandbox(&state, sandbox_id).await, reset);
+}
+
+#[tokio::test]
+async fn global_policy_update_waits_for_endpoint_report_guard() {
+    let state = test_server_state().await;
+    let policy = mcp_policy_with_versions(&["2025-11-25"]);
+    let updates = [
+        UpdateConfigRequest {
+            policy: Some(policy),
+            global: true,
+            ..Default::default()
+        },
+        UpdateConfigRequest {
+            setting_key: super::super::POLICY_SETTING_KEY.to_string(),
+            delete_setting: true,
+            global: true,
+            ..Default::default()
+        },
+    ];
+
+    for (index, update) in updates.into_iter().enumerate() {
+        let before = load_global_settings(state.store.as_ref())
+            .await
+            .expect("read settings before update");
+        let guard = crate::persistence::lock_order::branch(
+            state
+                .compute
+                .mutation_guard(MutationScope::sandbox("default", "endpoint-report-guard")),
+        )
+        .await
+        .unwrap();
+        let mut pending = Box::pin(handle_update_config(&state, authed_request(update)));
+
+        // Poll the actual writer while an endpoint report owns the mutation
+        // boundary. Both replacing and deleting global policy must wait.
+        let result =
+            tokio::time::timeout(std::time::Duration::from_millis(100), pending.as_mut()).await;
+        assert!(
+            result.is_err(),
+            "global policy update committed while endpoint report guard was held: {result:?}"
+        );
+        let during = load_global_settings(state.store.as_ref())
+            .await
+            .expect("read settings while writer waits");
+        assert_eq!(during.revision, before.revision);
+        assert_eq!(during.settings, before.settings);
+
+        drop(guard);
+        tokio::time::timeout(std::time::Duration::from_secs(5), pending)
+            .await
+            .expect("global policy update completes after guard release")
+            .expect("global policy update succeeds");
+        let after = load_global_settings(state.store.as_ref())
+            .await
+            .expect("read updated settings");
+        assert_eq!(
+            decode_policy_from_global_settings(&after)
+                .expect("decode global policy")
+                .is_some(),
+            index == 0
+        );
+    }
+}
+
+#[tokio::test]
+async fn report_endpoint_status_does_not_wait_for_unrelated_sandbox_guard() {
+    let sandbox_id = "endpoint-unrelated-guard";
+    let (state, mut report) = sandbox_with_accepted_endpoint_result(sandbox_id, true).await;
+    let unrelated_guard = crate::persistence::lock_order::branch(state.compute.mutation_guard(
+        MutationScope::sandbox("default", "endpoint-unrelated-other"),
+    ))
+    .await
+    .expect("hold an unrelated sandbox guard");
+
+    report.report_sequence = 2;
+    report.observations[0].result = EndpointResult::TransportFailed as i32;
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        handle_report_endpoint_status(&state, with_sandbox(Request::new(report), sandbox_id)),
+    )
+    .await
+    .expect("an endpoint report must not wait for an unrelated sandbox mutation")
+    .expect("accept endpoint result");
+    let status = stored_sandbox(&state, sandbox_id)
+        .await
+        .status
+        .expect("sandbox status");
+    assert_eq!(
+        status.endpoint_statuses[0].last_result,
+        EndpointResult::TransportFailed as i32
+    );
+    drop(unrelated_guard);
+}
+
+#[test]
+fn expected_endpoint_statuses_canonicalize_identity_and_distinguish_paths() {
+    let policy = ProtoSandboxPolicy {
+        network_policies: HashMap::from([(
+            "mcp".to_string(),
+            NetworkPolicyRule {
+                endpoints: vec![
+                    NetworkEndpoint {
+                        host: "API.Example.COM".to_string(),
+                        ports: vec![443, 443],
+                        path: "**".to_string(),
+                        protocol: " MCP ".to_string(),
+                        ..Default::default()
+                    },
+                    NetworkEndpoint {
+                        host: "api.example.com".to_string(),
+                        port: 443,
+                        path: "/**".to_string(),
+                        protocol: "mcp".to_string(),
+                        provider_credentialed: true,
+                        ..Default::default()
+                    },
+                    NetworkEndpoint {
+                        host: "api.example.com".to_string(),
+                        port: 443,
+                        path: "/mcp/private/**".to_string(),
+                        protocol: "mcp".to_string(),
+                        ..Default::default()
+                    },
+                    NetworkEndpoint {
+                        host: "api.example.com".to_string(),
+                        port: 443,
+                        path: "/ignored".to_string(),
+                        protocol: "rest".to_string(),
+                        ..Default::default()
+                    },
+                ],
+                ..Default::default()
+            },
+        )]),
+        ..Default::default()
+    };
+
+    let endpoints = expected_endpoint_statuses(&policy);
+
+    assert_eq!(endpoints.len(), 2);
+    let root_endpoint_id = endpoint_id(&policy.network_policies["mcp"].endpoints[0]);
+    let private_endpoint_id = endpoint_id(&policy.network_policies["mcp"].endpoints[2]);
+    assert_ne!(root_endpoint_id, private_endpoint_id);
+    assert_eq!(
+        endpoints[&root_endpoint_id],
+        ExpectedEndpoint {
+            provider_credentialed: true,
+            status: test_initial_endpoint_status(&root_endpoint_id, "api.example.com", "/**"),
+        }
+    );
+    assert_eq!(
+        endpoints[&private_endpoint_id].status,
+        test_initial_endpoint_status(&private_endpoint_id, "api.example.com", "/mcp/private/**")
+    );
+}
+
+#[tokio::test]
+async fn report_endpoint_status_rejects_stale_configuration_epoch() {
+    let state = test_server_state().await;
+    let sandbox_id = "endpoint-stale";
+    state
+        .store
+        .put_message(&test_sandbox(
+            sandbox_id,
+            "endpoint-stale",
+            mcp_policy_with_versions(&["2025-11-25"]),
+            Vec::new(),
+        ))
+        .await
+        .expect("store sandbox");
+    let config = handle_get_sandbox_config(
+        &state,
+        with_sandbox(
+            Request::new(GetSandboxConfigRequest {
+                name: sandbox_id.to_string(),
+                workspace_scope: None,
+            }),
+            sandbox_id,
+        ),
+    )
+    .await
+    .expect("get sandbox config")
+    .into_inner();
+    let endpoint = &config
+        .policy
+        .as_ref()
+        .expect("effective policy")
+        .network_policies["mcp"]
+        .endpoints[0];
+    let observation = EndpointObservation {
+        endpoint_id: endpoint_id(endpoint),
+        result: EndpointResult::NoObservedExchange as i32,
+        failure: None,
+    };
+    let (session_tx, _session_rx) = tokio::sync::mpsc::channel(1);
+    let (shutdown_tx, _shutdown_rx) = tokio::sync::oneshot::channel();
+    state.supervisor_sessions.register(
+        sandbox_id.to_string(),
+        "session-current".to_string(),
+        session_tx,
+        shutdown_tx,
+    );
+    assert!(
+        state
+            .supervisor_sessions
+            .initialize_endpoint_status_authority(sandbox_id, "session-current")
+    );
+
+    for request in [
+        ReportEndpointStatusRequest {
+            sandbox_id: sandbox_id.to_string(),
+            policy_hash: format!("stale-{}", config.policy_hash),
+            provider_env_revision: config.provider_env_revision,
+            observations: vec![observation.clone()],
+            observed_endpoint_ids: Vec::new(),
+            supervisor_session_id: "session-current".to_string(),
+            report_sequence: 1,
+            token_grant_status: None,
+        },
+        ReportEndpointStatusRequest {
+            sandbox_id: sandbox_id.to_string(),
+            policy_hash: config.policy_hash.clone(),
+            provider_env_revision: config.provider_env_revision.wrapping_add(1),
+            observations: vec![observation.clone()],
+            observed_endpoint_ids: Vec::new(),
+            supervisor_session_id: "session-current".to_string(),
+            report_sequence: 1,
+            token_grant_status: None,
+        },
+    ] {
+        let error =
+            handle_report_endpoint_status(&state, with_sandbox(Request::new(request), sandbox_id))
+                .await
+                .expect_err("stale endpoint status must be rejected");
+        assert_eq!(error.code(), Code::FailedPrecondition);
+    }
+
+    let stored = state
+        .store
+        .get_message::<Sandbox>(sandbox_id)
+        .await
+        .expect("load sandbox")
+        .expect("sandbox remains present");
+    assert!(
+        stored
+            .status
+            .as_ref()
+            .is_none_or(|status| status.endpoint_statuses.is_empty())
+    );
+}
+
+#[test]
+fn endpoint_snapshot_rejects_credential_failure_for_uncredentialed_path() {
+    let expected = BTreeMap::from([(
+        "endpoint:v1:public".to_string(),
+        ExpectedEndpoint {
+            provider_credentialed: false,
+            status: test_initial_endpoint_status(
+                "endpoint:v1:public",
+                "api.example.com",
+                "/mcp/public/**",
+            ),
+        },
+    )]);
+    let reported = vec![EndpointObservation {
+        endpoint_id: "endpoint:v1:public".to_string(),
+        result: EndpointResult::CredentialUnavailable as i32,
+        failure: None,
+    }];
+    let error = validate_endpoint_snapshot(&reported, &[], &expected, &[])
+        .expect_err("uncredentialed endpoint cannot report credential failure");
+    assert_eq!(error.code(), Code::InvalidArgument);
+    assert_eq!(
+        error.message(),
+        "credential-unavailable requires a credentialed tool server endpoint"
+    );
+}
+
+#[test]
+fn endpoint_results_preserve_address_and_lifecycle_through_failure_recovery_and_reset() {
+    let mut sandbox = test_sandbox(
+        "sandbox-id",
+        "sandbox-name",
+        ProtoSandboxPolicy::default(),
+        Vec::new(),
+    );
+    sandbox.status = Some(SandboxStatus {
+        phase: SandboxPhase::Ready as i32,
+        conditions: vec![ready_condition()],
+        endpoint_statuses: vec![test_initial_endpoint_status(
+            "obsolete",
+            "retired.example.com",
+            "/old",
+        )],
+        ..Default::default()
+    });
+    let initial = test_initial_endpoint_status("current", "api.example.com", "/mcp/private/**");
+    for (result, time) in [
+        (EndpointResult::TransportFailed, "2026-09-05T01:00:00.000Z"),
+        (
+            EndpointResult::HttpResponseReceived,
+            "2026-09-05T02:00:00.000Z",
+        ),
+        (
+            EndpointResult::NoObservedExchange,
+            "2026-09-05T03:00:00.000Z",
+        ),
+    ] {
+        let reports = BTreeMap::from([(
+            "current".to_string(),
+            EndpointStatus {
+                last_result: result as i32,
+                ..initial.clone()
+            },
+        )]);
+        let observed = if result == EndpointResult::NoObservedExchange {
+            HashSet::new()
+        } else {
+            HashSet::from(["current".to_string()])
+        };
+        reconcile_endpoint_statuses(&mut sandbox, &reports, &observed, &timestamp(time));
+
+        let status = sandbox.status.as_ref().expect("status remains present");
+        assert_eq!(status.phase, SandboxPhase::Ready as i32);
+        assert_eq!(status.conditions, vec![ready_condition()]);
+        assert_eq!(
+            status.endpoint_statuses,
+            vec![EndpointStatus {
+                last_result: result as i32,
+                last_reported_time: if result == EndpointResult::NoObservedExchange {
+                    None
+                } else {
+                    Some(timestamp(time))
+                },
+                ..initial.clone()
+            }]
+        );
+    }
+}
+
+#[test]
+fn endpoint_reconciliation_advances_only_observed_endpoint_timestamp() {
+    let mut sandbox = test_sandbox(
+        "sandbox-id",
+        "sandbox-name",
+        ProtoSandboxPolicy::default(),
+        Vec::new(),
+    );
+    let endpoint_a = EndpointStatus {
+        last_result: EndpointResult::HttpResponseReceived as i32,
+        last_reported_time: Some(timestamp("2026-09-05T01:01:00.000Z")),
+        ..test_initial_endpoint_status("a", "a.example.com", "/**")
+    };
+    let endpoint_b = EndpointStatus {
+        last_result: EndpointResult::TransportFailed as i32,
+        last_reported_time: Some(timestamp("2026-09-05T01:11:00.000Z")),
+        ..test_initial_endpoint_status("b", "b.example.com", "/**")
+    };
+    sandbox.status = Some(SandboxStatus {
+        endpoint_statuses: vec![endpoint_a.clone(), endpoint_b.clone()],
+        ..Default::default()
+    });
+    let reports = BTreeMap::from([
+        ("a".to_string(), endpoint_a.clone()),
+        ("b".to_string(), endpoint_b.clone()),
+    ]);
+    reconcile_endpoint_statuses(
+        &mut sandbox,
+        &reports,
+        &HashSet::from(["a".to_string()]),
+        &timestamp("2026-09-05T02:00:00.000Z"),
+    );
+    let status = sandbox.status.expect("status remains present");
+    assert_eq!(
+        status.endpoint_statuses,
+        vec![
+            EndpointStatus {
+                last_reported_time: Some(timestamp("2026-09-05T02:00:00.000Z")),
+                ..endpoint_a
+            },
+            endpoint_b
+        ]
+    );
+}
+
+fn reauthorize_failure() -> openshell_core::proto::EndpointFailure {
+    openshell_core::endpoint_failure::EndpointFailure::token_grant(
+        openshell_core::token_grant_failure::TokenGrantFailure::new(
+            openshell_core::token_grant_failure::TokenGrantFailureKind::ProviderAuthorizationRequired,
+            openshell_core::token_grant_failure::TokenGrantStage::GatewayRpc,
+        ),
+        "github",
+        "access_token",
+        "7e6d5c4b-3a29-4180-9f6e-5d4c3b2a1908",
+    )
+    .to_proto()
+}
+
+fn sandbox_grant_failure() -> TokenGrantFailureObservation {
+    TokenGrantFailureObservation {
+        destination_host: "api.example.com".to_string(),
+        destination_port: 443,
+        failure: Some(reauthorize_failure()),
+    }
+}
+
+async fn rest_grant_status_fixture(
+    sandbox_id: &str,
+) -> (Arc<ServerState>, ReportEndpointStatusRequest) {
+    let state = test_server_state().await;
+    state
+        .store
+        .put_message(&test_provider("github", "github"))
+        .await
+        .expect("store attached provider");
+    let mut policy = openshell_policy::restrictive_default_policy();
+    policy.network_policies.insert(
+        "rest".to_string(),
+        NetworkPolicyRule {
+            name: "rest".to_string(),
+            endpoints: vec![NetworkEndpoint {
+                host: "api.example.com".to_string(),
+                port: 443,
+                protocol: "rest".to_string(),
+                access: openshell_core::proto::NetworkAccessPreset::Full as i32,
+                ..Default::default()
+            }],
+            ..Default::default()
+        },
+    );
+    state
+        .store
+        .put_message(&test_sandbox(
+            sandbox_id,
+            sandbox_id,
+            policy.clone(),
+            vec!["github".to_string()],
+        ))
+        .await
+        .expect("store REST-only sandbox");
+    state
+        .store
+        .put_policy_revision(
+            &format!("{sandbox_id}-v1"),
+            sandbox_id,
+            "default",
+            1,
+            &policy.encode_to_vec(),
+            &deterministic_policy_hash(&policy),
+        )
+        .await
+        .expect("store REST policy");
+    acknowledge_loaded_policy(&state, sandbox_id, 1).await;
+    register_session(&state, sandbox_id, "session-a");
+    reset_endpoint_status_for_supervisor_session(&state, sandbox_id, "session-a")
+        .await
+        .expect("initialize REST observation session");
+    assert!(
+        state
+            .supervisor_sessions
+            .initialize_endpoint_status_authority(sandbox_id, "session-a")
+    );
+    let sandbox = stored_sandbox(&state, sandbox_id).await;
+    let context = active_endpoint_context(&state, &sandbox).await.unwrap();
+    (
+        state,
+        ReportEndpointStatusRequest {
+            sandbox_id: sandbox_id.to_string(),
+            policy_hash: context.policy_hash,
+            provider_env_revision: context.provider_env_revision,
+            supervisor_session_id: "session-a".to_string(),
+            report_sequence: 1,
+            token_grant_status: Some(TokenGrantStatus {
+                last_failure: Some(sandbox_grant_failure()),
+            }),
+            ..Default::default()
+        },
+    )
+}
+
+async fn stored_grant_failure(
+    state: &Arc<ServerState>,
+    sandbox_id: &str,
+) -> Option<Box<TokenGrantFailureObservation>> {
+    public_status(state, sandbox_id)
+        .await
+        .last_token_grant_failure
+}
+
+#[test]
+fn token_grant_status_rejects_invalid_fields() {
+    use openshell_core::rpc_error::StatusExt;
+
+    let attached = ["github".to_string()];
+    let validate = |observation: TokenGrantFailureObservation, attached: &[String]| {
+        validate_token_grant_status(
+            Some(&TokenGrantStatus {
+                last_failure: Some(observation),
+            }),
+            attached,
+        )
+    };
+    validate(sandbox_grant_failure(), &attached).expect("valid observation is accepted");
+    // A failure raised before credential selection names no provider.
+    let mut unnamed = sandbox_grant_failure();
+    let cause = unnamed.failure.as_mut().unwrap();
+    cause.provider.clear();
+    cause.credential_key.clear();
+    validate(unnamed, &[]).expect("unnamed failure is accepted");
+
+    type Mutation = fn(&mut TokenGrantFailureObservation);
+    let rows: [(Mutation, &str); 5] = [
+        (
+            |o| o.destination_host = "API.EXAMPLE.COM".to_string(),
+            "token_grant_status.last_failure",
+        ),
+        (
+            |o| o.destination_host = "bad\nSECRET".to_string(),
+            "token_grant_status.last_failure",
+        ),
+        (
+            |o| o.failure = None,
+            "token_grant_status.last_failure.failure",
+        ),
+        (
+            |o| o.failure.as_mut().unwrap().domain = 99,
+            "token_grant_status.last_failure.failure.domain",
+        ),
+        (
+            |o| o.failure.as_mut().unwrap().code = "bogus".to_string(),
+            "token_grant_status.last_failure.failure",
+        ),
+    ];
+    for (mutate, field) in rows {
+        let mut observation = sandbox_grant_failure();
+        mutate(&mut observation);
+        let error = validate(observation, &attached).unwrap_err();
+        assert_eq!(error.code(), Code::InvalidArgument, "{field}");
+        assert!(!error.message().contains("SECRET"));
+        assert_eq!(
+            error
+                .get_error_details()
+                .bad_request()
+                .unwrap()
+                .field_violations[0]
+                .field,
+            field
+        );
+    }
+
+    let mut foreign = sandbox_grant_failure();
+    foreign.failure.as_mut().unwrap().provider = "other-team".to_string();
+    let error = validate(foreign, &attached).unwrap_err();
+    assert_eq!(error.code(), Code::FailedPrecondition);
+    let info = openshell_core::rpc_error::decode_details(&error)
+        .and_then(|details| details.error_info().cloned())
+        .expect("stable error reason");
+    assert_eq!(info.reason, "ENDPOINT_FAILURE_PROVIDER_NOT_ATTACHED");
+}
+
+#[test]
+fn endpoint_snapshot_stores_failure_only_for_a_result_its_domain_explains() {
+    let expected = BTreeMap::from([(
+        "endpoint:v1:tools".to_string(),
+        ExpectedEndpoint {
+            provider_credentialed: true,
+            status: test_initial_endpoint_status(
+                "endpoint:v1:tools",
+                "tools.example.com",
+                "/mcp/**",
+            ),
+        },
+    )]);
+    let validate = |result: EndpointResult| {
+        validate_endpoint_snapshot(
+            &[EndpointObservation {
+                endpoint_id: "endpoint:v1:tools".to_string(),
+                result: result as i32,
+                failure: Some(reauthorize_failure()),
+            }],
+            &["endpoint:v1:tools".to_string()],
+            &expected,
+            &["github".to_string()],
+        )
+    };
+    let (reports, _) = validate(EndpointResult::CredentialUnavailable)
+        .expect("a classified credential failure is accepted");
+    assert_eq!(
+        reports["endpoint:v1:tools"].last_failure,
+        Some(reauthorize_failure())
+    );
+
+    let error = validate(EndpointResult::TransportFailed).unwrap_err();
+    assert_eq!(error.code(), Code::InvalidArgument);
+    assert_eq!(
+        error.message(),
+        "endpoint failure domain does not explain this endpoint result"
+    );
+}
+
+/// Send `report` with a new sequence and grant status; return the public cause.
+async fn send_grant_report(
+    state: &Arc<ServerState>,
+    report: &mut ReportEndpointStatusRequest,
+    sequence: u64,
+    grant_status: Option<TokenGrantStatus>,
+) -> Option<Box<TokenGrantFailureObservation>> {
+    report.report_sequence = sequence;
+    report.token_grant_status = grant_status;
+    let sandbox_id = report.sandbox_id.clone();
+    handle_report_endpoint_status(
+        state,
+        with_sandbox(Request::new(report.clone()), &sandbox_id),
+    )
+    .await
+    .expect("report accepted");
+    public_status(state, &sandbox_id)
+        .await
+        .last_token_grant_failure
+}
+
+#[tokio::test]
+async fn rest_grant_failure_is_retained_cleared_and_reset() {
+    let sandbox_id = "rest-grant-status";
+    let (state, mut report) = rest_grant_status_fixture(sandbox_id).await;
+    let failure = report.token_grant_status.clone();
+    let stored = Some(Box::new(sandbox_grant_failure()));
+
+    // A REST-only sandbox reports a failure without MCP observations. A report
+    // without the extension retains it; an explicit success clears it.
+    assert_eq!(
+        send_grant_report(&state, &mut report, 1, failure.clone()).await,
+        stored
+    );
+    assert_eq!(
+        send_grant_report(&state, &mut report, 2, None).await,
+        stored
+    );
+    let success = Some(TokenGrantStatus::default());
+    assert_eq!(
+        send_grant_report(&state, &mut report, 3, success).await,
+        None
+    );
+
+    // A report without the extension from a new provider revision cannot keep
+    // the earlier cause.
+    send_grant_report(&state, &mut report, 4, failure.clone()).await;
+    state
+        .store
+        .update_message_cas::<openshell_core::proto::Provider, _>(
+            "provider-github",
+            0,
+            |provider| {
+                provider.credentials.insert(
+                    "GITHUB_TOKEN".to_string(),
+                    "changed-inert-token".to_string(),
+                );
+            },
+        )
+        .await
+        .unwrap();
+    let sandbox = stored_sandbox(&state, sandbox_id).await;
+    let context = active_endpoint_context(&state, &sandbox).await.unwrap();
+    report.policy_hash = context.policy_hash;
+    report.provider_env_revision = context.provider_env_revision;
+    assert_eq!(send_grant_report(&state, &mut report, 5, None).await, None);
+
+    // Losing the session clears the cause.
+    send_grant_report(&state, &mut report, 6, failure).await;
+    state
+        .supervisor_sessions
+        .remove_if_current(sandbox_id, "session-a")
+        .unwrap();
+    reset_endpoint_status_after_supervisor_disconnect(&state, sandbox_id)
+        .await
+        .unwrap();
+    assert!(stored_grant_failure(&state, sandbox_id).await.is_none());
+
+    // Startup invalidates a sandbox whose only evidence is a grant failure.
+    state
+        .store
+        .update_message_cas::<Sandbox, _>(sandbox_id, 0, |sandbox| {
+            sandbox.status.as_mut().unwrap().last_token_grant_failure = stored.clone();
+        })
+        .await
+        .unwrap();
+    invalidate_endpoint_status_on_startup(&state).await.unwrap();
+    assert!(stored_grant_failure(&state, sandbox_id).await.is_none());
+}
+
+#[test]
+fn endpoint_failure_change_without_marker_keeps_report_time() {
+    let mut sandbox = test_sandbox(
+        "sandbox-id",
+        "sandbox-name",
+        ProtoSandboxPolicy::default(),
+        Vec::new(),
+    );
+    let endpoint = EndpointStatus {
+        last_result: EndpointResult::CredentialUnavailable as i32,
+        last_failure: Some(reauthorize_failure()),
+        ..test_initial_endpoint_status("endpoint", "api.example.com", "/**")
+    };
+    reconcile_endpoint_statuses(
+        &mut sandbox,
+        &BTreeMap::from([("endpoint".to_string(), endpoint.clone())]),
+        &HashSet::from(["endpoint".to_string()]),
+        &timestamp("2026-09-05T01:00:00.000Z"),
+    );
+
+    // Only a new result needs an observation marker; a new cause for the same
+    // result is stored and keeps the earlier report time.
+    let mut retry = reauthorize_failure();
+    retry.request_id = "1a2b3c4d-5e6f-4a1b-8c2d-3e4f5a6b7c8d".to_string();
+    let changed = BTreeMap::from([(
+        "endpoint".to_string(),
+        EndpointStatus {
+            last_failure: Some(retry.clone()),
+            ..endpoint
+        },
+    )]);
+    validate_endpoint_observation_markers(&sandbox, &changed, &HashSet::new())
+        .expect("a changed cause for the same result needs no marker");
+    reconcile_endpoint_statuses(
+        &mut sandbox,
+        &changed,
+        &HashSet::new(),
+        &timestamp("2026-09-05T02:00:00.000Z"),
+    );
+    let status = &sandbox.status.as_ref().unwrap().endpoint_statuses[0];
+    assert_eq!(status.last_failure, Some(retry));
+    assert_eq!(
+        status.last_reported_time,
+        Some(timestamp("2026-09-05T01:00:00.000Z"))
+    );
+}
+
+#[test]
+fn endpoint_snapshot_requires_marker_for_new_observed_result() {
+    let mut sandbox = test_sandbox(
+        "sandbox-id",
+        "sandbox-name",
+        ProtoSandboxPolicy::default(),
+        Vec::new(),
+    );
+    let endpoint = EndpointStatus {
+        last_result: EndpointResult::HttpResponseReceived as i32,
+        ..test_initial_endpoint_status("endpoint", "api.example.com", "/**")
+    };
+    let reports = BTreeMap::from([("endpoint".to_string(), endpoint)]);
+    let error = validate_endpoint_observation_markers(&sandbox, &reports, &HashSet::new())
+        .expect_err("a new result requires an observation marker");
+    assert_eq!(error.code(), Code::InvalidArgument);
+    assert_eq!(
+        error.message(),
+        "a new tool server endpoint result must be marked as observed"
+    );
+    let observed = HashSet::from(["endpoint".to_string()]);
+    validate_endpoint_observation_markers(&sandbox, &reports, &observed)
+        .expect("new evidence marked");
+    reconcile_endpoint_statuses(
+        &mut sandbox,
+        &reports,
+        &observed,
+        &timestamp("2026-09-05T01:00:00.000Z"),
+    );
+    validate_endpoint_observation_markers(&sandbox, &reports, &HashSet::new())
+        .expect("retained evidence");
+    invalidate_endpoint_status_without_session(&mut sandbox);
+    assert!(validate_endpoint_observation_markers(&sandbox, &reports, &HashSet::new()).is_err());
+    reconcile_endpoint_statuses(
+        &mut sandbox,
+        &reports,
+        &observed,
+        &timestamp("2026-09-05T02:00:00.000Z"),
+    );
+    assert_eq!(
+        sandbox.status.expect("status").endpoint_statuses[0].last_reported_time,
+        Some(timestamp("2026-09-05T02:00:00.000Z"))
+    );
+}
+
+#[test]
+fn endpoint_reconciliation_initializes_status_name_and_unknown_result() {
+    let mut sandbox = test_sandbox(
+        "sandbox-id",
+        "sandbox-name",
+        ProtoSandboxPolicy::default(),
+        Vec::new(),
+    );
+    sandbox.status = None;
+    let expected_phase = sandbox.phase();
+    let expected_policy_version = sandbox.current_policy_version();
+    let endpoint = test_initial_endpoint_status("endpoint", "api.example.com", "/**");
+    let reports = BTreeMap::from([("endpoint".to_string(), endpoint.clone())]);
+    reconcile_endpoint_statuses(
+        &mut sandbox,
+        &reports,
+        &HashSet::new(),
+        &timestamp("2026-09-05T04:00:00.000Z"),
+    );
+    let status = sandbox.status.expect("status initialized");
+    assert_eq!(status.endpoint_statuses, vec![endpoint]);
+    assert_eq!(status.phase, expected_phase);
+    assert_eq!(status.current_policy_version, expected_policy_version);
+    assert!(status.conditions.is_empty());
+}
+
+#[tokio::test]
+async fn startup_reconciliation_invalidates_status_from_previous_sessions() {
+    let state = test_server_state().await;
+    let sandbox_id = "endpoint-startup-invalidation";
+    let mut sandbox = test_sandbox(
+        sandbox_id,
+        sandbox_id,
+        mcp_policy_with_versions(&["2025-11-25"]),
+        Vec::new(),
+    );
+    let initial = test_initial_endpoint_status("old-session", "api.example.com", "/mcp");
+    sandbox.status = Some(SandboxStatus {
+        endpoint_statuses: vec![EndpointStatus {
+            last_result: EndpointResult::HttpResponseReceived as i32,
+            last_reported_time: Some(timestamp("2026-09-05T01:01:00.000Z")),
+            ..initial.clone()
+        }],
+        conditions: vec![ready_condition()],
+        ..Default::default()
+    });
+    state
+        .store
+        .put_message(&sandbox)
+        .await
+        .expect("store prior session status");
+    invalidate_endpoint_status_on_startup(&state)
+        .await
+        .expect("startup reconciliation");
+    let status = stored_sandbox(&state, sandbox_id)
+        .await
+        .status
+        .expect("status remains present");
+    assert_eq!(status.endpoint_statuses, vec![initial]);
+    assert_eq!(status.conditions, vec![ready_condition()]);
+}
+
+/// Store a sandbox carrying endpoint evidence from an earlier gateway process
+/// and return the status startup reconciliation must leave behind.
+async fn seed_stale_endpoint_status(state: &ServerState, sandbox_id: &str) -> EndpointStatus {
+    let mut sandbox = test_sandbox(
+        sandbox_id,
+        sandbox_id,
+        mcp_policy_with_versions(&["2025-11-25"]),
+        Vec::new(),
+    );
+    let initial = test_initial_endpoint_status(sandbox_id, "api.example.com", "/mcp");
+    sandbox.status = Some(SandboxStatus {
+        endpoint_statuses: vec![EndpointStatus {
+            last_result: EndpointResult::HttpResponseReceived as i32,
+            last_reported_time: Some(timestamp("2026-09-05T01:01:00.000Z")),
+            ..initial.clone()
+        }],
+        conditions: vec![ready_condition()],
+        ..Default::default()
+    });
+    state
+        .store
+        .put_message(&sandbox)
+        .await
+        .expect("store prior session status");
+    initial
+}
+
+fn spawn_startup_reconciliation(
+    state: &Arc<ServerState>,
+) -> tokio::task::JoinHandle<Result<(), Status>> {
+    let state = state.clone();
+    tokio::spawn(async move { invalidate_endpoint_status_on_startup(&state).await })
+}
+
+#[tokio::test]
+async fn startup_reconciliation_does_not_hold_a_fleet_guard() {
+    let state = test_server_state().await;
+    let sandbox_id = "endpoint-startup-fleet-target";
+    let initial = seed_stale_endpoint_status(&state, sandbox_id).await;
+    let unrelated_guard = crate::persistence::lock_order::branch(state.compute.mutation_guard(
+        MutationScope::sandbox("default", "endpoint-startup-fleet-unrelated"),
+    ))
+    .await
+    .expect("hold an unrelated sandbox guard");
+
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        invalidate_endpoint_status_on_startup(&state),
+    )
+    .await
+    .expect("startup reconciliation must not wait for an unrelated sandbox mutation")
+    .expect("startup reconciliation");
+    let status = stored_sandbox(&state, sandbox_id)
+        .await
+        .status
+        .expect("status remains present");
+    assert_eq!(status.endpoint_statuses, vec![initial]);
+    drop(unrelated_guard);
+}
+
+#[tokio::test]
+async fn startup_reconciliation_skips_sandbox_deleted_while_waiting() {
+    let state = test_server_state().await;
+    let sandbox_id = "endpoint-startup-deleted";
+    seed_stale_endpoint_status(&state, sandbox_id).await;
+    let guard = state
+        .compute
+        .mutation_guard(MutationScope::sandbox("default", sandbox_id))
+        .await
+        .expect("hold the target sandbox guard");
+    let mut reconciliation = spawn_startup_reconciliation(&state);
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(100), &mut reconciliation)
+            .await
+            .is_err(),
+        "startup reconciliation must wait for the target sandbox guard"
+    );
+
+    // The sandbox was listed before this delete, so the reconciliation that
+    // wakes up must treat the missing row as done rather than fail startup.
+    assert!(
+        state
+            .store
+            .delete("sandbox", sandbox_id)
+            .await
+            .expect("delete sandbox")
+    );
+    drop(guard);
+    tokio::time::timeout(std::time::Duration::from_secs(5), reconciliation)
+        .await
+        .expect("startup reconciliation finishes after the guard is released")
+        .expect("startup reconciliation task")
+        .expect("a sandbox deleted while reconciliation waited is skipped");
+}
+
+#[tokio::test]
+async fn startup_reconciliation_pages_past_a_sandbox_deleted_mid_scan() {
+    let state = test_server_state().await;
+    let page_size = usize::try_from(ENDPOINT_STARTUP_RECONCILIATION_PAGE_SIZE).unwrap();
+    // Zero-padded ids keep the listing order equal to the seeding order.
+    let ids: Vec<String> = (0..page_size + 2)
+        .map(|index| format!("endpoint-startup-page-{index:03}"))
+        .collect();
+    let mut initial = Vec::with_capacity(ids.len());
+    for sandbox_id in &ids {
+        initial.push(seed_stale_endpoint_status(&state, sandbox_id).await);
+    }
+    let is_reset = |sandbox_id: &str, expected: &EndpointStatus| {
+        let state = state.clone();
+        let sandbox_id = sandbox_id.to_string();
+        let expected = expected.clone();
+        async move {
+            stored_sandbox(&state, &sandbox_id)
+                .await
+                .status
+                .is_some_and(|status| status.endpoint_statuses == vec![expected])
+        }
+    };
+
+    // Holding the first sandbox lets the scan reset the rest of page 1, then
+    // keeps it from reading page 2.
+    let guard = state
+        .compute
+        .mutation_guard(MutationScope::sandbox("default", &ids[0]))
+        .await
+        .expect("hold the first sandbox guard");
+    let reconciliation = spawn_startup_reconciliation(&state);
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        for (sandbox_id, expected) in ids[1..page_size].iter().zip(&initial[1..page_size]) {
+            while !is_reset(sandbox_id, expected).await {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        }
+    })
+    .await
+    .expect("the scan resets the rest of page 1 while it waits");
+    assert!(!reconciliation.is_finished());
+
+    // With offset paging, page 2 would now skip its first sandbox.
+    let deleted = page_size / 2;
+    assert!(
+        state
+            .store
+            .delete("sandbox", &ids[deleted])
+            .await
+            .expect("delete sandbox")
+    );
+    drop(guard);
+    tokio::time::timeout(std::time::Duration::from_secs(5), reconciliation)
+        .await
+        .expect("startup reconciliation finishes after the guard is released")
+        .expect("startup reconciliation task")
+        .expect("startup reconciliation");
+    for (index, (sandbox_id, expected)) in ids.iter().zip(&initial).enumerate() {
+        if index != deleted {
+            assert!(
+                is_reset(sandbox_id, expected).await,
+                "{sandbox_id} kept stale endpoint status"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn startup_reconciliation_rereads_under_guard() {
+    let state = test_server_state().await;
+    let sandbox_id = "endpoint-startup-reread";
+    let initial = seed_stale_endpoint_status(&state, sandbox_id).await;
+    let listed_version = stored_sandbox(&state, sandbox_id)
+        .await
+        .get_resource_version();
+    let guard = state
+        .compute
+        .mutation_guard(MutationScope::sandbox("default", sandbox_id))
+        .await
+        .expect("hold the target sandbox guard");
+    let mut reconciliation = spawn_startup_reconciliation(&state);
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(100), &mut reconciliation)
+            .await
+            .is_err(),
+        "startup reconciliation must wait for the target sandbox guard"
+    );
+
+    // Lifecycle writers on other replicas take no distributed guard, so the
+    // listed version can go stale while reconciliation waits.
+    let bumped = state
+        .store
+        .update_message_cas::<Sandbox, _>(sandbox_id, listed_version, |sandbox| {
+            sandbox
+                .metadata
+                .as_mut()
+                .expect("sandbox metadata")
+                .labels
+                .insert("concurrent-write".to_string(), "true".to_string());
+        })
+        .await
+        .expect("concurrent unrelated write");
+    assert!(bumped.get_resource_version() > listed_version);
+    drop(guard);
+    tokio::time::timeout(std::time::Duration::from_secs(5), reconciliation)
+        .await
+        .expect("startup reconciliation finishes after the guard is released")
+        .expect("startup reconciliation task")
+        .expect("startup reconciliation");
+
+    let sandbox = stored_sandbox(&state, sandbox_id).await;
+    assert!(sandbox.get_resource_version() > bumped.get_resource_version());
+    assert_eq!(
+        sandbox
+            .metadata
+            .as_ref()
+            .expect("sandbox metadata")
+            .labels
+            .get("concurrent-write")
+            .map(String::as_str),
+        Some("true")
+    );
+    assert_eq!(
+        sandbox
+            .status
+            .expect("status remains present")
+            .endpoint_statuses,
+        vec![initial]
+    );
+}
+
+/// Assert that the evidence `seed_stale_endpoint_status` stored survived.
+async fn assert_endpoint_evidence_kept(state: &ServerState, sandbox_id: &str) {
+    let status = stored_sandbox(state, sandbox_id)
+        .await
+        .status
+        .expect("status remains present");
+    assert_eq!(
+        status.endpoint_statuses[0].last_result,
+        EndpointResult::HttpResponseReceived as i32
+    );
+    assert!(status.endpoint_statuses[0].last_reported_time.is_some());
+}
+
+#[tokio::test]
+async fn startup_reconciliation_keeps_evidence_of_a_live_owner() {
+    let state = test_server_state().await;
+    let sandbox_id = "endpoint-startup-live-owner";
+    seed_stale_endpoint_status(&state, sandbox_id).await;
+    let guard = state
+        .compute
+        .mutation_guard(MutationScope::sandbox("default", sandbox_id))
+        .await
+        .expect("hold the target sandbox guard");
+    let mut reconciliation = spawn_startup_reconciliation(&state);
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(100), &mut reconciliation)
+            .await
+            .is_err(),
+        "startup reconciliation must wait for the target sandbox guard"
+    );
+
+    // The supervisor connects to a peer after the unguarded owner check, so
+    // only the re-check under the guard can see it.
+    SupervisorOwnerIndex::new(state.store.clone(), OWNER_TTL)
+        .publish(
+            sandbox_id,
+            "session",
+            "supervisor",
+            1,
+            "peer-replica",
+            "https://peer",
+        )
+        .await
+        .expect("publish a live owner on a peer");
+    drop(guard);
+    tokio::time::timeout(std::time::Duration::from_secs(5), reconciliation)
+        .await
+        .expect("startup reconciliation finishes after the guard is released")
+        .expect("startup reconciliation task")
+        .expect("startup reconciliation");
+    assert_endpoint_evidence_kept(&state, sandbox_id).await;
+
+    // With the owner already live, the check before the guard skips the
+    // sandbox without waiting for its mutation.
+    let guard = state
+        .compute
+        .mutation_guard(MutationScope::sandbox("default", sandbox_id))
+        .await
+        .expect("hold the target sandbox guard");
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        invalidate_endpoint_status_on_startup(&state),
+    )
+    .await
+    .expect("a live owner is skipped without waiting for the sandbox guard")
+    .expect("startup reconciliation");
+    drop(guard);
+    assert_endpoint_evidence_kept(&state, sandbox_id).await;
+}
+
+#[tokio::test]
+async fn startup_reconciliation_retries_a_conflict_then_succeeds() {
+    let mut calls = 0;
+    retry_startup_reconciliation(no_retry_deadline(), || {
+        calls += 1;
+        let call = calls;
+        async move {
+            Ok(if call == 1 {
+                StartupAttempt::Retry(PersistenceError::Conflict {
+                    current_resource_version: Some(2),
+                })
+            } else {
+                StartupAttempt::Done
+            })
+        }
+    })
+    .await
+    .expect("a conflict is retried");
+    assert_eq!(calls, 2);
+}
+
+#[tokio::test]
+async fn startup_reconciliation_retries_no_lock_timeout_after_the_deadline() {
+    let mut calls = 0;
+    let error = retry_startup_reconciliation(tokio::time::Instant::now(), || {
+        calls += 1;
+        async {
+            Ok(StartupAttempt::Retry(PersistenceError::LockTimeout(
+                "waiting for a local mutation lock".to_string(),
+            )))
+        }
+    })
+    .await
+    .expect_err("a lock timeout past the deadline fails");
+    assert_eq!(error.code(), Code::Unavailable);
+    assert_eq!(calls, 1);
+
+    let mut calls = 0;
+    retry_startup_reconciliation(tokio::time::Instant::now(), || {
+        calls += 1;
+        let call = calls;
+        async move {
+            Ok(if call == 1 {
+                StartupAttempt::Retry(PersistenceError::Conflict {
+                    current_resource_version: Some(2),
+                })
+            } else {
+                StartupAttempt::Done
+            })
+        }
+    })
+    .await
+    .expect("a conflict past the deadline is still retried");
+    assert_eq!(calls, 2);
+}
+
+#[tokio::test]
+async fn startup_reconciliation_retries_a_lock_timeout() {
+    const WAITS: &str = "openshell_server_mutation_lock_wait_seconds_count{scope=\"sandbox\"}";
+    const TIMEOUTS: &str = "openshell_server_mutation_lock_timeouts_total{scope=\"sandbox\"}";
+    let metrics = crate::gateway_metrics::MetricsCapture::install();
+    let state = test_server_state().await;
+    let sandbox_id = "endpoint-startup-lock-timeout";
+    let initial = seed_stale_endpoint_status(&state, sandbox_id).await;
+    let lock_timeout = std::time::Duration::from_secs(1);
+    state
+        .compute
+        .set_mutation_lock_timeout_for_tests(lock_timeout);
+    let workspace_guard = state
+        .compute
+        .mutation_guard(MutationScope::Workspace("default"))
+        .await
+        .expect("hold the sandbox's workspace");
+    let reconciliation = spawn_startup_reconciliation(&state);
+
+    // Release after the first attempt's lock wait timed out, while the retry
+    // waits.
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while metrics.value(TIMEOUTS).is_none() {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the first lock wait times out");
+    assert!(
+        !reconciliation.is_finished(),
+        "a lock timeout must not end the scan"
+    );
+    drop(workspace_guard);
+    tokio::time::timeout(std::time::Duration::from_secs(5), reconciliation)
+        .await
+        .expect("startup reconciliation finishes after the holder releases")
+        .expect("startup reconciliation task")
+        .expect("a lock timeout is retried");
+    let status = stored_sandbox(&state, sandbox_id)
+        .await
+        .status
+        .expect("status remains present");
+    assert_eq!(status.endpoint_statuses, vec![initial]);
+
+    // The sweep counts the timed-out wait and records the retry's wait.
+    assert_eq!(metrics.value(TIMEOUTS), Some(1));
+    assert_eq!(metrics.value(WAITS), Some(1));
+}
+
+#[tokio::test]
+async fn startup_reconciliation_fails_when_a_holder_outlasts_the_retry_window() {
+    let state = test_server_state().await;
+    seed_stale_endpoint_status(&state, "endpoint-startup-held-workspace").await;
+    let lock_timeout = std::time::Duration::from_millis(100);
+    state
+        .compute
+        .set_mutation_lock_timeout_for_tests(lock_timeout);
+    let _workspace_guard = state
+        .compute
+        .mutation_guard(MutationScope::Workspace("default"))
+        .await
+        .expect("hold the sandbox's workspace");
+
+    let started = tokio::time::Instant::now();
+    let error = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        invalidate_endpoint_status_on_startup(&state),
+    )
+    .await
+    .expect("the retry window bounds startup reconciliation")
+    .expect_err("a holder past the retry window fails startup");
+    assert_eq!(error.code(), Code::Unavailable);
+    assert!(
+        started.elapsed() >= lock_timeout * ENDPOINT_STARTUP_RECONCILIATION_RETRY_LOCK_WAITS,
+        "lock timeouts are retried for the whole window"
+    );
+}
+
+/// A retry deadline no test reaches.
+fn no_retry_deadline() -> tokio::time::Instant {
+    tokio::time::Instant::now() + std::time::Duration::from_hours(1)
+}
+
+#[tokio::test]
+async fn startup_reconciliation_stops_after_the_attempt_limit() {
+    let mut calls = 0;
+    let error = retry_startup_reconciliation(no_retry_deadline(), || {
+        calls += 1;
+        async {
+            Ok(StartupAttempt::Retry(PersistenceError::Database(
+                "object sb not found".to_string(),
+            )))
+        }
+    })
+    .await
+    .expect_err("retries are bounded");
+    assert_eq!(error.code(), Code::Internal);
+    assert_eq!(calls, ENDPOINT_STARTUP_RECONCILIATION_ATTEMPTS);
+
+    let mut calls = 0;
+    let error = retry_startup_reconciliation(no_retry_deadline(), || {
+        calls += 1;
+        async { Err(Status::unavailable("resolve supervisor owner failed")) }
+    })
+    .await
+    .expect_err("an attempt error is returned");
+    assert_eq!(error.code(), Code::Unavailable);
+    assert_eq!(calls, 1, "an attempt error is not retried");
+}
+
+/// Store accepted endpoint evidence, then end the supervisor session that
+/// reported it, as the session task does before its disconnect reset.
+async fn disconnected_sandbox_with_endpoint_result(sandbox_id: &str) -> Arc<ServerState> {
+    let (state, _report) = sandbox_with_accepted_endpoint_result(sandbox_id, true).await;
+    assert!(
+        state
+            .supervisor_sessions
+            .remove_if_current(sandbox_id, "session-a")
+            .is_some()
+    );
+    assert_eq!(
+        stored_sandbox(&state, sandbox_id)
+            .await
+            .status
+            .expect("sandbox status")
+            .endpoint_statuses[0]
+            .last_result,
+        EndpointResult::HttpResponseReceived as i32
+    );
+    state
+}
+
+#[tokio::test]
+async fn disconnect_reset_skips_guard_when_local_session_replaced() {
+    let sandbox_id = "endpoint-disconnect-local-replacement";
+    let state = disconnected_sandbox_with_endpoint_result(sandbox_id).await;
+    register_session(&state, sandbox_id, "session-b");
+    let before = stored_sandbox(&state, sandbox_id).await;
+    let guard = state
+        .compute
+        .mutation_guard(MutationScope::Global)
+        .await
+        .expect("hold a guard that excludes every sandbox guard");
+
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        reset_endpoint_status_after_supervisor_disconnect(&state, sandbox_id),
+    )
+    .await
+    .expect("a disconnect with a local replacement must not wait for the guard")
+    .expect("disconnect reset");
+    assert_eq!(stored_sandbox(&state, sandbox_id).await, before);
+    drop(guard);
+}
+
+#[tokio::test]
+async fn disconnect_reset_skips_guard_when_peer_owns_session() {
+    let sandbox_id = "endpoint-disconnect-peer-owner";
+    let state = disconnected_sandbox_with_endpoint_result(sandbox_id).await;
+    SupervisorOwnerIndex::new(state.store.clone(), OWNER_TTL)
+        .publish(
+            sandbox_id,
+            "peer-s",
+            "inst",
+            1,
+            "peer-replica",
+            "https://peer:8080",
+        )
+        .await
+        .expect("publish a live owner on a peer");
+    let before = stored_sandbox(&state, sandbox_id).await;
+    let guard = state
+        .compute
+        .mutation_guard(MutationScope::Global)
+        .await
+        .expect("hold a guard that excludes every sandbox guard");
+
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        reset_endpoint_status_after_supervisor_disconnect(&state, sandbox_id),
+    )
+    .await
+    .expect("a disconnect with a live peer owner must not wait for the guard")
+    .expect("disconnect reset");
+    assert_eq!(stored_sandbox(&state, sandbox_id).await, before);
+    drop(guard);
+}
+
+#[tokio::test]
+async fn disconnect_reset_waits_for_guard_without_replacement() {
+    let sandbox_id = "endpoint-disconnect-no-replacement";
+    let state = disconnected_sandbox_with_endpoint_result(sandbox_id).await;
+    let before = stored_sandbox(&state, sandbox_id).await;
+    let guard =
+        crate::persistence::lock_order::branch(state.compute.mutation_guard(MutationScope::Global))
+            .await
+            .expect("hold a guard that excludes every sandbox guard");
+    let mut pending = Box::pin(reset_endpoint_status_after_supervisor_disconnect(
+        &state, sandbox_id,
+    ));
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(100), pending.as_mut())
+            .await
+            .is_err(),
+        "a disconnect without a replacement must wait for the guard"
+    );
+    assert_eq!(stored_sandbox(&state, sandbox_id).await, before);
+
+    drop(guard);
+    tokio::time::timeout(std::time::Duration::from_secs(5), pending)
+        .await
+        .expect("disconnect reset finishes after the guard is released")
+        .expect("disconnect reset");
+    let status = stored_sandbox(&state, sandbox_id)
+        .await
+        .status
+        .expect("status remains present");
+    assert_eq!(
+        status.endpoint_statuses[0].last_result,
+        EndpointResult::NoObservedExchange as i32
+    );
+    assert!(status.endpoint_statuses[0].last_reported_time.is_none());
+}
+
+#[tokio::test]
+async fn disconnect_reset_rechecks_for_replacement_under_guard() {
+    let sandbox_id = "endpoint-disconnect-late-replacement";
+    let state = disconnected_sandbox_with_endpoint_result(sandbox_id).await;
+    let guard =
+        crate::persistence::lock_order::branch(state.compute.mutation_guard(MutationScope::Global))
+            .await
+            .expect("hold a guard that excludes every sandbox guard");
+    let mut pending = Box::pin(reset_endpoint_status_after_supervisor_disconnect(
+        &state, sandbox_id,
+    ));
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(100), pending.as_mut())
+            .await
+            .is_err(),
+        "a disconnect without a replacement must wait for the guard"
+    );
+
+    // The replacement registers after the unguarded check, so only the
+    // re-check under the guard can keep its evidence.
+    register_session(&state, sandbox_id, "session-b");
+    let before = stored_sandbox(&state, sandbox_id).await;
+    drop(guard);
+    tokio::time::timeout(std::time::Duration::from_secs(5), pending)
+        .await
+        .expect("disconnect reset finishes after the guard is released")
+        .expect("disconnect reset");
+    assert_eq!(stored_sandbox(&state, sandbox_id).await, before);
+}
+
+/// Serve the gateway API on loopback so a test can open a real supervisor
+/// stream.
+async fn gateway_client(state: Arc<ServerState>) -> OpenShellClient<tonic::transport::Channel> {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind loopback listener");
+    let address = listener.local_addr().expect("listener address");
+    tokio::spawn(
+        tonic::transport::Server::builder()
+            .add_service(OpenShellServer::new(OpenShellService::new(state)))
+            .serve_with_incoming(TcpListenerStream::new(listener)),
+    );
+    OpenShellClient::connect(format!("http://{address}"))
+        .await
+        .expect("connect to the test gateway")
+}
+
+#[tokio::test]
+async fn session_resets_invalidate_evidence_when_stored_configuration_is_invalid() {
+    for disconnect in [false, true] {
+        let sandbox_id = "endpoint-invalid-configuration";
+        let (state, _) = sandbox_with_accepted_endpoint_result(sandbox_id, false).await;
+        let before = stored_sandbox(&state, sandbox_id).await;
+        assert_eq!(
+            before.status.as_ref().unwrap().endpoint_statuses[0].last_result,
+            i32::from(EndpointResult::HttpResponseReceived)
+        );
+        let mut invalid_policy = mcp_policy_with_versions(&["2025-11-25"]);
+        invalid_policy
+            .network_policies
+            .get_mut("mcp")
+            .unwrap()
+            .endpoints[0]
+            .protocol = "rest".to_string();
+        state
+            .store
+            .put_policy_revision(
+                "invalid-policy",
+                sandbox_id,
+                "default",
+                2,
+                &invalid_policy.encode_to_vec(),
+                "invalid",
+            )
+            .await
+            .unwrap();
+        let error = active_endpoint_context(&state, &before)
+            .await
+            .err()
+            .expect("stored policy fails validation");
+        assert!(crate::grpc::policy::is_configuration_rejection(&error));
+        if disconnect {
+            state
+                .supervisor_sessions
+                .remove_if_current(sandbox_id, "session-a");
+            reset_endpoint_status_after_supervisor_disconnect(&state, sandbox_id)
+                .await
+                .expect("disconnect invalidates evidence without decoding invalid policy");
+        } else {
+            register_session(&state, sandbox_id, "session-b");
+            reset_endpoint_status_for_supervisor_session(&state, sandbox_id, "session-b")
+                .await
+                .expect("replacement invalidates evidence without decoding invalid policy");
+        }
+        let stored = stored_sandbox(&state, sandbox_id).await;
+        let endpoint = &stored.status.as_ref().unwrap().endpoint_statuses[0];
+        assert_eq!(
+            endpoint.endpoint_id,
+            before.status.as_ref().unwrap().endpoint_statuses[0].endpoint_id
+        );
+        assert_eq!(
+            endpoint.last_result,
+            i32::from(EndpointResult::NoObservedExchange)
+        );
+        assert!(endpoint.last_reported_time.is_none());
+        assert!(endpoint.last_failure.is_none());
+    }
+}
+
+#[tokio::test]
+async fn replacement_reset_timeout_invalidates_superseded_evidence() {
+    let sandbox_id = "endpoint-replacement-reset-timeout";
+    // Session A stays registered, so the replacement supersedes it before A's
+    // session loop could schedule a disconnect reset.
+    let (state, _report) = sandbox_with_accepted_endpoint_result(sandbox_id, true).await;
+    let hold = state
+        .compute
+        .sandbox_mutation_guard_by_id(sandbox_id)
+        .await
+        .expect("hold the sandbox mutation guard")
+        .expect("sandbox exists");
+    state
+        .compute
+        .set_mutation_lock_timeout_for_tests(std::time::Duration::from_millis(50));
+
+    let hello = SupervisorMessage {
+        payload: Some(supervisor_message::Payload::Hello(SupervisorHello {
+            sandbox_id: sandbox_id.to_string(),
+            instance_id: "instance-b".to_string(),
+            connection_epoch: 1,
+            supports_provider_readiness: false,
+            redirected: false,
+            supports_session_redirect: false,
+            supports_config_push: false,
+        })),
+    };
+    let error = gateway_client(Arc::clone(&state))
+        .await
+        .connect_supervisor(tokio_stream::iter([hello]))
+        .await
+        .expect_err("the replacement's endpoint reset times out on the held guard");
+    assert_eq!(error.code(), Code::Unavailable);
+    assert!(
+        state
+            .supervisor_sessions
+            .current_session_id(sandbox_id)
+            .is_none()
+    );
+    assert_eq!(
+        stored_sandbox(&state, sandbox_id)
+            .await
+            .status
+            .expect("sandbox status")
+            .endpoint_statuses[0]
+            .last_result,
+        EndpointResult::HttpResponseReceived as i32,
+        "nothing resets while the guard is held"
+    );
+
+    drop(hold);
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let status = stored_sandbox(&state, sandbox_id)
+                .await
+                .status
+                .expect("sandbox status");
+            if status.endpoint_statuses[0].last_result == EndpointResult::NoObservedExchange as i32
+            {
+                assert!(status.endpoint_statuses[0].last_reported_time.is_none());
+                assert_eq!(status.phase, SandboxPhase::Provisioning as i32);
+                assert!(status.conditions.iter().any(|condition| {
+                    condition.r#type == "Ready" && condition.status == "False"
+                }));
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the superseded session's evidence is reset once the guard is free");
+}
+
+#[tokio::test]
+async fn replacement_reset_retry_does_not_hold_gateway_shutdown() {
+    let sandbox_id = "endpoint-replacement-reset-retry";
+    let (state, _report) = sandbox_with_accepted_endpoint_result(sandbox_id, true).await;
+    // X(workspace) times out the reset and every retry of it, but not the
+    // demotion, which takes only S(global) X(sandbox).
+    let hold = crate::persistence::lock_order::branch(
+        state
+            .compute
+            .mutation_guard(MutationScope::Workspace("default")),
+    )
+    .await
+    .expect("hold the sandbox's workspace guard");
+    state
+        .compute
+        .set_mutation_lock_timeout_for_tests(std::time::Duration::from_millis(50));
+
+    let hello = SupervisorMessage {
+        payload: Some(supervisor_message::Payload::Hello(SupervisorHello {
+            sandbox_id: sandbox_id.to_string(),
+            instance_id: "instance-b".to_string(),
+            connection_epoch: 1,
+            supports_provider_readiness: false,
+            redirected: false,
+            supports_session_redirect: false,
+            supports_config_push: false,
+        })),
+    };
+    let error = gateway_client(Arc::clone(&state))
+        .await
+        .connect_supervisor(tokio_stream::iter([hello]))
+        .await
+        .expect_err("the replacement's endpoint reset times out on the held guard");
+    assert_eq!(error.code(), Code::Unavailable);
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let status = stored_sandbox(&state, sandbox_id)
+                .await
+                .status
+                .expect("sandbox status");
+            if status.phase == SandboxPhase::Provisioning as i32 {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the failed replacement demotes the sandbox");
+
+    // The retry is still timing out on the held guard. Shutdown waits for
+    // the demotion only.
+    let shutdown = state
+        .supervisor_sessions
+        .shutdown(std::time::Duration::from_millis(500))
+        .await;
+    assert!(
+        shutdown.is_ok(),
+        "the endpoint-status retry must not hold gateway shutdown: {shutdown:?}"
+    );
+    drop(hold);
+}
+
+#[tokio::test]
+async fn report_endpoint_status_is_session_bound_and_retry_idempotent() {
+    let state = test_server_state().await;
+    let sandbox_id = "endpoint-session";
+    let mut policy = mcp_policy_with_versions(&["2025-11-25"]);
+    let endpoints = &mut policy
+        .network_policies
+        .get_mut("mcp")
+        .expect("MCP rule")
+        .endpoints;
+    endpoints[0].path = "/mcp/observed/**".to_string();
+    let mut unobserved = endpoints[0].clone();
+    unobserved.path = "/mcp/unobserved/**".to_string();
+    endpoints.push(unobserved);
+    let mut sandbox = test_sandbox(sandbox_id, sandbox_id, policy, Vec::new());
+    sandbox.status = Some(SandboxStatus {
+        phase: SandboxPhase::Ready as i32,
+        conditions: vec![ready_condition()],
+        ..Default::default()
+    });
+    state
+        .store
+        .put_message(&sandbox)
+        .await
+        .expect("store sandbox");
+    let config = handle_get_sandbox_config(
+        &state,
+        with_sandbox(
+            Request::new(GetSandboxConfigRequest {
+                name: sandbox_id.to_string(),
+                workspace_scope: None,
+            }),
+            sandbox_id,
+        ),
+    )
+    .await
+    .expect("sandbox config")
+    .into_inner();
+    let endpoints = &config.policy.as_ref().expect("policy").network_policies["mcp"].endpoints;
+    let observed_id = endpoint_id(&endpoints[0]);
+    let unobserved_id = endpoint_id(&endpoints[1]);
+    assert_ne!(observed_id, unobserved_id);
+    let mut initial = endpoints
+        .iter()
+        .map(initial_endpoint_status)
+        .collect::<Vec<_>>();
+    initial.sort_by(|left, right| left.endpoint_id.cmp(&right.endpoint_id));
+
+    register_session(&state, sandbox_id, "session-a");
+    reset_endpoint_status_for_supervisor_session(&state, sandbox_id, "session-a")
+        .await
+        .expect("session reset");
+    assert!(
+        state
+            .supervisor_sessions
+            .initialize_endpoint_status_authority(sandbox_id, "session-a")
+    );
+    let initial_status = public_status(&state, sandbox_id).await;
+    assert_eq!(initial_status.endpoint_statuses, initial);
+    assert_eq!(initial_status.conditions, vec![ready_condition()]);
+
+    let report = ReportEndpointStatusRequest {
+        sandbox_id: sandbox_id.to_string(),
+        policy_hash: config.policy_hash,
+        provider_env_revision: config.provider_env_revision,
+        observations: vec![
+            EndpointObservation {
+                endpoint_id: observed_id.clone(),
+                result: EndpointResult::TransportFailed as i32,
+                failure: None,
+            },
+            EndpointObservation {
+                endpoint_id: unobserved_id,
+                result: EndpointResult::NoObservedExchange as i32,
+                failure: None,
+            },
+        ],
+        observed_endpoint_ids: vec![observed_id.clone()],
+        supervisor_session_id: "session-a".to_string(),
+        report_sequence: 1,
+        token_grant_status: None,
+    };
+    handle_report_endpoint_status(
+        &state,
+        with_sandbox(Request::new(report.clone()), sandbox_id),
+    )
+    .await
+    .expect("first report");
+    let first = stored_sandbox(&state, sandbox_id).await;
+    let public = public_status(&state, sandbox_id).await;
+    assert_eq!(public.phase, SandboxPhase::Ready as i32);
+    assert_eq!(public.conditions, vec![ready_condition()]);
+    let mut expected = initial.clone();
+    let observed = expected
+        .iter_mut()
+        .find(|endpoint| endpoint.endpoint_id == observed_id)
+        .expect("observed endpoint");
+    observed.last_result = EndpointResult::TransportFailed as i32;
+    observed.last_reported_time.clone_from(
+        &public
+            .endpoint_statuses
+            .iter()
+            .find(|endpoint| endpoint.endpoint_id == observed_id)
+            .expect("public endpoint")
+            .last_reported_time,
+    );
+    assert!(observed.last_reported_time.is_some());
+    assert_eq!(public.endpoint_statuses, expected);
+
+    handle_report_endpoint_status(
+        &state,
+        with_sandbox(Request::new(report.clone()), sandbox_id),
+    )
+    .await
+    .expect("identical retry");
+    assert_eq!(stored_sandbox(&state, sandbox_id).await, first);
+    let mut conflicting_retry = report.clone();
+    conflicting_retry.observations[0].result = EndpointResult::UpstreamRejected as i32;
+    let error = handle_report_endpoint_status(
+        &state,
+        with_sandbox(Request::new(conflicting_retry), sandbox_id),
+    )
+    .await
+    .expect_err("sequence body is immutable");
+    assert_eq!(error.code(), Code::InvalidArgument);
+
+    let mut newer = report.clone();
+    newer.report_sequence = 9;
+    newer.observations[0].result = EndpointResult::HttpResponseReceived as i32;
+    handle_report_endpoint_status(
+        &state,
+        with_sandbox(Request::new(newer.clone()), sandbox_id),
+    )
+    .await
+    .expect("new complete snapshot with a sequence gap");
+    let newest = stored_sandbox(&state, sandbox_id).await;
+    let recovered = public_status(&state, sandbox_id).await;
+    assert_eq!(recovered.phase, SandboxPhase::Ready as i32);
+    assert_eq!(recovered.conditions, vec![ready_condition()]);
+    assert_eq!(
+        recovered
+            .endpoint_statuses
+            .iter()
+            .find(|endpoint| endpoint.endpoint_id == observed_id)
+            .expect("recovered endpoint")
+            .last_result,
+        EndpointResult::HttpResponseReceived as i32
+    );
+    let error = handle_report_endpoint_status(
+        &state,
+        with_sandbox(Request::new(report.clone()), sandbox_id),
+    )
+    .await
+    .expect_err("older sequence rejected");
+    assert_eq!(error.code(), Code::FailedPrecondition);
+    handle_report_endpoint_status(&state, with_sandbox(Request::new(newer), sandbox_id))
+        .await
+        .expect("newest identical retry");
+    assert_eq!(stored_sandbox(&state, sandbox_id).await, newest);
+
+    assert!(
+        state
+            .supervisor_sessions
+            .remove_if_current(sandbox_id, "session-a")
+            .is_some()
+    );
+    reset_endpoint_status_after_supervisor_disconnect(&state, sandbox_id)
+        .await
+        .expect("disconnect reset");
+    let disconnected = public_status(&state, sandbox_id).await;
+    assert_eq!(disconnected.endpoint_statuses, initial);
+    assert_eq!(disconnected.conditions, vec![ready_condition()]);
+    register_session(&state, sandbox_id, "session-b");
+    reset_endpoint_status_for_supervisor_session(&state, sandbox_id, "session-b")
+        .await
+        .expect("replacement reset");
+    assert!(
+        state
+            .supervisor_sessions
+            .initialize_endpoint_status_authority(sandbox_id, "session-b")
+    );
+    let error =
+        handle_report_endpoint_status(&state, with_sandbox(Request::new(report), sandbox_id))
+            .await
+            .expect_err("superseded session rejected");
+    assert_eq!(error.code(), Code::PermissionDenied);
+    assert_eq!(
+        public_status(&state, sandbox_id).await.endpoint_statuses,
+        initial
+    );
+}
+
+#[tokio::test]
+async fn loaded_policy_and_unknown_endpoint_inventory_commit_atomically() {
+    let state = test_server_state().await;
+    let sandbox_id = "endpoint-policy-activation";
+    let mut old_policy = mcp_policy_with_versions(&["2025-11-25"]);
+    old_policy
+        .network_policies
+        .get_mut("mcp")
+        .expect("MCP policy")
+        .endpoints[0]
+        .host = "retired.example.com".to_string();
+    let initial_old = initial_endpoint_status(&old_policy.network_policies["mcp"].endpoints[0]);
+    let mut sandbox = test_sandbox(sandbox_id, sandbox_id, old_policy, Vec::new());
+    sandbox.status = Some(SandboxStatus {
+        current_policy_version: 0,
+        endpoint_statuses: vec![EndpointStatus {
+            last_result: EndpointResult::HttpResponseReceived as i32,
+            last_reported_time: Some(timestamp("2026-09-05T01:00:00.000Z")),
+            ..initial_old
+        }],
+        ..Default::default()
+    });
+    state
+        .store
+        .put_message(&sandbox)
+        .await
+        .expect("store sandbox");
+    let active_policy = mcp_policy_with_versions(&["2025-11-25"]);
+    let policy_hash = deterministic_policy_hash(&active_policy);
+    let initial_active =
+        initial_endpoint_status(&active_policy.network_policies["mcp"].endpoints[0]);
+    state
+        .store
+        .put_policy_revision(
+            "active-revision",
+            sandbox_id,
+            "default",
+            1,
+            &active_policy.encode_to_vec(),
+            &policy_hash,
+        )
+        .await
+        .expect("store active revision");
+    let mut pending_policy = active_policy;
+    pending_policy
+        .network_policies
+        .get_mut("mcp")
+        .expect("MCP policy")
+        .endpoints[0]
+        .host = "pending.example.com".to_string();
+    let initial_pending =
+        initial_endpoint_status(&pending_policy.network_policies["mcp"].endpoints[0]);
+    state
+        .store
+        .put_policy_revision(
+            "pending-revision",
+            sandbox_id,
+            "default",
+            2,
+            &pending_policy.encode_to_vec(),
+            &deterministic_policy_hash(&pending_policy),
+        )
+        .await
+        .expect("store pending revision");
+
+    handle_report_policy_status(
+        &state,
+        with_sandbox(
+            Request::new(ReportPolicyStatusRequest {
+                sandbox_id: sandbox_id.to_string(),
+                version: 1,
+                status: PolicyStatus::Loaded as i32,
+                load_error: String::new(),
+            }),
+            sandbox_id,
+        ),
+    )
+    .await
+    .expect("activate acknowledged policy");
+    let stored = stored_sandbox(&state, sandbox_id).await;
+    assert_eq!(stored.current_policy_version(), 1);
+    let context = active_endpoint_context(&state, &stored)
+        .await
+        .expect("active endpoint context");
+    assert_eq!(context.policy_hash, policy_hash);
+    assert_eq!(
+        context.endpoints.keys().cloned().collect::<Vec<_>>(),
+        vec![initial_active.endpoint_id.clone()]
+    );
+    let status = stored.status.expect("status");
+    assert_eq!(status.current_policy_version, 1);
+    assert_eq!(status.endpoint_statuses, vec![initial_active.clone()]);
+
+    register_session(&state, sandbox_id, "active-session");
+    reset_endpoint_status_for_supervisor_session(&state, sandbox_id, "active-session")
+        .await
+        .expect("reset active endpoints");
+    assert!(
+        state
+            .supervisor_sessions
+            .initialize_endpoint_status_authority(sandbox_id, "active-session")
+    );
+    assert_eq!(
+        stored_sandbox(&state, sandbox_id)
+            .await
+            .status
+            .expect("reset status")
+            .endpoint_statuses,
+        vec![initial_active.clone()]
+    );
+    handle_report_endpoint_status(
+        &state,
+        with_sandbox(
+            Request::new(ReportEndpointStatusRequest {
+                sandbox_id: sandbox_id.to_string(),
+                policy_hash: context.policy_hash,
+                provider_env_revision: context.provider_env_revision,
+                observations: vec![EndpointObservation {
+                    endpoint_id: initial_active.endpoint_id.clone(),
+                    result: EndpointResult::HttpResponseReceived as i32,
+                    failure: None,
+                }],
+                observed_endpoint_ids: vec![initial_active.endpoint_id.clone()],
+                supervisor_session_id: "active-session".to_string(),
+                report_sequence: 1,
+                token_grant_status: None,
+            }),
+            sandbox_id,
+        ),
+    )
+    .await
+    .expect("active revision accepts reports while next policy is pending");
+    let reported = stored_sandbox(&state, sandbox_id)
+        .await
+        .status
+        .expect("reported status");
+    assert_eq!(reported.endpoint_statuses.len(), 1);
+    let endpoint = &reported.endpoint_statuses[0];
+    assert!(endpoint.last_reported_time.is_some());
+    assert_eq!(
+        endpoint,
+        &EndpointStatus {
+            last_result: EndpointResult::HttpResponseReceived as i32,
+            last_reported_time: endpoint.last_reported_time,
+            ..initial_active
+        }
+    );
+
+    // Only a load acknowledgement advances the active version and endpoint
+    // inventory; storing a pending policy cannot change either.
+    handle_report_policy_status(
+        &state,
+        with_sandbox(
+            Request::new(ReportPolicyStatusRequest {
+                sandbox_id: sandbox_id.to_string(),
+                version: 2,
+                status: PolicyStatus::Loaded as i32,
+                load_error: String::new(),
+            }),
+            sandbox_id,
+        ),
+    )
+    .await
+    .expect("activate pending policy");
+    let replaced = stored_sandbox(&state, sandbox_id)
+        .await
+        .status
+        .expect("replacement status");
+    assert_eq!(replaced.current_policy_version, 2);
+    assert_eq!(replaced.endpoint_statuses, vec![initial_pending]);
+
+    let mut empty_policy = pending_policy;
+    empty_policy.network_policies.clear();
+    state
+        .store
+        .put_policy_revision(
+            "empty-revision",
+            sandbox_id,
+            "default",
+            3,
+            &empty_policy.encode_to_vec(),
+            &deterministic_policy_hash(&empty_policy),
+        )
+        .await
+        .expect("store empty inventory policy");
+    handle_report_policy_status(
+        &state,
+        with_sandbox(
+            Request::new(ReportPolicyStatusRequest {
+                sandbox_id: sandbox_id.to_string(),
+                version: 3,
+                status: PolicyStatus::Loaded as i32,
+                load_error: String::new(),
+            }),
+            sandbox_id,
+        ),
+    )
+    .await
+    .expect("activate empty inventory");
+    let cleared = stored_sandbox(&state, sandbox_id)
+        .await
+        .status
+        .expect("cleared status");
+    assert_eq!(cleared.current_policy_version, 3);
+    assert!(cleared.endpoint_statuses.is_empty());
+    assert_eq!(cleared.conditions, replaced.conditions);
+    assert_eq!(cleared.phase, replaced.phase);
+}
+
+#[tokio::test]
+async fn late_result_for_an_older_revision_keeps_the_newer_policy_active() {
+    let state = test_server_state().await;
+    let sandbox_id = "endpoint-late-policy-result";
+    let mut older_policy = mcp_policy_with_versions(&["2025-11-25"]);
+    older_policy
+        .network_policies
+        .get_mut("mcp")
+        .expect("MCP policy")
+        .endpoints[0]
+        .host = "older.example.com".to_string();
+    let mut newer_policy = older_policy.clone();
+    newer_policy
+        .network_policies
+        .get_mut("mcp")
+        .expect("MCP policy")
+        .endpoints[0]
+        .host = "newer.example.com".to_string();
+    let initial_newer = initial_endpoint_status(&newer_policy.network_policies["mcp"].endpoints[0]);
+    state
+        .store
+        .put_message(&test_sandbox(
+            sandbox_id,
+            sandbox_id,
+            older_policy.clone(),
+            Vec::new(),
+        ))
+        .await
+        .expect("store sandbox");
+    for (version, policy) in [(1, &older_policy), (2, &newer_policy)] {
+        state
+            .store
+            .put_policy_revision(
+                &format!("{sandbox_id}-v{version}"),
+                sandbox_id,
+                "default",
+                version,
+                &policy.encode_to_vec(),
+                &deterministic_policy_hash(policy),
+            )
+            .await
+            .expect("store policy revision");
+    }
+    acknowledge_loaded_policy(&state, sandbox_id, 1).await;
+    acknowledge_loaded_policy(&state, sandbox_id, 2).await;
+    let active = stored_sandbox(&state, sandbox_id)
+        .await
+        .status
+        .expect("active status");
+    assert_eq!(active.current_policy_version, 2);
+    assert_eq!(active.endpoint_statuses, vec![initial_newer]);
+
+    // The older revision's result arrives last, as one queued by a supervisor
+    // session that was replaced before the result was written.
+    acknowledge_loaded_policy(&state, sandbox_id, 1).await;
+
+    let after = stored_sandbox(&state, sandbox_id)
+        .await
+        .status
+        .expect("status after the late result");
+    assert_eq!(after.current_policy_version, 2);
+    assert_eq!(after.endpoint_statuses, active.endpoint_statuses);
+    for (version, status) in [(1, "superseded"), (2, "loaded")] {
+        let revision = state
+            .store
+            .get_policy_by_version(sandbox_id, version)
+            .await
+            .expect("load policy revision")
+            .expect("policy revision exists");
+        assert_eq!(revision.status, status, "policy revision {version}");
+    }
+}

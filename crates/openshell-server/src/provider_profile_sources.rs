@@ -5,29 +5,41 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
+use std::time::Duration;
 
+use arc_swap::ArcSwapOption;
 use async_trait::async_trait;
+use metrics::{counter, gauge};
 use openshell_core::GatewayProviderProfileSourceConfig;
 use openshell_core::mcp::normalize_provider_profile_mcp_fields;
-use openshell_core::proto::ProviderProfile;
+use openshell_core::policy_identity::canonical_rule_bytes;
+use openshell_core::proto::{NetworkPolicyRule, ProviderProfile};
 use openshell_gateway_interceptors::{
     GatewayInterceptorProfileSource, GatewayInterceptorRuntime,
     ProviderProfileSourceSnapshot as InterceptorProfileSnapshot,
 };
 use openshell_providers::{
-    ProfileValidationDiagnostic, ProviderTypeProfile, builtin_profiles, normalize_profile_id,
-    normalize_provider_type, validate_profile_set,
+    ProfileValidationDiagnostic, ProviderTypeProfile, normalize_profile_id, validate_profile_set,
 };
 use prost::Message as _;
 use sha2::{Digest, Sha256};
+use tokio::time::Instant;
 use tonic::Status;
-use tracing::debug;
+use tracing::{debug, warn};
 
+use crate::ServerState;
 use crate::persistence::{ObjectListQuery, ObjectType, Store};
 use crate::storage_proto::StoredProviderProfile;
 
-const BUILTIN_SOURCE_ID: &str = "builtin";
 const USER_SOURCE_ID: &str = "user";
+/// How often the gateway re-fetches interceptor provider-profile sources.
+/// Matches the supervisor configuration poll interval.
+pub const PROVIDER_PROFILE_SOURCE_REFRESH_INTERVAL: Duration = Duration::from_secs(10);
+
+/// A cached snapshot older than this many refresh intervals fails closed: a
+/// stale profile could keep injecting credentials for an endpoint its source
+/// has withdrawn.
+const CACHED_SNAPSHOT_MAX_AGE_INTERVALS: u32 = 3;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProfileScope {
@@ -64,44 +76,6 @@ pub trait ProviderProfileSource: Send + Sync + std::fmt::Debug {
         store: &Store,
         workspace: &str,
     ) -> Result<ProviderProfileSnapshot, Status>;
-}
-
-#[derive(Debug, Clone, Default)]
-struct BuiltinProviderProfileSource;
-
-#[async_trait]
-impl ProviderProfileSource for BuiltinProviderProfileSource {
-    fn source_id(&self) -> &str {
-        BUILTIN_SOURCE_ID
-    }
-
-    fn user_managed(&self) -> bool {
-        false
-    }
-
-    fn allow_empty(&self) -> bool {
-        false
-    }
-
-    async fn snapshot(
-        &self,
-        _store: &Store,
-        _workspace: &str,
-    ) -> Result<ProviderProfileSnapshot, Status> {
-        let proto_profiles: Vec<ProviderProfile> = builtin_profiles()
-            .iter()
-            .map(ProviderTypeProfile::to_proto)
-            .collect();
-        let revision = profile_snapshot_revision(&proto_profiles);
-        let profiles = proto_profiles
-            .into_iter()
-            .map(|profile| ScopedSnapshotProfile {
-                scope: ProfileScope::Static,
-                profile,
-            })
-            .collect();
-        Ok(ProviderProfileSnapshot { revision, profiles })
-    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -142,7 +116,7 @@ impl ProviderProfileSource for UserProviderProfileSource {
             if let Some(profile) = stored.profile {
                 let mut profile = profile_response_payload(profile, resource_version);
                 normalize_provider_profile_mcp_fields(&mut profile);
-                hasher.update(profile.encode_to_vec());
+                hasher.update(canonical_provider_profile_bytes(&profile));
                 profiles.push(ScopedSnapshotProfile {
                     scope: ProfileScope::Platform,
                     profile,
@@ -163,7 +137,7 @@ impl ProviderProfileSource for UserProviderProfileSource {
                 if let Some(profile) = stored.profile {
                     let mut profile = profile_response_payload(profile, resource_version);
                     normalize_provider_profile_mcp_fields(&mut profile);
-                    hasher.update(profile.encode_to_vec());
+                    hasher.update(canonical_provider_profile_bytes(&profile));
                     profiles.push(ScopedSnapshotProfile {
                         scope: ProfileScope::Workspace,
                         profile,
@@ -200,10 +174,14 @@ impl ProviderProfileSource for GatewayInterceptorProfileSource {
     ) -> Result<ProviderProfileSnapshot, Status> {
         let InterceptorProfileSnapshot { revision, profiles } =
             Self::snapshot(self).await.map_err(|err| {
-                Status::unavailable(format!(
-                    "provider profile source '{}' snapshot failed: {err}",
-                    self.source_id()
-                ))
+                openshell_core::rpc_error::unavailable(
+                    "PROFILE_SOURCE_UNAVAILABLE",
+                    format!(
+                        "provider profile source '{}' snapshot failed: {err}",
+                        self.source_id()
+                    ),
+                    Duration::from_secs(1),
+                )
             })?;
         let profiles = profiles
             .into_iter()
@@ -216,9 +194,98 @@ impl ProviderProfileSource for GatewayInterceptorProfileSource {
     }
 }
 
+/// A source served from a snapshot that a background task refreshes, so
+/// configuration builds and polls do not call the source on every read.
+#[derive(Debug)]
+struct CachedProviderProfileSource {
+    inner: Arc<dyn ProviderProfileSource>,
+    cached: ArcSwapOption<CachedSnapshot>,
+    max_age: Duration,
+}
+
+#[derive(Debug)]
+struct CachedSnapshot {
+    snapshot: ProviderProfileSnapshot,
+    fetched_at: Instant,
+}
+
+impl CachedProviderProfileSource {
+    fn new(inner: Arc<dyn ProviderProfileSource>, refresh_interval: Duration) -> Self {
+        Self {
+            inner,
+            cached: ArcSwapOption::empty(),
+            max_age: refresh_interval.saturating_mul(CACHED_SNAPSHOT_MAX_AGE_INTERVALS),
+        }
+    }
+
+    /// Fetch a new snapshot. Returns whether its revision differs from the
+    /// cached one; a failure keeps serving the cached snapshot until it ages
+    /// out.
+    async fn refresh(&self, store: &Store) -> Result<bool, Status> {
+        let snapshot = self.inner.snapshot(store, "").await?;
+        let changed = self
+            .cached
+            .load()
+            .as_ref()
+            .is_none_or(|cached| cached.snapshot.revision != snapshot.revision);
+        self.cached.store(Some(Arc::new(CachedSnapshot {
+            snapshot,
+            fetched_at: Instant::now(),
+        })));
+        Ok(changed)
+    }
+
+    fn age(&self) -> Option<Duration> {
+        self.cached
+            .load()
+            .as_ref()
+            .map(|cached| cached.fetched_at.elapsed())
+    }
+}
+
+#[async_trait]
+impl ProviderProfileSource for CachedProviderProfileSource {
+    fn source_id(&self) -> &str {
+        self.inner.source_id()
+    }
+
+    fn user_managed(&self) -> bool {
+        self.inner.user_managed()
+    }
+
+    fn allow_empty(&self) -> bool {
+        self.inner.allow_empty()
+    }
+
+    async fn snapshot(
+        &self,
+        _store: &Store,
+        _workspace: &str,
+    ) -> Result<ProviderProfileSnapshot, Status> {
+        let cached = self.cached.load();
+        let Some(cached) = cached
+            .as_ref()
+            .filter(|cached| cached.fetched_at.elapsed() <= self.max_age)
+        else {
+            return Err(openshell_core::rpc_error::unavailable(
+                "PROFILE_SOURCE_UNAVAILABLE",
+                format!(
+                    "provider profile source '{}' has no current snapshot",
+                    self.source_id()
+                ),
+                Duration::from_secs(1),
+            ));
+        };
+        Ok(cached.snapshot.clone())
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct ProviderProfileSources {
     sources: Vec<Arc<dyn ProviderProfileSource>>,
+    /// Sources served from a refreshed snapshot, also present in `sources`.
+    cached: Vec<Arc<CachedProviderProfileSource>>,
+    refresh_interval: Duration,
 }
 
 #[derive(Debug, Clone)]
@@ -244,7 +311,6 @@ struct ScopedProfileEntry {
 struct EffectiveProfileEntry {
     effective: ScopedProfileEntry,
     platform_fallback: Option<ScopedProfileEntry>,
-    static_fallback: Option<ScopedProfileEntry>,
 }
 
 #[derive(Debug, Clone)]
@@ -255,18 +321,29 @@ pub struct EffectiveProviderProfileCatalog {
 }
 
 impl ProviderProfileSources {
+    /// The gateway default: user-managed profiles only.
+    ///
+    /// A gateway with nothing imported serves an empty catalog, which is a
+    /// valid state, not a startup failure.
     pub fn with_default_sources() -> Self {
+        Self::uncached(vec![Arc::new(UserProviderProfileSource)])
+    }
+
+    fn uncached(sources: Vec<Arc<dyn ProviderProfileSource>>) -> Self {
         Self {
-            sources: vec![
-                Arc::new(BuiltinProviderProfileSource),
-                Arc::new(UserProviderProfileSource),
-            ],
+            sources,
+            cached: Vec::new(),
+            refresh_interval: Duration::ZERO,
         }
     }
 
+    /// With a `refresh_interval`, interceptor sources are served from a
+    /// snapshot that [`spawn_refresh`] refreshes at that interval. Without
+    /// one, every read calls the interceptor.
     pub fn from_config(
         configured: &[GatewayProviderProfileSourceConfig],
         runtime: Option<&GatewayInterceptorRuntime>,
+        refresh_interval: Option<Duration>,
     ) -> Result<Self, String> {
         if configured.is_empty() {
             return Err("provider_profile_sources must contain at least one source".to_string());
@@ -274,11 +351,9 @@ impl ProviderProfileSources {
 
         let mut source_ids = BTreeSet::new();
         let mut sources: Vec<Arc<dyn ProviderProfileSource>> = Vec::with_capacity(configured.len());
+        let mut cached = Vec::new();
         for source in configured {
             let source: Arc<dyn ProviderProfileSource> = match source {
-                GatewayProviderProfileSourceConfig::Builtin => {
-                    Arc::new(BuiltinProviderProfileSource)
-                }
                 GatewayProviderProfileSourceConfig::User => Arc::new(UserProviderProfileSource),
                 GatewayProviderProfileSourceConfig::Interceptor { name } => {
                     if name.trim().is_empty() {
@@ -292,7 +367,18 @@ impl ProviderProfileSources {
                                 "provider profile source interceptor '{name}' is not configured or does not advertise provider_profiles"
                             )
                         })?;
-                    Arc::new(source)
+                    let source: Arc<dyn ProviderProfileSource> = Arc::new(source);
+                    match refresh_interval {
+                        Some(refresh_interval) => {
+                            let source = Arc::new(CachedProviderProfileSource::new(
+                                source,
+                                refresh_interval,
+                            ));
+                            cached.push(Arc::clone(&source));
+                            source
+                        }
+                        None => source,
+                    }
                 }
             };
             let source_id = source.source_id().to_string();
@@ -303,7 +389,40 @@ impl ProviderProfileSources {
             }
             sources.push(source);
         }
-        Ok(Self { sources })
+        Ok(Self {
+            sources,
+            cached,
+            refresh_interval: refresh_interval.unwrap_or_default(),
+        })
+    }
+
+    /// Refresh every cached source. Returns whether any revision changed.
+    pub(crate) async fn refresh_cached(&self, store: &Store) -> bool {
+        if self.cached.is_empty() {
+            return false;
+        }
+        let mut changed = false;
+        let mut oldest = Duration::ZERO;
+        for source in &self.cached {
+            match source.refresh(store).await {
+                Ok(source_changed) => {
+                    changed |= source_changed;
+                    record_refresh("ok");
+                }
+                Err(error) => {
+                    record_refresh("failed");
+                    warn!(
+                        source_id = source.source_id(),
+                        error = error.message(),
+                        "provider profile source refresh failed"
+                    );
+                }
+            }
+            oldest = oldest.max(source.age().unwrap_or(Duration::MAX));
+        }
+        gauge!("openshell_server_provider_profile_source_snapshot_age_seconds")
+            .set(oldest.as_secs_f64());
+        changed
     }
 
     pub fn source_ids(&self) -> Vec<&str> {
@@ -323,14 +442,24 @@ impl ProviderProfileSources {
                 profile,
             })
             .collect();
-        Self {
-            sources: vec![Arc::new(StaticProviderProfileSource {
-                snapshot: ProviderProfileSnapshot {
-                    revision,
-                    profiles: scoped,
-                },
-            })],
-        }
+        Self::uncached(vec![Arc::new(StaticProviderProfileSource {
+            snapshot: ProviderProfileSnapshot {
+                revision,
+                profiles: scoped,
+            },
+        })])
+    }
+
+    /// A source-managed catalog composed with the user-managed source.
+    ///
+    /// Models the shape an operator gets from an interceptor-vended catalog:
+    /// the interceptor's profiles are read-only through the profile APIs, while
+    /// imported profiles beside them are not.
+    #[cfg(test)]
+    pub(crate) fn from_test_profiles_with_user_source(profiles: Vec<ProviderProfile>) -> Self {
+        let mut sources = Self::from_test_profiles(profiles).sources;
+        sources.push(Arc::new(UserProviderProfileSource));
+        Self::uncached(sources)
     }
 
     #[cfg(test)]
@@ -342,24 +471,22 @@ impl ProviderProfileSources {
             !snapshots.is_empty(),
             "test snapshot sequence must not be empty"
         );
-        Self {
-            sources: vec![Arc::new(SequencedProviderProfileSource {
-                snapshots: snapshots
-                    .into_iter()
-                    .map(|(revision, profiles)| ProviderProfileSnapshot {
-                        revision,
-                        profiles: profiles
-                            .into_iter()
-                            .map(|profile| ScopedSnapshotProfile {
-                                scope: ProfileScope::Static,
-                                profile,
-                            })
-                            .collect(),
-                    })
-                    .collect(),
-                fetch_count,
-            })],
-        }
+        Self::uncached(vec![Arc::new(SequencedProviderProfileSource {
+            snapshots: snapshots
+                .into_iter()
+                .map(|(revision, profiles)| ProviderProfileSnapshot {
+                    revision,
+                    profiles: profiles
+                        .into_iter()
+                        .map(|profile| ScopedSnapshotProfile {
+                            scope: ProfileScope::Static,
+                            profile,
+                        })
+                        .collect(),
+                })
+                .collect(),
+            fetch_count,
+        })])
     }
 
     pub(crate) async fn snapshot_catalog(
@@ -398,6 +525,41 @@ impl ProviderProfileSources {
     }
 }
 
+fn record_refresh(outcome: &'static str) {
+    counter!(
+        "openshell_server_provider_profile_source_refreshes_total",
+        "outcome" => outcome,
+    )
+    .increment(1);
+}
+
+/// Keep cached provider profile sources fresh, and push a changed catalog to
+/// this replica's supervisor sessions. Every replica runs its own refresh, so
+/// none notifies its peers. The first refresh runs before the gateway serves,
+/// in `run_server`.
+pub fn spawn_refresh(state: Arc<ServerState>) {
+    let sources = &state.provider_profile_sources;
+    if sources.cached.is_empty() {
+        return;
+    }
+    let interval = sources.refresh_interval;
+    tokio::spawn(async move {
+        let mut timer = tokio::time::interval(interval);
+        timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        timer.tick().await;
+        loop {
+            timer.tick().await;
+            if state
+                .provider_profile_sources
+                .refresh_cached(&state.store)
+                .await
+            {
+                crate::config_delivery::publish_all_local(&state);
+            }
+        }
+    });
+}
+
 impl EffectiveProviderProfileCatalog {
     pub(crate) fn revision(&self) -> &str {
         &self.revision
@@ -420,9 +582,6 @@ impl EffectiveProviderProfileCatalog {
         for entry in self.profiles.values() {
             result.push((entry.effective.scope, entry.effective.response.clone()));
             if let Some(fallback) = &entry.platform_fallback {
-                result.push((fallback.scope, fallback.response.clone()));
-            }
-            if let Some(fallback) = &entry.static_fallback {
                 result.push((fallback.scope, fallback.response.clone()));
             }
         }
@@ -454,23 +613,12 @@ impl EffectiveProviderProfileCatalog {
             .map(|entry| entry.profile.clone())
     }
 
+    /// Resolve a profile by its exact normalized ID.
+    ///
+    /// Profiles are import-only, so a provider type names a profile the
+    /// operator imported. There is no alias fallback: an unimported ID is
+    /// absent, not a hint toward some other profile.
     fn scoped_type_profile_for_scope(
-        &self,
-        id: &str,
-        profile_workspace: &str,
-    ) -> Option<&ScopedProfileEntry> {
-        if let Some(entry) = self.exact_scoped_type_profile_for_scope(id, profile_workspace) {
-            return Some(entry);
-        }
-
-        let alias = normalize_provider_type(id)?;
-        if normalize_profile_id(id).as_deref() == Some(alias) {
-            return None;
-        }
-        self.exact_scoped_type_profile_for_scope(alias, profile_workspace)
-    }
-
-    fn exact_scoped_type_profile_for_scope(
         &self,
         id: &str,
         profile_workspace: &str,
@@ -486,25 +634,23 @@ impl EffectiveProviderProfileCatalog {
             match &entry.platform_fallback {
                 Some(fallback) => Some(fallback),
                 None if entry.effective.scope == ProfileScope::Platform => Some(&entry.effective),
-                None => entry.static_fallback.as_ref(),
+                None => None,
             }
         } else {
             Some(&entry.effective)
         }
     }
 
+    /// The non-user source that manages this profile, if any.
+    ///
+    /// Profiles are import-only, so the only read-only profiles left are the
+    /// ones a configured interceptor vends.
     pub(crate) fn static_source_for_profile(&self, id: &str) -> Option<String> {
         let id = normalize_profile_id(id)?;
         self.profiles
             .get(&id)
-            .and_then(|entry| {
-                if entry.effective.user_managed {
-                    entry.static_fallback.as_ref()
-                } else {
-                    Some(&entry.effective)
-                }
-            })
-            .map(|entry| entry.source_id.clone())
+            .filter(|entry| !entry.effective.user_managed)
+            .map(|entry| entry.effective.source_id.clone())
     }
 
     pub(crate) fn hash_type_profile_revision_for_scope(
@@ -538,7 +684,38 @@ fn hash_scoped_profile_revision(entry: &ScopedProfileEntry, hasher: &mut Sha256)
         b"source-managed"
     };
     hasher.update(ownership_tag);
-    hasher.update(entry.response.encode_to_vec());
+    hasher.update(canonical_provider_profile_bytes(&entry.response));
+}
+
+/// Keep profile revision inputs stable across protobuf map iteration orders.
+fn canonical_provider_profile_bytes(profile: &ProviderProfile) -> Vec<u8> {
+    let mut map_free = profile.clone();
+    map_free.annotations.clear();
+    map_free.endpoints.clear();
+
+    let mut out = Vec::new();
+    append_canonical_bytes(&mut out, &map_free.encode_to_vec());
+    let mut annotations = profile.annotations.iter().collect::<Vec<_>>();
+    annotations.sort_by_key(|(key, _)| key.as_str());
+    out.extend_from_slice(&(annotations.len() as u64).to_le_bytes());
+    for (key, value) in annotations {
+        append_canonical_bytes(&mut out, key.as_bytes());
+        append_canonical_bytes(&mut out, value.as_bytes());
+    }
+    out.extend_from_slice(&(profile.endpoints.len() as u64).to_le_bytes());
+    for endpoint in &profile.endpoints {
+        let rule = NetworkPolicyRule {
+            endpoints: vec![endpoint.clone()],
+            ..Default::default()
+        };
+        append_canonical_bytes(&mut out, &canonical_rule_bytes(&rule));
+    }
+    out
+}
+
+fn append_canonical_bytes(out: &mut Vec<u8>, bytes: &[u8]) {
+    out.extend_from_slice(&(bytes.len() as u64).to_le_bytes());
+    out.extend_from_slice(bytes);
 }
 
 fn scope_to_string(scope: ProfileScope) -> &'static str {
@@ -665,19 +842,9 @@ fn build_effective_profiles(
                 let new_scope = new_entry.scope;
 
                 match (existing_scope, new_scope) {
-                    (ProfileScope::Static, _)
-                        if existing.effective.source_id == BUILTIN_SOURCE_ID
-                            && new_entry.user_managed =>
-                    {
-                        let fallback = std::mem::replace(&mut existing.effective, new_entry);
-                        existing.static_fallback = Some(fallback);
-                    }
-                    (_, ProfileScope::Static)
-                        if new_entry.source_id == BUILTIN_SOURCE_ID
-                            && existing.effective.user_managed =>
-                    {
-                        existing.static_fallback = Some(new_entry);
-                    }
+                    // A source-managed profile never yields to an imported one:
+                    // a collision between a vended catalog and a stored profile
+                    // is a configuration error, not an override.
                     (ProfileScope::Static, _) | (_, ProfileScope::Static) => {
                         let location = if existing.effective.source_id == source_id {
                             format!("within source '{source_id}'")
@@ -711,7 +878,6 @@ fn build_effective_profiles(
                     EffectiveProfileEntry {
                         effective: new_entry,
                         platform_fallback: None,
-                        static_fallback: None,
                     },
                 );
             }
@@ -753,6 +919,7 @@ fn format_diagnostic(diagnostic: ProfileValidationDiagnostic) -> String {
     }
 }
 
+#[cfg(test)]
 fn profile_snapshot_revision(profiles: &[ProviderProfile]) -> String {
     let mut profiles = profiles.to_vec();
     profiles
@@ -762,7 +929,7 @@ fn profile_snapshot_revision(profiles: &[ProviderProfile]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(b"openshell-provider-profile-snapshot-v1");
     for profile in profiles {
-        hasher.update(profile.encode_to_vec());
+        hasher.update(canonical_provider_profile_bytes(&profile));
     }
     format!("sha256:{:x}", hasher.finalize())
 }
@@ -776,12 +943,12 @@ pub fn stored_provider_profile(profile: ProviderProfile) -> StoredProviderProfil
         metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
             id: uuid::Uuid::new_v4().to_string(),
             name: profile.id.clone(),
-            created_at_ms: now_ms,
+            created_time: openshell_core::time::timestamp_from_millis(now_ms).ok(),
             labels: std::collections::HashMap::new(),
             resource_version: 0,
             annotations: std::collections::HashMap::new(),
             workspace: String::new(),
-            deletion_timestamp_ms: 0,
+            deletion_time: None,
         }),
         profile: Some(profile),
     }
@@ -903,6 +1070,12 @@ mod tests {
             Ok(Response::new(InterceptorManifest {
                 name: "mock-profile-source".to_string(),
                 provider_profiles: self.advertises_profiles,
+                extension: Some(openshell_core::extension_protocol::extension_metadata(
+                    openshell_core::extension_protocol::ExtensionFamily::GatewayInterceptor,
+                    "openshell/mock-profile-source",
+                    "test",
+                    [],
+                )),
                 ..InterceptorManifest::default()
             }))
         }
@@ -956,11 +1129,7 @@ mod tests {
     }
 
     fn profile(id: &str) -> ProviderProfile {
-        let mut profile = builtin_profiles()
-            .iter()
-            .find(|profile| profile.id == "github")
-            .expect("github built-in profile")
-            .clone();
+        let mut profile = openshell_providers::example_profiles::load("github");
         profile.id = id.to_string();
         profile.display_name = id.to_string();
         profile.to_proto()
@@ -1166,6 +1335,7 @@ mod tests {
             Arc::clone(&fetch_count),
         );
         let store = crate::persistence::test_store().await;
+        sources.refresh_cached(&store).await;
 
         let first = sources.snapshot_catalog(&store, "default").await.unwrap();
         assert_eq!(fetch_count.load(Ordering::SeqCst), 1);
@@ -1287,23 +1457,79 @@ mod tests {
         assert!(err.message().contains("duplicate provider profile id"));
     }
 
-    #[test]
-    fn configured_local_sources_preserve_order() {
+    #[tokio::test]
+    async fn configured_sources_preserve_order() {
+        let (runtime, task) = interceptor_runtime(
+            ProtoProviderProfileSnapshot {
+                revision: "external".to_string(),
+                profiles: vec![profile("governed-github")],
+            },
+            true,
+        )
+        .await;
         let sources = ProviderProfileSources::from_config(
             &[
+                GatewayProviderProfileSourceConfig::Interceptor {
+                    name: "governance".to_string(),
+                },
                 GatewayProviderProfileSourceConfig::User,
-                GatewayProviderProfileSourceConfig::Builtin,
             ],
-            None,
+            Some(&runtime),
+            Some(Duration::from_secs(10)),
         )
         .unwrap();
 
-        assert_eq!(sources.source_ids(), vec!["user", "builtin"]);
+        assert_eq!(sources.source_ids(), vec!["interceptor/governance", "user"]);
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn interceptor_sources_are_cached_only_with_a_refresh_interval() {
+        let (runtime, task) = interceptor_runtime(
+            ProtoProviderProfileSnapshot {
+                revision: "external".to_string(),
+                profiles: vec![profile("governed-github")],
+            },
+            true,
+        )
+        .await;
+        let store = crate::persistence::test_store().await;
+        let configured = [GatewayProviderProfileSourceConfig::Interceptor {
+            name: "governance".to_string(),
+        }];
+
+        // A cached source fails closed until its first refresh, so a read
+        // that succeeds without one went to the interceptor.
+        let uncached =
+            ProviderProfileSources::from_config(&configured, Some(&runtime), None).unwrap();
+        assert!(uncached.cached.is_empty());
+        uncached
+            .snapshot_catalog(&store, "default")
+            .await
+            .expect("an uncached interceptor source is read on request");
+
+        let cached = ProviderProfileSources::from_config(
+            &configured,
+            Some(&runtime),
+            Some(Duration::from_secs(10)),
+        )
+        .unwrap();
+        assert_eq!(cached.cached.len(), 1);
+        assert_eq!(
+            cached
+                .snapshot_catalog(&store, "default")
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::Unavailable
+        );
+        task.abort();
     }
 
     #[test]
     fn configured_sources_must_not_be_empty() {
-        let err = ProviderProfileSources::from_config(&[], None).unwrap_err();
+        let err = ProviderProfileSources::from_config(&[], None, Some(Duration::from_secs(10)))
+            .unwrap_err();
         assert!(err.contains("at least one source"));
     }
 
@@ -1311,13 +1537,14 @@ mod tests {
     fn configured_sources_must_be_unique() {
         let err = ProviderProfileSources::from_config(
             &[
-                GatewayProviderProfileSourceConfig::Builtin,
-                GatewayProviderProfileSourceConfig::Builtin,
+                GatewayProviderProfileSourceConfig::User,
+                GatewayProviderProfileSourceConfig::User,
             ],
             None,
+            Some(Duration::from_secs(10)),
         )
         .unwrap_err();
-        assert!(err.contains("duplicate provider profile source 'builtin'"));
+        assert!(err.contains("duplicate provider profile source 'user'"));
     }
 
     #[test]
@@ -1327,6 +1554,7 @@ mod tests {
                 name: "governance".to_string(),
             }],
             None,
+            Some(Duration::from_secs(10)),
         )
         .unwrap_err();
         assert!(err.contains("not configured or does not advertise provider_profiles"));
@@ -1392,9 +1620,11 @@ mod tests {
                 name: "governance".to_string(),
             }],
             Some(&runtime),
+            Some(Duration::from_secs(10)),
         )
         .unwrap();
         let store = crate::persistence::test_store().await;
+        sources.refresh_cached(&store).await;
 
         let profiles = sources
             .snapshot_catalog(&store, "default")
@@ -1428,9 +1658,11 @@ mod tests {
                 name: "governance".to_string(),
             }],
             Some(&runtime),
+            Some(Duration::from_secs(10)),
         )
         .unwrap();
         let store = crate::persistence::test_store().await;
+        sources.refresh_cached(&store).await;
 
         let err = sources
             .snapshot_catalog(&store, "default")
@@ -1455,9 +1687,11 @@ mod tests {
                 name: "governance".to_string(),
             }],
             Some(&runtime),
+            Some(Duration::from_secs(10)),
         )
         .unwrap();
         let store = crate::persistence::test_store().await;
+        sources.refresh_cached(&store).await;
 
         let err = sources
             .snapshot_catalog(&store, "default")
@@ -1479,15 +1713,21 @@ mod tests {
         .await;
         let sources = ProviderProfileSources::from_config(
             &[
-                GatewayProviderProfileSourceConfig::Builtin,
+                GatewayProviderProfileSourceConfig::User,
                 GatewayProviderProfileSourceConfig::Interceptor {
                     name: "governance".to_string(),
                 },
             ],
             Some(&runtime),
+            Some(Duration::from_secs(10)),
         )
         .unwrap();
         let store = crate::persistence::test_store().await;
+        sources.refresh_cached(&store).await;
+        store
+            .put_message(&stored_provider_profile(profile("github")))
+            .await
+            .unwrap();
 
         let profiles = sources
             .snapshot_catalog(&store, "default")
@@ -1515,15 +1755,21 @@ mod tests {
         .await;
         let sources = ProviderProfileSources::from_config(
             &[
-                GatewayProviderProfileSourceConfig::Builtin,
+                GatewayProviderProfileSourceConfig::User,
                 GatewayProviderProfileSourceConfig::Interceptor {
                     name: "governance".to_string(),
                 },
             ],
             Some(&runtime),
+            Some(Duration::from_secs(10)),
         )
         .unwrap();
         let store = crate::persistence::test_store().await;
+        sources.refresh_cached(&store).await;
+        store
+            .put_message(&stored_provider_profile(profile("github")))
+            .await
+            .unwrap();
 
         let err = sources
             .snapshot_catalog(&store, "default")
@@ -1551,9 +1797,11 @@ mod tests {
                 name: "governance".to_string(),
             }],
             Some(&runtime),
+            Some(Duration::from_secs(10)),
         )
         .unwrap();
         let store = crate::persistence::test_store().await;
+        sources.refresh_cached(&store).await;
 
         let err = sources
             .snapshot_catalog(&store, "default")
@@ -1575,15 +1823,21 @@ mod tests {
         .await;
         let sources = ProviderProfileSources::from_config(
             &[
-                GatewayProviderProfileSourceConfig::Builtin,
+                GatewayProviderProfileSourceConfig::User,
                 GatewayProviderProfileSourceConfig::Interceptor {
                     name: "governance".to_string(),
                 },
             ],
             Some(&runtime),
+            Some(Duration::from_secs(10)),
         )
         .unwrap();
         let store = crate::persistence::test_store().await;
+        sources.refresh_cached(&store).await;
+        store
+            .put_message(&stored_provider_profile(profile("github")))
+            .await
+            .unwrap();
 
         let err = sources
             .snapshot_catalog(&store, "default")
@@ -1602,6 +1856,7 @@ mod tests {
                 name: "governance".to_string(),
             }],
             Some(&runtime),
+            Some(Duration::from_secs(10)),
         )
         .unwrap_err();
 
@@ -1634,15 +1889,72 @@ mod tests {
             metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                 id: uuid::Uuid::new_v4().to_string(),
                 name: proto.id.clone(),
-                created_at_ms: now_ms,
+                created_time: openshell_core::time::timestamp_from_millis(now_ms).ok(),
                 labels: std::collections::HashMap::new(),
                 resource_version: 0,
                 annotations: std::collections::HashMap::new(),
                 workspace: workspace.to_string(),
-                deletion_timestamp_ms: 0,
+                deletion_time: None,
             }),
             profile: Some(proto),
         }
+    }
+
+    #[tokio::test]
+    async fn unchanged_annotated_profile_has_stable_revisions() {
+        use std::collections::HashSet;
+
+        let store = crate::persistence::test_store().await;
+        let mut stored = stored_profile_in_workspace("annotated-api", "default");
+        stored.profile.as_mut().unwrap().annotations = (0..8)
+            .map(|index| (format!("key-{index}"), format!("value-{index}")))
+            .collect();
+        store.put_message(&stored).await.unwrap();
+
+        let sources = ProviderProfileSources::with_default_sources();
+        let mut source_revisions = HashSet::new();
+        let mut profile_revisions = HashSet::new();
+        for _ in 0..32 {
+            let catalog = sources.snapshot_catalog(&store, "default").await.unwrap();
+            source_revisions.insert(catalog.revision().to_string());
+            let mut hasher = Sha256::new();
+            catalog.hash_type_profile_revision_for_scope("annotated-api", "default", &mut hasher);
+            profile_revisions.insert(hasher.finalize().to_vec());
+        }
+
+        assert_eq!(source_revisions.len(), 1);
+        assert_eq!(profile_revisions.len(), 1);
+    }
+
+    #[test]
+    fn canonical_profile_bytes_sort_nested_endpoint_maps() {
+        use openshell_core::proto::GraphqlOperation;
+
+        let mut first = profile("mapped-endpoint");
+        let endpoint = first.endpoints.first_mut().unwrap();
+        endpoint.graphql_persisted_queries = (0..8)
+            .map(|index| (format!("query-{index}"), GraphqlOperation::default()))
+            .collect();
+        let mut second = first.clone();
+        second.endpoints[0].graphql_persisted_queries = (0..8)
+            .rev()
+            .map(|index| (format!("query-{index}"), GraphqlOperation::default()))
+            .collect();
+
+        assert_eq!(
+            canonical_provider_profile_bytes(&first),
+            canonical_provider_profile_bytes(&second)
+        );
+        assert!(
+            second.endpoints[0]
+                .graphql_persisted_queries
+                .remove("query-0")
+                .is_some()
+        );
+        assert_ne!(
+            canonical_provider_profile_bytes(&first),
+            canonical_provider_profile_bytes(&second)
+        );
     }
 
     #[tokio::test]
@@ -1792,46 +2104,32 @@ mod tests {
     }
 
     #[test]
-    fn user_managed_profiles_shadow_new_builtins_in_scope() {
-        let catalog = build_effective_profiles(vec![
+    fn a_source_managed_profile_is_never_shadowed_by_an_imported_one() {
+        // Provider profiles are import-only, so an ID a non-user source vends
+        // is not a default an import may quietly displace. The collision is a
+        // configuration error and the imported profile does not win.
+        let err = build_effective_profiles(vec![
             CollectedProviderProfileSnapshot {
-                source_id: "builtin".to_string(),
+                source_id: "interceptor/gov".to_string(),
                 revision: "v1".to_string(),
-                profiles: vec![
-                    scoped(ProfileScope::Static, "openai"),
-                    scoped(ProfileScope::Static, "anthropic"),
-                ],
+                profiles: vec![scoped(ProfileScope::Static, "openai")],
                 user_managed: false,
                 allow_empty: false,
             },
             CollectedProviderProfileSnapshot {
                 source_id: "user".to_string(),
                 revision: "v1".to_string(),
-                profiles: vec![
-                    scoped(ProfileScope::Platform, "openai"),
-                    scoped(ProfileScope::Workspace, "anthropic"),
-                ],
+                profiles: vec![scoped(ProfileScope::Platform, "openai")],
                 user_managed: true,
                 allow_empty: true,
             },
         ])
-        .unwrap();
+        .unwrap_err();
 
-        let openai = catalog
-            .get_type_profile_for_scope("openai", "default")
-            .expect("platform override");
-        assert_eq!(openai.source, "user");
-        let anthropic = catalog
-            .get_type_profile_for_scope("anthropic", "default")
-            .expect("workspace override");
-        assert_eq!(anthropic.source, "user");
-        let platform_anthropic = catalog
-            .get_type_profile_for_scope("anthropic", "")
-            .expect("built-in fallback outside workspace scope");
-        assert_eq!(platform_anthropic.source, "builtin");
-        assert_eq!(
-            catalog.static_source_for_profile("openai").as_deref(),
-            Some("builtin")
+        assert!(
+            err.message().contains("duplicate provider profile id"),
+            "{}",
+            err.message()
         );
     }
 
@@ -2162,5 +2460,110 @@ mod tests {
             .expect("custom profile reusing unloaded default ID");
         assert_eq!(resolved.id, "github");
         assert_eq!(resolved.display_name, "Private GitHub");
+    }
+
+    /// Serves `revision` until `fail` is set.
+    #[derive(Debug, Default)]
+    struct SwitchableSource {
+        revision: std::sync::Mutex<String>,
+        fail: std::sync::atomic::AtomicBool,
+        fetches: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl ProviderProfileSource for SwitchableSource {
+        fn source_id(&self) -> &'static str {
+            "switchable"
+        }
+
+        fn user_managed(&self) -> bool {
+            false
+        }
+
+        fn allow_empty(&self) -> bool {
+            false
+        }
+
+        async fn snapshot(
+            &self,
+            _store: &Store,
+            _workspace: &str,
+        ) -> Result<ProviderProfileSnapshot, Status> {
+            self.fetches.fetch_add(1, Ordering::SeqCst);
+            if self.fail.load(Ordering::SeqCst) {
+                return Err(Status::unavailable("source down"));
+            }
+            Ok(ProviderProfileSnapshot {
+                revision: self.revision.lock().unwrap().clone(),
+                profiles: vec![ScopedSnapshotProfile {
+                    scope: ProfileScope::Static,
+                    profile: profile("github"),
+                }],
+            })
+        }
+    }
+
+    fn cached_source(inner: &Arc<SwitchableSource>) -> CachedProviderProfileSource {
+        *inner.revision.lock().unwrap() = "r1".to_string();
+        CachedProviderProfileSource::new(
+            Arc::<SwitchableSource>::clone(inner),
+            Duration::from_secs(10),
+        )
+    }
+
+    #[tokio::test]
+    async fn cached_source_fails_closed_before_its_first_refresh() {
+        let store = crate::persistence::test_store().await;
+        let inner = Arc::new(SwitchableSource::default());
+        let cached = cached_source(&inner);
+
+        let error = cached.snapshot(&store, "default").await.unwrap_err();
+        assert_eq!(error.code(), tonic::Code::Unavailable);
+        assert_eq!(inner.fetches.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn cached_source_reads_do_not_fetch_and_refresh_reports_revision_changes() {
+        let store = crate::persistence::test_store().await;
+        let inner = Arc::new(SwitchableSource::default());
+        let cached = cached_source(&inner);
+
+        assert!(cached.refresh(&store).await.unwrap(), "first snapshot");
+        for _ in 0..3 {
+            assert_eq!(
+                cached.snapshot(&store, "default").await.unwrap().revision,
+                "r1"
+            );
+        }
+        assert_eq!(inner.fetches.load(Ordering::SeqCst), 1);
+
+        assert!(!cached.refresh(&store).await.unwrap(), "unchanged revision");
+        *inner.revision.lock().unwrap() = "r2".to_string();
+        assert!(cached.refresh(&store).await.unwrap(), "changed revision");
+        assert_eq!(
+            cached.snapshot(&store, "default").await.unwrap().revision,
+            "r2"
+        );
+    }
+
+    #[tokio::test]
+    async fn cached_source_serves_a_failed_refresh_until_the_snapshot_ages_out() {
+        let store = crate::persistence::test_store().await;
+        let inner = Arc::new(SwitchableSource::default());
+        let cached = cached_source(&inner);
+        tokio::time::pause();
+        cached.refresh(&store).await.unwrap();
+        inner.fail.store(true, Ordering::SeqCst);
+
+        tokio::time::advance(Duration::from_secs(20)).await;
+        assert!(cached.refresh(&store).await.is_err());
+        assert_eq!(
+            cached.snapshot(&store, "default").await.unwrap().revision,
+            "r1"
+        );
+
+        tokio::time::advance(Duration::from_secs(11)).await;
+        let error = cached.snapshot(&store, "default").await.unwrap_err();
+        assert_eq!(error.code(), tonic::Code::Unavailable);
     }
 }

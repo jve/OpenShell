@@ -68,7 +68,7 @@ Create a sandbox with a Python image:
     sandbox, err := client.Sandboxes().Create(ctx, "default", "my-sandbox", &v1.SandboxSpec{
         Template: &v1.SandboxTemplate{Image: "python:3.12"},
         Environment: map[string]string{"LANG": "en_US.UTF-8"},
-    }, nil)
+    })
     if err != nil {
         log.Fatal(err)
     }
@@ -107,11 +107,11 @@ For long-running commands, use `Stream` to receive output incrementally, or `Int
 Delete the sandbox when you are done:
 
 ```go
-    err = client.Sandboxes().Delete(ctx, "default", sandbox.Name)
+    deletion, err := client.Sandboxes().Delete(ctx, "default", sandbox.Name)
     if err != nil {
         log.Fatal(err)
     }
-    fmt.Println("Sandbox deleted")
+    fmt.Printf("Deletion outcome: %v\n", deletion.Outcome)
 }
 ```
 

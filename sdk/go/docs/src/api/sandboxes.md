@@ -7,7 +7,7 @@ wait for readiness, watch state changes, and retrieve logs.
 
 ## Create
 
-Creates a new sandbox with the given name, spec, and labels.
+Creates a new sandbox with the given name and spec.
 
 ```go
 sb, err := client.Sandboxes().Create(ctx, "default", "my-sandbox", &v1.SandboxSpec{
@@ -15,10 +15,17 @@ sb, err := client.Sandboxes().Create(ctx, "default", "my-sandbox", &v1.SandboxSp
         Image: "nvcr.io/nvidia/openshell:latest",
     },
     Providers: []string{"openai"},
-}, map[string]string{
+}, v1.WithLabels(map[string]string{
     "team": "platform",
-})
+}), v1.WithServiceExposures(v1.ServiceExposure{TargetPort: 8080}))
+fmt.Println(sb.ServiceURLs[""])
 ```
+
+Create-time service exposures register loopback HTTP endpoints with the
+sandbox. Leave `Service` empty for the unnamed endpoint or set it to create a
+named endpoint. Routing begins when the sandbox is ready.
+`ServiceURLs` returns the routed URLs keyed by service name; the empty key is
+the unnamed endpoint.
 
 Set `GPU: true` to request the active driver's default GPU assignment. Set
 `GPUCount` when the sandbox needs a specific GPU count; a non-nil `GPUCount`
@@ -40,7 +47,7 @@ sb, err := client.CreateSandboxFromTemplate(ctx,
         Providers: []string{"openai"},
         Policy:    policy,
     },
-    map[string]string{"team": "platform"},
+    v1.WithLabels(map[string]string{"team": "platform"}),
 )
 ```
 
@@ -54,6 +61,51 @@ Retrieves a sandbox by name.
 sb, err := client.Sandboxes().Get(ctx, "default", "my-sandbox")
 fmt.Println(sb.Status.Phase) // "Ready", "Provisioning", etc.
 ```
+
+### Tool server connections
+
+`sb.Status.EndpointStatuses` shows each configured tool server endpoint and its last accepted network result in one record. A sandbox can be `Ready` while a tool server connection fails; endpoint results do not change lifecycle readiness. OpenShell currently observes endpoints configured for MCP over HTTP.
+
+```go
+for _, endpoint := range sb.Status.EndpointStatuses {
+    fmt.Printf("%s:%v%s: %s, reported %s\n",
+        endpoint.Host, endpoint.Ports, endpoint.Path,
+        endpoint.LastResult, endpoint.LastReportedAt)
+}
+```
+
+`LastResult` is a typed `v1.EndpointResult`. For example, `v1.EndpointTransportFailed` means the transport failed before an HTTP response arrived. `v1.EndpointHTTPResponseReceived` means the server returned an HTTP status below 400; its body can still contain a tool error. Neither result establishes current availability.
+
+OpenShell observes real traffic passively and does not expire idle observations. Keep `LastReportedAt` visible when displaying a result: it records when the gateway accepted the observation, not when the request happened. Retained evidence can be accepted after a reset. `v1.EndpointNoObservedExchange` has an empty timestamp and retains the configured address, so the endpoint remains identifiable before traffic is observed or after evidence is invalidated.
+
+`LastFailure` explains a `v1.EndpointCredentialUnavailable` result when the supervisor classified the cause, and is `nil` otherwise. Each later observation replaces or clears it. `Code` and `Stage` come from closed sets, `Provider` and `CredentialKey` name the configured credential, and no field carries remote text. `RequestID` matches the `x-openshell-request-id` header the workload received, so you can correlate the refused request.
+
+```go
+for _, endpoint := range sb.Status.EndpointStatuses {
+    if f := endpoint.LastFailure; f != nil && f.Domain == v1.EndpointFailureDomainTokenGrant {
+        fmt.Printf("%s/%s: %s at %s (request %s)\n",
+            f.Provider, f.CredentialKey, f.Code, f.Stage, f.RequestID)
+        if f.RecoveryAction == v1.RefreshRecoveryActionReauthorize {
+            // Ask the user to replace the provider's OAuth grant.
+        }
+    }
+}
+```
+
+### Token grant failures
+
+`sb.Status.LastTokenGrantFailure` gives the latest classified grant refusal for any destination, including REST requests without an MCP inventory entry. It carries `DestinationHost`, `DestinationPort`, and the same bounded `EndpointFailure` as endpoint status.
+
+```go
+if observation := sb.Status.LastTokenGrantFailure; observation != nil && observation.Failure != nil {
+    f := observation.Failure
+    fmt.Printf("%s (port %d): %s, recovery %s, request %s\n",
+        observation.DestinationHost, observation.DestinationPort,
+        f.Code, f.RecoveryAction, f.RequestID)
+}
+```
+
+Check `RequestID` against the refused response before acting: a newer failure can replace this record. A successful grant for the same destination, provider, and credential clears it; a failure before credential selection clears on the next successful grant to that destination. Policy, provider, and supervisor-session resets also clear it. `nil` means no retained cause. This is one latest observation, not a request history or a server health check.
 
 ## List
 
@@ -85,8 +137,15 @@ allSandboxes, err := client.Sandboxes().ListAll(ctx, "", v1.ListOptions{
 Deletes a sandbox by name.
 
 ```go
-err := client.Sandboxes().Delete(ctx, "default", "my-sandbox")
+deletion, err := client.Sandboxes().Delete(ctx, "default", "my-sandbox", v1.DeleteOptions{AllowMissing: true})
 ```
+
+Missing targets return `NotFound` unless `AllowMissing` is true. Inspect
+`deletion.Outcome`: `DeletionAccepted` means cleanup is pending, while
+`DeletionCompleted` and `DeletionAlreadyAbsent` establish logical completion.
+Unknown values do not establish completion. `deletion.SandboxID` identifies the
+original sandbox; do not confuse a same-name replacement with that target.
+Allowing absence does not make a retry safe if names can be reused.
 
 ## AttachProvider
 

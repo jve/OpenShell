@@ -56,14 +56,61 @@ pub fn validate_required_fields(event: &Value, schema: &Value) {
         _ => return,
     };
 
+    if let Some(fields) = schema
+        .get("constraints")
+        .and_then(|constraints| constraints.get("at_least_one"))
+        .and_then(Value::as_array)
+    {
+        assert!(
+            fields
+                .iter()
+                .filter_map(Value::as_str)
+                .any(|field| { event.get(field).is_some_and(|value| !value.is_null()) }),
+            "Missing at_least_one field from {fields:?}"
+        );
+    }
+
     for (name, def) in &attrs {
         let is_required = def.get("requirement").and_then(|r| r.as_str()) == Some("required");
         let is_profile_field = def.get("profile").is_some() || def.get("profiles").is_some();
         if is_required && !is_profile_field {
             assert!(
-                event.get(name).is_some(),
+                event.get(name).is_some_and(|value| !value.is_null()),
                 "Missing required field '{name}' in OCSF event. Event keys: {:?}",
                 event.as_object().map(|o| o.keys().collect::<Vec<_>>())
+            );
+        }
+    }
+}
+
+/// Validate that every attribute in the event is defined by the schema and,
+/// for event classes, that profile attributes belong to a profile the event
+/// declares in `metadata.profiles` (none when absent).
+pub fn validate_known_fields(event: &Value, schema: &Value) {
+    let Some(attrs) = schema.get("attributes").and_then(Value::as_object) else {
+        return;
+    };
+    let declared: Option<Vec<&str>> = schema.get("uid").map(|_| {
+        event
+            .pointer("/metadata/profiles")
+            .and_then(Value::as_array)
+            .map(|profiles| profiles.iter().filter_map(Value::as_str).collect())
+            .unwrap_or_default()
+    });
+    let schema_name = schema["name"].as_str().unwrap_or_default();
+    for name in event.as_object().into_iter().flat_map(|o| o.keys()) {
+        let Some(def) = attrs.get(name) else {
+            panic!("Field '{name}' is not defined by the '{schema_name}' schema");
+        };
+        if let (Some(declared), Some(profiles)) =
+            (&declared, def.get("profiles").and_then(Value::as_array))
+        {
+            assert!(
+                profiles
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .any(|profile| declared.contains(&profile)),
+                "Field '{name}' requires one of the profiles {profiles:?}, declared {declared:?}"
             );
         }
     }
@@ -93,6 +140,67 @@ mod tests {
     use super::*;
 
     #[test]
+    fn network_and_http_require_at_least_one_non_null_field() {
+        for (class, fields) in [
+            ("network_activity", ["src_endpoint", "dst_endpoint"]),
+            ("http_activity", ["http_request", "http_response"]),
+        ] {
+            let schema = load_class_schema(class);
+            let mut event = serde_json::json!({
+                "class_uid": schema["uid"], "severity_id": 1, "metadata": {},
+                "time": 12345, "type_uid": 0, "activity_id": 0, "category_uid": 4
+            });
+            assert!(
+                std::panic::catch_unwind(|| validate_required_fields(&event, &schema)).is_err()
+            );
+            for field in fields {
+                event[field] = Value::Null;
+                assert!(
+                    std::panic::catch_unwind(|| validate_required_fields(&event, &schema)).is_err()
+                );
+                event[field] = serde_json::json!({});
+                validate_required_fields(&event, &schema);
+                event.as_object_mut().unwrap().remove(field);
+            }
+        }
+    }
+
+    #[test]
+    fn known_fields_rejects_attributes_outside_the_schema() {
+        let schema = load_class_schema("base_event");
+        let mut event = serde_json::json!({"class_uid": 0, "severity_id": 1});
+        validate_known_fields(&event, &schema);
+
+        event["is_src_dst_assignment_known"] = Value::Bool(true);
+        assert!(std::panic::catch_unwind(|| validate_known_fields(&event, &schema)).is_err());
+    }
+
+    #[test]
+    fn known_fields_rejects_attributes_of_undeclared_profiles() {
+        let schema = load_class_schema("authentication");
+        let mut event = serde_json::json!({
+            "class_uid": 3002,
+            "metadata": {"profiles": ["host"]},
+            "device": {}
+        });
+        validate_known_fields(&event, &schema);
+
+        event["api"] = serde_json::json!({"operation": "Op"});
+        assert!(std::panic::catch_unwind(|| validate_known_fields(&event, &schema)).is_err());
+    }
+
+    #[test]
+    fn known_fields_treats_missing_profile_declarations_as_none() {
+        let schema = load_class_schema("authentication");
+        let event = serde_json::json!({
+            "class_uid": 3002,
+            "metadata": {},
+            "api": {"operation": "Op"}
+        });
+        assert!(std::panic::catch_unwind(|| validate_known_fields(&event, &schema)).is_err());
+    }
+
+    #[test]
     fn test_load_class_schemas() {
         // These tests only pass when the vendored schemas are present
         let classes = [
@@ -103,6 +211,8 @@ mod tests {
             "detection_finding",
             "application_lifecycle",
             "device_config_state_change",
+            "api_activity",
+            "authentication",
             "base_event",
         ];
 

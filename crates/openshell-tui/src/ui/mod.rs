@@ -26,7 +26,7 @@ use crate::theme::Theme;
 pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
     // Splash screen is a full-screen takeover — no chrome.
     if app.screen == Screen::Splash {
-        splash::draw(frame, frame.size(), &app.theme);
+        splash::draw(frame, frame.area(), &app.theme);
         return;
     }
 
@@ -38,7 +38,7 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
             Constraint::Length(1), // nav bar
             Constraint::Length(1), // command bar
         ])
-        .split(frame.size());
+        .split(frame.area());
 
     draw_title_bar(frame, app, chunks[0]);
 
@@ -53,16 +53,16 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
 
     // Modal overlays (drawn last so they're on top).
     if app.create_form.is_some() {
-        create_sandbox::draw(frame, app, frame.size());
+        create_sandbox::draw(frame, app, frame.area());
     }
     if app.create_provider_form.is_some() {
-        create_provider::draw(frame, app, frame.size());
+        create_provider::draw(frame, app, frame.area());
     }
     if app.provider_detail.is_some() {
-        create_provider::draw_detail(frame, app, frame.size());
+        create_provider::draw_detail(frame, app, frame.area());
     }
     if app.update_provider_form.is_some() {
-        create_provider::draw_update(frame, app, frame.size());
+        create_provider::draw_update(frame, app, frame.area());
     }
 }
 
@@ -74,8 +74,8 @@ fn draw_sandbox_screen(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(sandbox_detail::required_height(app)), // metadata
-            Constraint::Min(0),                                       // policy or logs
+            Constraint::Length(sandbox_detail::required_height(app, area.width)), // metadata
+            Constraint::Min(0),                                                   // policy or logs
         ])
         .split(area);
 
@@ -96,7 +96,7 @@ fn draw_sandbox_screen(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
     {
         let filtered: Vec<&app::LogLine> = app.filtered_log_lines();
         if let Some(log) = filtered.get(detail_idx) {
-            sandbox_logs::draw_detail_popup(frame, log, frame.size(), &app.theme);
+            sandbox_logs::draw_detail_popup(frame, log, frame.area(), &app.theme);
         }
     }
 
@@ -105,7 +105,7 @@ fn draw_sandbox_screen(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
         let abs = app.draft_scroll + app.draft_selected;
         let scroll = app.draft_detail_scroll;
         let metrics = app.draft_chunks.get(abs).map(|chunk| {
-            sandbox_draft::draw_detail_popup(frame, chunk, frame.size(), &app.theme, scroll)
+            sandbox_draft::draw_detail_popup(frame, chunk, frame.area(), &app.theme, scroll)
         });
         if let Some(metrics) = metrics {
             app.draft_detail_rows = metrics.total_rows;
@@ -118,7 +118,7 @@ fn draw_sandbox_screen(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
         sandbox_draft::draw_approve_all_popup(
             frame,
             &app.approve_all_confirm_chunks,
-            frame.size(),
+            frame.area(),
             &app.theme,
         );
     }
@@ -701,7 +701,7 @@ mod tests {
         let mut terminal = Terminal::new(TestBackend::new(180, 1)).unwrap();
 
         terminal
-            .draw(|frame| draw_nav_bar(frame, &app, frame.size()))
+            .draw(|frame| draw_nav_bar(frame, &app, frame.area()))
             .unwrap();
 
         let text: String = terminal
@@ -725,17 +725,66 @@ mod tests {
             .draw(|frame| {
                 frame.render_widget(
                     Paragraph::new(Line::from(title_bar_brand_spans(&Theme::dark()))),
-                    frame.size(),
+                    frame.area(),
                 );
             })
             .unwrap();
 
         let buffer = terminal.backend().buffer();
         let rendered = (0..width)
-            .map(|x| buffer.get(x, 0).symbol())
+            .map(|x| buffer[(x, 0)].symbol())
             .collect::<String>();
         assert_eq!(rendered, expected);
         assert!(!rendered.contains("ALPHA"));
+    }
+
+    #[tokio::test]
+    async fn configuration_notes_fit_dashboard_and_wrap_in_detail() {
+        let mut app = test_app();
+        app.sandbox_names = vec!["quarantined".into()];
+        app.sandbox_count = 1;
+        app.sandbox_notes = vec!["Invalid config".into()];
+        let diagnostic = "Invalid config: credentialed endpoint api.example.com:443 requires L7 inspection before the sandbox workload can start safely";
+        app.sandbox_detail_notes = vec![diagnostic.into()];
+        for width in [80, 100, 120] {
+            for all_workspaces in [false, true] {
+                app.all_workspaces = all_workspaces;
+                let mut terminal = Terminal::new(TestBackend::new(width, 24)).unwrap();
+                terminal
+                    .draw(|frame| {
+                        sandboxes::draw(frame, &app, frame.area(), true);
+                    })
+                    .unwrap();
+                let text: String = terminal
+                    .backend()
+                    .buffer()
+                    .content()
+                    .iter()
+                    .map(ratatui::buffer::Cell::symbol)
+                    .collect();
+                assert!(
+                    text.contains("Invalid config"),
+                    "dashboard at {width}: {text}"
+                );
+                assert!(!text.contains("credentialed endpoint"));
+            }
+            app.screen = Screen::Sandbox;
+            let mut terminal = Terminal::new(TestBackend::new(width, 24)).unwrap();
+            terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+            let text: String = terminal
+                .backend()
+                .buffer()
+                .content()
+                .iter()
+                .map(ratatui::buffer::Cell::symbol)
+                .collect();
+            let words = text
+                .replace('│', " ")
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ");
+            assert!(words.contains(diagnostic), "detail at {width}: {words}");
+        }
     }
 
     #[tokio::test]

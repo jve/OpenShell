@@ -1,46 +1,59 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Gateway-minted per-sandbox JWTs.
+//! Gateway-minted session and extension JWTs.
 //!
-//! The gateway signs an Ed25519 JWT for each sandbox at create time and
-//! the sandbox supervisor presents it as `Authorization: Bearer <jwt>` on
-//! supervisor-to-gateway gRPC calls. This module implements both sides of the
-//! gateway-controlled token:
-//! - [`SandboxJwtIssuer`] mints fresh tokens (called from
-//!   `handle_create_sandbox` and the `IssueSandboxToken` RPC).
-//! - [`SandboxJwtAuthenticator`] validates tokens on inbound requests and
-//!   produces a [`Principal::Sandbox`] with [`SandboxIdentitySource::BootstrapJwt`].
+//! [`SandboxSessionJwtAuthority`] mints and verifies generation-bound sandbox
+//! session tokens, and with the same key the shared supervisor's token for
+//! the private assignment stream (its own `typ` and claims, see
+//! [`super::supervisor_token`]). [`ExtensionJwtIssuer`] mints explicitly
+//! typed credentials for supervisor middleware and gateway interceptors and
+//! publishes the corresponding JWKS metadata.
 //!
 //! Algorithm: `EdDSA` (Ed25519). Pinned via `Validation::algorithms` to
 //! prevent algorithm-confusion attacks.
 
-use super::authenticator::Authenticator;
+use super::authenticator::{AuthFailureReason, AuthMechanism};
+use super::authenticator::{AuthRejection, Authentication, Authenticator, bearer_credential};
 use super::principal::{Principal, SandboxIdentitySource, SandboxPrincipal};
 use async_trait::async_trait;
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
-use jsonwebtoken::{
-    Algorithm, DecodingKey, EncodingKey, Header, Validation, decode, decode_header, encode,
-};
+use jsonwebtoken::{Algorithm, EncodingKey, Header, decode_header};
+use openshell_crypto::jwt::encode;
 pub use openshell_extension_core::{
     EXTENSION_JWT_TYP, ExtensionAudience, ExtensionCallerKind, ExtensionJwtClaims,
     MAX_EXTENSION_TOKEN_TTL,
 };
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
+use sha2::{Digest as _, Sha256};
 use std::{
     io::Cursor,
+    sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use tonic::Status;
-use tracing::{debug, warn};
+use tracing::warn;
 use x509_parser::{oid_registry::OID_SIG_ED25519, prelude::FromDer, x509::SubjectPublicKeyInfo};
+
+use openshell_core::SandboxSessionId;
+use openshell_core::jwt::{
+    AuthenticatedSandboxSession, AuthenticatedSupervisor, CredentialEpoch,
+    GATEWAY_SESSION_JWT_TYPE, MintedSessionToken, SandboxId, SandboxLaunchAuthentication,
+    SandboxRuntimeIdentity, SessionJwtError, SessionJwtIssuer, SessionJwtVerifier,
+    SessionTokenProfile, SessionVerificationKey, SupervisorAuthBundle, SupervisorJwtVerifier,
+    SystemJwtClock,
+};
+use openshell_core::sandbox_generation::SandboxGenerationId;
+
+/// The method on which a sandbox renews its gateway JWT, and the only one that
+/// accepts a just-consumed bearer.
+pub const REFRESH_SANDBOX_TOKEN_PATH: &str = "/openshell.v1.OpenShell/RefreshSandboxToken";
 
 /// SPIFFE-shaped subject prefix. Embedded in the `sub` claim of every
 /// minted token so a future migration to per-sandbox certs or SPIRE can
 /// reuse the same subject namespace without breaking handler equality
 /// checks.
 const SPIFFE_SUBJECT_PREFIX: &str = "spiffe://openshell/sandbox/";
-const SANDBOX_JWT_EXP_LEEWAY_SECS: i64 = 60;
 
 /// Public JSON Web Key Set served by the gateway.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -60,39 +73,22 @@ pub struct GatewayJwk {
     pub x: String,
 }
 
-/// JWT claim set serialized in every gateway-minted sandbox token.
-#[derive(Debug, Serialize, Deserialize)]
-pub struct SandboxJwtClaims {
-    /// `spiffe://openshell/sandbox/<uuid>`. SPIFFE-shaped for forward
-    /// compatibility with channel-bound identity (per-sandbox cert / SPIRE).
-    pub sub: String,
-    /// Gateway identity (`openshell-gateway:<gateway_id>`). Both `iss` and
-    /// `aud` use the same value so any future replicas of the same
-    /// deployment validate each others' tokens without configuration.
-    pub iss: String,
-    pub aud: String,
-    pub iat: i64,
-    pub exp: i64,
-    /// Canonical sandbox UUID, denormalized from `sub` for cheap parsing
-    /// without a SPIFFE library.
-    pub sandbox_id: String,
-}
-
-/// Mints fresh sandbox JWTs.
-pub struct SandboxJwtIssuer {
+/// Mints typed extension JWTs and publishes their verification metadata.
+pub struct ExtensionJwtIssuer {
     encoding_key: EncodingKey,
     kid: String,
     issuer: String,
-    audience: String,
-    ttl: Option<Duration>,
+    gateway_audience: String,
+    ttl: Duration,
+    jwks: GatewayJwks,
 }
 
-impl std::fmt::Debug for SandboxJwtIssuer {
+impl std::fmt::Debug for ExtensionJwtIssuer {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("SandboxJwtIssuer")
+        f.debug_struct("ExtensionJwtIssuer")
             .field("kid", &self.kid)
             .field("issuer", &self.issuer)
-            .field("audience", &self.audience)
+            .field("gateway_audience", &self.gateway_audience)
             .field("ttl", &self.ttl)
             .finish_non_exhaustive()
     }
@@ -105,57 +101,316 @@ pub struct MintedToken {
     pub expires_at_ms: i64,
 }
 
-impl SandboxJwtIssuer {
+/// Issuer and verifier for launch-scoped supervisor credentials.
+pub struct SandboxSessionJwtAuthority {
+    issuer: SessionJwtIssuer,
+    gateway_verifier: SessionJwtVerifier,
+    supervisor_verifier: SupervisorJwtVerifier,
+    gateway_id: String,
+    verification_keys: Vec<SessionVerificationKey>,
+}
+
+impl std::fmt::Debug for SandboxSessionJwtAuthority {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("SandboxSessionJwtAuthority")
+            .field("gateway_id", &self.gateway_id)
+            .field(
+                "verification_key_ids",
+                &self
+                    .verification_keys
+                    .iter()
+                    .map(|key| key.key_id.as_str())
+                    .collect::<Vec<_>>(),
+            )
+            .finish_non_exhaustive()
+    }
+}
+
+impl SandboxSessionJwtAuthority {
     pub fn from_pem(
         signing_key_pem: &[u8],
-        kid: String,
+        public_key_pem: &[u8],
+        key_id: String,
         gateway_id: &str,
         ttl: Option<Duration>,
     ) -> Result<Self, String> {
+        let clock = Arc::new(SystemJwtClock);
+        let issuer = SessionJwtIssuer::from_ed25519_pem(
+            signing_key_pem,
+            key_id.clone(),
+            gateway_id,
+            ttl,
+            clock.clone(),
+        )
+        .map_err(|error| error.to_string())?;
+        let verification_keys = vec![SessionVerificationKey {
+            key_id,
+            public_key_pem: public_key_pem.to_vec(),
+        }];
+        let gateway_verifier = SessionJwtVerifier::new(
+            gateway_id,
+            SessionTokenProfile::Gateway,
+            verification_keys.clone(),
+            clock.clone(),
+        )
+        .map_err(|error| error.to_string())?;
+        let supervisor_verifier =
+            SupervisorJwtVerifier::new(gateway_id, verification_keys.clone(), clock)
+                .map_err(|error| error.to_string())?;
+        Ok(Self {
+            issuer,
+            gateway_verifier,
+            supervisor_verifier,
+            gateway_id: gateway_id.to_string(),
+            verification_keys,
+        })
+    }
+
+    #[allow(clippy::result_large_err)]
+    pub fn mint_persisted_launch(
+        &self,
+        sandbox_id: &str,
+        identity: &crate::auth::sandbox_session::PersistedSandboxIdentity,
+    ) -> Result<SandboxLaunchAuthentication, Status> {
+        let token_metadata = identity
+            .refresh_replay
+            .as_ref()
+            .map(|replay| replay.sandbox_token_id().map(|id| (id, replay.issued_at)))
+            .transpose()
+            .map_err(|error| Status::internal(error.to_string()))?;
+        self.mint_launch_with_metadata(
+            sandbox_id,
+            identity.runtime_generation.clone(),
+            identity.auth_epoch,
+            identity.gateway_token_id,
+            token_metadata,
+        )
+    }
+
+    #[allow(clippy::result_large_err)]
+    pub fn mint_launch(
+        &self,
+        sandbox_id: &str,
+        runtime_generation: SandboxGenerationId,
+        auth_epoch: CredentialEpoch,
+        gateway_token_id: uuid::Uuid,
+    ) -> Result<SandboxLaunchAuthentication, Status> {
+        self.mint_launch_with_metadata(
+            sandbox_id,
+            runtime_generation,
+            auth_epoch,
+            gateway_token_id,
+            None,
+        )
+    }
+
+    #[allow(clippy::result_large_err)]
+    fn mint_launch_with_metadata(
+        &self,
+        sandbox_id: &str,
+        runtime_generation: SandboxGenerationId,
+        auth_epoch: CredentialEpoch,
+        gateway_token_id: uuid::Uuid,
+        token_metadata: Option<(uuid::Uuid, i64)>,
+    ) -> Result<SandboxLaunchAuthentication, Status> {
+        // Derive the session from durable launch identity, not token IDs or
+        // minting time. Retries and credential renewal retain this session;
+        // a fresh generation gets a different one without new stored metadata.
+        let mut digest = Sha256::new();
+        digest.update(b"openshell-launch-session-v1\0");
+        digest.update(sandbox_id.as_bytes());
+        digest.update(b"\0");
+        digest.update(runtime_generation.as_str().as_bytes());
+        let mut session_bytes = [0_u8; 16];
+        session_bytes.copy_from_slice(&digest.finalize()[..16]);
+        let session_id = uuid::Uuid::from_bytes(session_bytes)
+            .to_string()
+            .parse::<SandboxSessionId>()
+            .map_err(|_| Status::internal("invalid derived sandbox session identity"))?;
+        let identity = SandboxRuntimeIdentity {
+            sandbox_id: SandboxId::parse(sandbox_id)
+                .map_err(|_| Status::invalid_argument("sandbox ID is invalid"))?,
+            runtime_generation: runtime_generation.clone(),
+            auth_epoch,
+        };
+        let pair = token_metadata
+            .map_or_else(
+                || {
+                    self.issuer
+                        .mint_pair_with_gateway_token_id(&identity, gateway_token_id)
+                },
+                |(sandbox_token_id, issued_at)| {
+                    self.issuer.mint_pair_with_token_metadata(
+                        &identity,
+                        gateway_token_id,
+                        sandbox_token_id,
+                        issued_at,
+                    )
+                },
+            )
+            .map_err(|error| {
+                warn!(%error, "failed to mint launch-scoped sandbox credentials");
+                Status::internal("failed to mint sandbox launch credentials")
+            })?;
+        Ok(SandboxLaunchAuthentication {
+            supervisor: SupervisorAuthBundle {
+                session_id,
+                runtime_generation,
+                session_rotation: openshell_core::jwt::SessionRotation::new(1)
+                    .map_err(|error| Status::internal(error.to_string()))?,
+                auth_epoch: pair.auth_epoch,
+                gateway_token: pair.gateway.token,
+                gateway_expires_at: pair.gateway.expires_at,
+                sandbox_token: pair.sandbox.token,
+                sandbox_expires_at: pair.sandbox.expires_at,
+                ssh_host_private_key: None,
+                ocsf_otlp_headers: None,
+            },
+            gateway_id: self.gateway_id.clone(),
+            verification_keys: self.verification_keys.clone(),
+        })
+    }
+
+    pub fn verify_gateway_token(
+        &self,
+        token: &str,
+    ) -> Result<AuthenticatedSandboxSession, AuthRejection> {
+        self.gateway_verifier.verify(token).map_err(|error| {
+            AuthRejection::new(
+                AuthMechanism::SandboxJwt,
+                session_failure_reason(&error),
+                Status::unauthenticated(format!("invalid gateway session: {error}")),
+            )
+        })
+    }
+
+    /// Mint the shared supervisor's token for the assignment stream. Its
+    /// lifetime is bounded on its own; the session lifetime may be
+    /// non-expiring.
+    pub fn mint_supervisor_token(
+        &self,
+        ttl: Duration,
+    ) -> Result<MintedSessionToken, SessionJwtError> {
+        self.issuer.mint_supervisor_token(ttl)
+    }
+
+    /// Verify a presented supervisor token.
+    pub fn verify_supervisor_token(
+        &self,
+        token: &str,
+    ) -> Result<AuthenticatedSupervisor, AuthRejection> {
+        self.supervisor_verifier.verify(token).map_err(|error| {
+            let reason = match error {
+                SessionJwtError::SubjectMismatch => AuthFailureReason::AudienceOrIssuerMismatch,
+                ref other => session_failure_reason(other),
+            };
+            AuthRejection::new(
+                AuthMechanism::SupervisorToken,
+                reason,
+                Status::unauthenticated(format!("invalid supervisor token: {error}")),
+            )
+        })
+    }
+}
+
+/// Authenticates launch-scoped supervisor tokens and checks their identity
+/// against the durable sandbox record.
+pub struct SandboxSessionJwtAuthenticator {
+    authority: Arc<SandboxSessionJwtAuthority>,
+    store: Arc<crate::persistence::Store>,
+}
+
+impl SandboxSessionJwtAuthenticator {
+    pub fn new(
+        authority: Arc<SandboxSessionJwtAuthority>,
+        store: Arc<crate::persistence::Store>,
+    ) -> Self {
+        Self { authority, store }
+    }
+}
+
+impl std::fmt::Debug for SandboxSessionJwtAuthenticator {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("SandboxSessionJwtAuthenticator")
+            .finish_non_exhaustive()
+    }
+}
+
+#[async_trait]
+impl Authenticator for SandboxSessionJwtAuthenticator {
+    async fn authenticate(
+        &self,
+        headers: &http::HeaderMap,
+        path: &str,
+    ) -> Result<Authentication, AuthRejection> {
+        let Some(token) = bearer_credential(headers) else {
+            return Ok(Authentication::NotApplicable);
+        };
+        let Ok(header) = decode_header(token) else {
+            return Ok(Authentication::NotApplicable);
+        };
+        if header.typ.as_deref() != Some(GATEWAY_SESSION_JWT_TYPE) {
+            return Ok(Authentication::NotApplicable);
+        }
+        let authenticated = self.authority.verify_gateway_token(token)?;
+        // Refresh performs its own lineage check so the immediately consumed
+        // bearer can recover an already-committed successor after a lost
+        // response. Every other RPC accepts only the current bearer.
+        if path != REFRESH_SANDBOX_TOKEN_PATH {
+            crate::auth::sandbox_session::authorize_persisted(&self.store, &authenticated).await?;
+        }
+        Ok(Authentication::Accepted(Principal::Sandbox(
+            SandboxPrincipal {
+                sandbox_id: authenticated.sandbox_id.to_string(),
+                source: SandboxIdentitySource::BootstrapJwt {
+                    issuer: "launch-session".to_string(),
+                },
+                trust_domain: Some("openshell".to_string()),
+            },
+        )))
+    }
+}
+
+fn session_failure_reason(error: &SessionJwtError) -> AuthFailureReason {
+    match error {
+        SessionJwtError::Expired => AuthFailureReason::ExpiredCredential,
+        SessionJwtError::WrongIssuer | SessionJwtError::WrongAudience => {
+            AuthFailureReason::AudienceOrIssuerMismatch
+        }
+        SessionJwtError::MissingKeyId | SessionJwtError::InvalidJti => {
+            AuthFailureReason::MalformedCredential
+        }
+        _ => AuthFailureReason::InvalidCredential,
+    }
+}
+
+impl ExtensionJwtIssuer {
+    pub fn from_pem(
+        signing_key_pem: &[u8],
+        public_key_pem: &[u8],
+        kid: String,
+        gateway_id: &str,
+        ttl: Duration,
+    ) -> Result<Self, String> {
         crate::install_jsonwebtoken_crypto_provider();
 
-        if ttl.is_some_and(|ttl| ttl.is_zero()) {
-            return Err("sandbox token TTL must be positive when configured".to_string());
+        if ttl.is_zero() {
+            return Err("gateway token TTL must be positive".to_string());
         }
 
         let encoding_key = EncodingKey::from_ed_pem(signing_key_pem)
             .map_err(|e| format!("failed to parse Ed25519 signing key PEM: {e}"))?;
+        let jwks = GatewayJwks::from_public_key_pem(public_key_pem, kid.clone())?;
         let identity = format!("openshell-gateway:{gateway_id}");
         Ok(Self {
             encoding_key,
             kid,
             issuer: identity.clone(),
-            audience: identity,
+            gateway_audience: identity,
             ttl,
-        })
-    }
-
-    /// Mint a fresh token for `sandbox_id`.
-    #[allow(clippy::result_large_err)] // `tonic::Status` is the natural error here
-    pub fn mint(&self, sandbox_id: &str) -> Result<MintedToken, Status> {
-        crate::install_jsonwebtoken_crypto_provider();
-
-        let now = now_secs();
-        let exp = self.ttl.map_or(0, |ttl| {
-            now.saturating_add(i64::try_from(ttl.as_secs()).unwrap_or(3_600))
-        });
-        let claims = SandboxJwtClaims {
-            sub: format!("{SPIFFE_SUBJECT_PREFIX}{sandbox_id}"),
-            iss: self.issuer.clone(),
-            aud: self.audience.clone(),
-            iat: now,
-            exp,
-            sandbox_id: sandbox_id.to_string(),
-        };
-        let mut header = Header::new(Algorithm::EdDSA);
-        header.kid = Some(self.kid.clone());
-        let token = encode(&header, &claims, &self.encoding_key).map_err(|e| {
-            warn!(error = %e, "failed to mint sandbox JWT");
-            Status::internal("failed to mint sandbox token")
-        })?;
-        Ok(MintedToken {
-            token,
-            expires_at_ms: exp.saturating_mul(1000),
+            jwks,
         })
     }
 
@@ -172,7 +427,27 @@ impl SandboxJwtIssuer {
         sandbox_id: Option<&str>,
         ttl: Duration,
     ) -> Result<MintedToken, Status> {
-        if audience.as_str() == self.audience {
+        self.mint_extension_token_with_metadata(
+            audience,
+            caller_kind,
+            sandbox_id,
+            ttl,
+            now_secs(),
+            uuid::Uuid::new_v4(),
+        )
+    }
+
+    #[allow(clippy::result_large_err)]
+    pub(crate) fn mint_extension_token_with_metadata(
+        &self,
+        audience: &ExtensionAudience,
+        caller_kind: ExtensionCallerKind,
+        sandbox_id: Option<&str>,
+        ttl: Duration,
+        issued_at: i64,
+        token_id: uuid::Uuid,
+    ) -> Result<MintedToken, Status> {
+        if audience.as_str() == self.gateway_audience {
             return Err(Status::invalid_argument(
                 "extension audience must not equal the gateway sandbox audience",
             ));
@@ -201,15 +476,14 @@ impl SandboxJwtIssuer {
             }
         };
 
-        let now = now_secs();
-        let exp = now.saturating_add(i64::try_from(ttl.as_secs()).unwrap_or(3_600));
+        let exp = issued_at.saturating_add(i64::try_from(ttl.as_secs()).unwrap_or(3_600));
         let claims = ExtensionJwtClaims {
             iss: self.issuer.clone(),
             aud: audience.as_str().to_string(),
             sub,
-            iat: now,
+            iat: issued_at,
             exp,
-            jti: uuid::Uuid::new_v4().to_string(),
+            jti: token_id.to_string(),
             caller_kind,
             sandbox_id,
         };
@@ -228,49 +502,12 @@ impl SandboxJwtIssuer {
         })
     }
 
-    pub fn sandbox_token_ttl(&self) -> Option<Duration> {
+    pub const fn token_ttl(&self) -> Duration {
         self.ttl
-    }
-}
-
-/// Authenticator that validates gateway-minted sandbox JWTs.
-pub struct SandboxJwtAuthenticator {
-    decoding_key: DecodingKey,
-    kid: String,
-    issuer: String,
-    audience: String,
-    jwks: GatewayJwks,
-}
-
-impl std::fmt::Debug for SandboxJwtAuthenticator {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("SandboxJwtAuthenticator")
-            .field("kid", &self.kid)
-            .field("issuer", &self.issuer)
-            .field("audience", &self.audience)
-            .finish_non_exhaustive()
-    }
-}
-
-impl SandboxJwtAuthenticator {
-    pub fn from_pem(public_key_pem: &[u8], kid: String, gateway_id: &str) -> Result<Self, String> {
-        crate::install_jsonwebtoken_crypto_provider();
-
-        let decoding_key = DecodingKey::from_ed_pem(public_key_pem)
-            .map_err(|e| format!("failed to parse Ed25519 public key PEM: {e}"))?;
-        let jwks = GatewayJwks::from_public_key_pem(public_key_pem, kid.clone())?;
-        let identity = format!("openshell-gateway:{gateway_id}");
-        Ok(Self {
-            decoding_key,
-            kid,
-            issuer: identity.clone(),
-            audience: identity,
-            jwks,
-        })
     }
 
     /// Return the public signing keys integrations use to verify extension
-    /// tokens. No private key material is retained by this type.
+    /// tokens.
     #[must_use]
     pub const fn jwks(&self) -> &GatewayJwks {
         &self.jwks
@@ -280,56 +517,6 @@ impl SandboxJwtAuthenticator {
     #[must_use]
     pub fn issuer(&self) -> &str {
         &self.issuer
-    }
-
-    #[allow(clippy::result_large_err)]
-    fn validate_bearer(&self, token: &str) -> Result<Option<Principal>, Status> {
-        crate::install_jsonwebtoken_crypto_provider();
-
-        let header = decode_header(token).map_err(|e| {
-            debug!(error = %e, "sandbox JWT header decode failed");
-            Status::unauthenticated("invalid token")
-        })?;
-
-        // Extension credentials share this signing key during alpha, but are
-        // never valid sandbox admission credentials. Check the explicit type
-        // before `kid` fallthrough so another authenticator cannot accept one.
-        // Legacy and untyped sandbox JWTs remain valid for rolling upgrades.
-        if header.typ.as_deref() == Some(EXTENSION_JWT_TYP) {
-            return Err(Status::unauthenticated(
-                "extension tokens cannot authenticate to the gateway",
-            ));
-        }
-
-        // Fall through to other authenticators when the kid does not match —
-        // OIDC issuers may share the Bearer slot.
-        if header.kid.as_deref() != Some(self.kid.as_str()) {
-            return Ok(None);
-        }
-        if !matches!(header.alg, Algorithm::EdDSA) {
-            return Ok(None);
-        }
-
-        let mut validation = Validation::new(Algorithm::EdDSA);
-        validation.algorithms = vec![Algorithm::EdDSA];
-        validation.set_issuer(&[&self.issuer]);
-        validation.set_audience(&[&self.audience]);
-        validation.set_required_spec_claims(&["iss", "aud", "exp", "sub"]);
-        validation.validate_exp = false;
-
-        let data =
-            decode::<SandboxJwtClaims>(token, &self.decoding_key, &validation).map_err(|e| {
-                debug!(error = %e, "sandbox JWT validation failed");
-                Status::unauthenticated(format!("invalid token: {e}"))
-            })?;
-
-        let claims = data.claims;
-        validate_exp(claims.exp)?;
-        Ok(Some(Principal::Sandbox(SandboxPrincipal {
-            sandbox_id: claims.sandbox_id,
-            source: SandboxIdentitySource::BootstrapJwt { issuer: claims.iss },
-            trust_domain: Some("openshell".to_string()),
-        })))
     }
 }
 
@@ -363,38 +550,6 @@ impl GatewayJwks {
     }
 }
 
-#[async_trait]
-impl Authenticator for SandboxJwtAuthenticator {
-    async fn authenticate(
-        &self,
-        headers: &http::HeaderMap,
-        _path: &str,
-    ) -> Result<Option<Principal>, Status> {
-        let Some(token) = headers
-            .get("authorization")
-            .and_then(|v| v.to_str().ok())
-            .and_then(|v| v.strip_prefix("Bearer "))
-        else {
-            return Ok(None);
-        };
-        self.validate_bearer(token)
-    }
-}
-
-#[allow(clippy::result_large_err)]
-fn validate_exp(exp: i64) -> Result<(), Status> {
-    if exp == 0 {
-        return Ok(());
-    }
-
-    if exp < now_secs().saturating_sub(SANDBOX_JWT_EXP_LEEWAY_SECS) {
-        debug!("sandbox JWT expired");
-        return Err(Status::unauthenticated("invalid token: ExpiredSignature"));
-    }
-
-    Ok(())
-}
-
 fn now_secs() -> i64 {
     i64::try_from(
         SystemTime::now()
@@ -407,229 +562,132 @@ fn now_secs() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use jsonwebtoken::{DecodingKey, Validation, decode};
     use openshell_bootstrap::jwt::generate_jwt_key;
 
-    fn header_map_with_bearer(token: &str) -> http::HeaderMap {
-        let mut h = http::HeaderMap::new();
-        h.insert(
-            "authorization",
-            http::HeaderValue::from_str(&format!("Bearer {token}")).unwrap(),
-        );
-        h
-    }
-
-    fn pair() -> (SandboxJwtIssuer, SandboxJwtAuthenticator) {
-        pair_with_ttl(Some(Duration::from_hours(1)))
-    }
-
-    fn pair_with_ttl(ttl: Option<Duration>) -> (SandboxJwtIssuer, SandboxJwtAuthenticator) {
+    fn issuer(ttl: Duration) -> ExtensionJwtIssuer {
         let mat = generate_jwt_key().expect("jwt key");
-        let issuer = SandboxJwtIssuer::from_pem(
+        ExtensionJwtIssuer::from_pem(
             mat.signing_key_pem.as_bytes(),
-            mat.kid.clone(),
-            "test-gateway",
-            ttl,
-        )
-        .unwrap();
-        let auth = SandboxJwtAuthenticator::from_pem(
             mat.public_key_pem.as_bytes(),
             mat.kid,
             "test-gateway",
+            ttl,
         )
-        .unwrap();
-        (issuer, auth)
+        .expect("issuer")
     }
 
     fn extension_audience(value: &str) -> ExtensionAudience {
         ExtensionAudience::new(value).expect("valid extension audience")
     }
 
-    #[tokio::test]
-    async fn mint_and_validate_round_trip() {
-        let (issuer, auth) = pair();
-        let minted = issuer.mint("sandbox-a").unwrap();
-        assert!(minted.expires_at_ms > 0);
-        let principal = auth
-            .authenticate(&header_map_with_bearer(&minted.token), "/anything")
-            .await
-            .unwrap()
-            .expect("expected principal");
-        match principal {
-            Principal::Sandbox(p) => {
-                assert_eq!(p.sandbox_id, "sandbox-a");
-                match p.source {
-                    SandboxIdentitySource::BootstrapJwt { issuer: iss } => {
-                        assert_eq!(iss, "openshell-gateway:test-gateway");
-                    }
-                    other => panic!("unexpected source: {other:?}"),
-                }
-            }
-            _ => panic!("expected Sandbox principal"),
-        }
-    }
-
-    #[tokio::test]
-    async fn extension_token_cannot_authenticate_as_a_sandbox() {
-        let mat = generate_jwt_key().expect("jwt key");
-        let issuer = SandboxJwtIssuer::from_pem(
-            mat.signing_key_pem.as_bytes(),
-            mat.kid.clone(),
+    #[test]
+    fn launch_session_survives_identity_reload_and_token_renewal() {
+        let material = generate_jwt_key().unwrap();
+        let authority = SandboxSessionJwtAuthority::from_pem(
+            material.signing_key_pem.as_bytes(),
+            material.public_key_pem.as_bytes(),
+            material.kid,
             "test-gateway",
-            Some(Duration::from_hours(1)),
+            Some(Duration::from_mins(15)),
         )
-        .expect("issuer");
-        let auth = SandboxJwtAuthenticator::from_pem(
-            mat.public_key_pem.as_bytes(),
-            mat.kid.clone(),
-            "test-gateway",
-        )
-        .expect("authenticator");
-
-        // Build the token directly to model a credential minted before the
-        // reserved-audience guard was added. Its claims otherwise satisfy the
-        // sandbox authenticator's issuer, audience, subject, and expiry checks.
-        let sandbox_id = "sandbox-a";
-        let now = now_secs();
-        let claims = ExtensionJwtClaims {
-            iss: "openshell-gateway:test-gateway".to_string(),
-            aud: "openshell-gateway:test-gateway".to_string(),
-            sub: format!("{SPIFFE_SUBJECT_PREFIX}{sandbox_id}"),
-            iat: now,
-            exp: now + 300,
-            jti: uuid::Uuid::new_v4().to_string(),
-            caller_kind: ExtensionCallerKind::Supervisor,
-            sandbox_id: Some(sandbox_id.to_string()),
-        };
-        let mut header = Header::new(Algorithm::EdDSA);
-        header.kid = Some(mat.kid);
-        header.typ = Some(EXTENSION_JWT_TYP.to_string());
-        let token = encode(&header, &claims, &issuer.encoding_key).expect("extension token");
-
-        let error = auth
-            .authenticate(&header_map_with_bearer(&token), "/anything")
-            .await
-            .expect_err("extension token must not authenticate as a sandbox");
-        assert_eq!(error.code(), tonic::Code::Unauthenticated);
+        .unwrap();
+        let identity = crate::auth::sandbox_session::PersistedSandboxIdentity::new().unwrap();
+        let first = authority
+            .mint_persisted_launch("sandbox-a", &identity)
+            .unwrap();
+        let mut annotations = std::collections::HashMap::new();
+        identity.write(&mut annotations);
+        let mut reloaded =
+            crate::auth::sandbox_session::PersistedSandboxIdentity::read(&annotations).unwrap();
+        reloaded.gateway_token_id = uuid::Uuid::new_v4();
+        let renewed = authority
+            .mint_persisted_launch("sandbox-a", &reloaded)
+            .unwrap();
+        assert_eq!(first.supervisor.session_id, renewed.supervisor.session_id);
         assert_eq!(
-            error.message(),
-            "extension tokens cannot authenticate to the gateway"
+            first.supervisor.runtime_generation,
+            renewed.supervisor.runtime_generation
+        );
+        assert_ne!(
+            first.supervisor.gateway_token.expose_secret(),
+            renewed.supervisor.gateway_token.expose_secret()
+        );
+
+        let other_sandbox = authority
+            .mint_persisted_launch("sandbox-b", &identity)
+            .unwrap();
+        assert_ne!(
+            first.supervisor.session_id,
+            other_sandbox.supervisor.session_id
+        );
+        let next = crate::auth::sandbox_session::PersistedSandboxIdentity::new().unwrap();
+        let next_launch = authority.mint_persisted_launch("sandbox-a", &next).unwrap();
+        assert_ne!(
+            first.supervisor.session_id,
+            next_launch.supervisor.session_id
         );
     }
 
-    #[tokio::test]
-    async fn ttl_none_mints_non_expiring_token() {
-        let (issuer, auth) = pair_with_ttl(None);
-        let minted = issuer.mint("sandbox-never").unwrap();
-        assert_eq!(minted.expires_at_ms, 0);
-
-        let principal = auth
-            .authenticate(&header_map_with_bearer(&minted.token), "/anything")
-            .await
-            .unwrap()
-            .expect("exp=0 token should authenticate");
-        assert!(matches!(principal, Principal::Sandbox(_)));
-
-        let mut validation = Validation::new(Algorithm::EdDSA);
-        validation.algorithms = vec![Algorithm::EdDSA];
-        validation.set_issuer(&["openshell-gateway:test-gateway"]);
-        validation.set_audience(&["openshell-gateway:test-gateway"]);
-        validation.set_required_spec_claims(&["iss", "aud", "exp", "sub"]);
-        validation.validate_exp = false;
-        let decoded = decode::<SandboxJwtClaims>(&minted.token, &auth.decoding_key, &validation)
-            .expect("token should decode");
-        assert_eq!(decoded.claims.exp, 0);
+    #[test]
+    fn session_verification_errors_map_to_reason_categories() {
+        for (error, reason) in [
+            (
+                SessionJwtError::Expired,
+                AuthFailureReason::ExpiredCredential,
+            ),
+            (
+                SessionJwtError::WrongIssuer,
+                AuthFailureReason::AudienceOrIssuerMismatch,
+            ),
+            (
+                SessionJwtError::WrongAudience,
+                AuthFailureReason::AudienceOrIssuerMismatch,
+            ),
+            (
+                SessionJwtError::MissingKeyId,
+                AuthFailureReason::MalformedCredential,
+            ),
+            (
+                SessionJwtError::InvalidJti,
+                AuthFailureReason::MalformedCredential,
+            ),
+            (
+                SessionJwtError::InvalidToken,
+                AuthFailureReason::InvalidCredential,
+            ),
+            (
+                SessionJwtError::UnknownKeyId,
+                AuthFailureReason::InvalidCredential,
+            ),
+        ] {
+            assert_eq!(session_failure_reason(&error), reason, "{error:?}");
+        }
     }
 
     #[test]
-    fn ttl_some_zero_is_rejected() {
+    fn zero_ttl_is_rejected() {
         let mat = generate_jwt_key().expect("jwt key");
-        let error = SandboxJwtIssuer::from_pem(
+        let error = ExtensionJwtIssuer::from_pem(
             mat.signing_key_pem.as_bytes(),
+            mat.public_key_pem.as_bytes(),
             mat.kid,
             "test-gateway",
-            Some(Duration::ZERO),
+            Duration::ZERO,
         )
-        .expect_err("Some(Duration::ZERO) must not reintroduce a sentinel");
+        .expect_err("Duration::ZERO must not reintroduce a sentinel");
         assert!(error.contains("must be positive"));
-    }
-
-    #[tokio::test]
-    async fn token_signed_by_other_key_is_rejected() {
-        let (_, auth_a) = pair();
-        let (issuer_b, _) = pair(); // different keypair
-        let minted = issuer_b.mint("sandbox-b").unwrap();
-        // The token has a different `kid` than auth_a expects, so the
-        // authenticator yields None (lets the chain fall through). That is
-        // the documented behavior for cross-issuer Bearer headers.
-        let result = auth_a
-            .authenticate(&header_map_with_bearer(&minted.token), "/anything")
-            .await
-            .unwrap();
-        assert!(result.is_none(), "different kid must fall through");
-    }
-
-    #[tokio::test]
-    async fn missing_bearer_yields_none() {
-        let (_, auth) = pair();
-        let result = auth
-            .authenticate(&http::HeaderMap::new(), "/anything")
-            .await
-            .unwrap();
-        assert!(result.is_none());
-    }
-
-    #[tokio::test]
-    async fn malformed_token_is_rejected() {
-        let (_, auth) = pair();
-        let err = auth
-            .authenticate(&header_map_with_bearer("not.a.jwt"), "/anything")
-            .await
-            .expect_err("malformed must reject");
-        assert_eq!(err.code(), tonic::Code::Unauthenticated);
-    }
-
-    #[tokio::test]
-    async fn expired_token_is_rejected() {
-        // Mint a token whose iat is far in the past so its TTL window is
-        // already closed by `now`. We sign the JWT directly with the same
-        // signing key to bypass the issuer's TTL-vs-now coupling.
-        let mat = generate_jwt_key().unwrap();
-        let issuer = SandboxJwtIssuer::from_pem(
-            mat.signing_key_pem.as_bytes(),
-            mat.kid.clone(),
-            "g",
-            Some(Duration::from_hours(1)),
-        )
-        .unwrap();
-        let auth =
-            SandboxJwtAuthenticator::from_pem(mat.public_key_pem.as_bytes(), mat.kid.clone(), "g")
-                .unwrap();
-        let claims = SandboxJwtClaims {
-            sub: format!("{SPIFFE_SUBJECT_PREFIX}sandbox-c"),
-            iss: "openshell-gateway:g".to_string(),
-            aud: "openshell-gateway:g".to_string(),
-            iat: now_secs() - 7200,
-            exp: now_secs() - 3600,
-            sandbox_id: "sandbox-c".to_string(),
-        };
-        let mut header = Header::new(Algorithm::EdDSA);
-        header.kid = Some(mat.kid);
-        let token = encode(&header, &claims, &issuer.encoding_key).unwrap();
-        let err = auth
-            .authenticate(&header_map_with_bearer(&token), "/anything")
-            .await
-            .expect_err("expired token must reject");
-        assert_eq!(err.code(), tonic::Code::Unauthenticated);
     }
 
     #[test]
     fn extension_tokens_have_exact_audience_and_caller_identity() {
         let mat = generate_jwt_key().expect("jwt key");
-        let issuer = SandboxJwtIssuer::from_pem(
+        let issuer = ExtensionJwtIssuer::from_pem(
             mat.signing_key_pem.as_bytes(),
+            mat.public_key_pem.as_bytes(),
             mat.kid.clone(),
             "gateway-a",
-            None,
+            Duration::from_mins(15),
         )
         .expect("issuer");
         let decoding_key = DecodingKey::from_ed_pem(mat.public_key_pem.as_bytes()).unwrap();
@@ -672,16 +730,8 @@ mod tests {
     }
 
     #[test]
-    fn extension_tokens_are_explicitly_typed_and_sandbox_tokens_are_not() {
-        let mat = generate_jwt_key().expect("jwt key");
-        let issuer = SandboxJwtIssuer::from_pem(
-            mat.signing_key_pem.as_bytes(),
-            mat.kid.clone(),
-            "gateway-a",
-            Some(Duration::from_hours(1)),
-        )
-        .expect("issuer");
-
+    fn extension_tokens_are_explicitly_typed() {
+        let issuer = issuer(Duration::from_hours(1));
         let extension = issuer
             .mint_extension_token(
                 &extension_audience("urn:openshell:extension:middleware:scanner"),
@@ -694,23 +744,19 @@ mod tests {
             decode_header(&extension.token).unwrap().typ.as_deref(),
             Some(EXTENSION_JWT_TYP)
         );
-
-        // The discriminator is only useful if the sandbox bootstrap token does
-        // not carry it. A verifier requiring `openshell-ext+jwt` must reject a
-        // gateway admission credential even though both share a signing key.
-        let sandbox = issuer.mint("sandbox-a").expect("sandbox token");
-        assert_ne!(
-            decode_header(&sandbox.token).unwrap().typ.as_deref(),
-            Some(EXTENSION_JWT_TYP)
-        );
     }
 
     #[test]
     fn extension_token_rejects_wrong_audience() {
         let mat = generate_jwt_key().expect("jwt key");
-        let issuer =
-            SandboxJwtIssuer::from_pem(mat.signing_key_pem.as_bytes(), mat.kid, "gateway-a", None)
-                .expect("issuer");
+        let issuer = ExtensionJwtIssuer::from_pem(
+            mat.signing_key_pem.as_bytes(),
+            mat.public_key_pem.as_bytes(),
+            mat.kid,
+            "gateway-a",
+            Duration::from_mins(15),
+        )
+        .expect("issuer");
         let minted = issuer
             .mint_extension_token(
                 &extension_audience("service-a"),
@@ -728,7 +774,7 @@ mod tests {
 
     #[test]
     fn extension_token_rejects_gateway_sandbox_audience() {
-        let (issuer, _) = pair();
+        let issuer = issuer(Duration::from_hours(1));
         let error = issuer
             .mint_extension_token(
                 &extension_audience("openshell-gateway:test-gateway"),
@@ -746,7 +792,7 @@ mod tests {
 
     #[test]
     fn extension_token_enforces_positive_bounded_ttl_and_caller_shape() {
-        let (issuer, _) = pair_with_ttl(None);
+        let issuer = issuer(Duration::from_mins(15));
         for ttl in [
             Duration::ZERO,
             MAX_EXTENSION_TOKEN_TTL + Duration::from_secs(1),
@@ -787,13 +833,15 @@ mod tests {
     #[test]
     fn jwks_contains_public_ed25519_key_without_pem_material() {
         let mat = generate_jwt_key().expect("jwt key");
-        let auth = SandboxJwtAuthenticator::from_pem(
+        let issuer = ExtensionJwtIssuer::from_pem(
+            mat.signing_key_pem.as_bytes(),
             mat.public_key_pem.as_bytes(),
             mat.kid.clone(),
             "gateway-a",
+            Duration::from_mins(15),
         )
-        .expect("authenticator");
-        let jwks = auth.jwks();
+        .expect("issuer");
+        let jwks = issuer.jwks();
         assert_eq!(jwks.keys.len(), 1);
         let key = &jwks.keys[0];
         assert_eq!(key.kid, mat.kid);
