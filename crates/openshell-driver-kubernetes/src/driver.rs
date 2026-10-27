@@ -4574,7 +4574,7 @@ impl KubernetesComputeDriver {
             .await?;
         let selector = self.sandbox_lookup_selector(sandbox_id);
         let lp = ListParams::default().labels(&selector);
-        let (kube_name, obj_namespace, _workspace, preconditions, pod_name, placement) =
+        let (kube_name, obj_namespace, _workspace, uid, pod_name, placement) =
             match tokio::time::timeout(KUBE_API_TIMEOUT, lookup_api.api.list(&lp)).await {
                 Ok(Ok(list)) => {
                     if let Some(obj) = list.items.into_iter().next() {
@@ -4593,10 +4593,7 @@ impl KubernetesComputeDriver {
                                     .unwrap_or_default();
                                 // An unreadable placement leaves any instance to reconciliation.
                                 let placement = supervisor_placement(&obj).ok();
-                                let pc = Preconditions {
-                                    uid: obj.metadata.uid,
-                                    resource_version: obj.metadata.resource_version,
-                                };
+                                let uid = obj.metadata.uid.clone();
                                 let pod_name = obj
                                     .metadata
                                     .annotations
@@ -4606,7 +4603,7 @@ impl KubernetesComputeDriver {
                                     })
                                     .cloned()
                                     .unwrap_or_else(|| name.clone());
-                                (name, ns, ws, pc, pod_name, placement)
+                                (name, ns, ws, uid, pod_name, placement)
                             }
                             None => return Ok(false),
                         }
@@ -4639,7 +4636,7 @@ impl KubernetesComputeDriver {
         let delete_api = self
             .supported_agent_sandbox_api(self.client.clone(), &obj_namespace)
             .await?;
-        let dp = DeleteParams::default().preconditions(preconditions);
+        let dp = sandbox_delete_params(uid);
         match tokio::time::timeout(KUBE_API_TIMEOUT, delete_api.api.delete(&kube_name, &dp)).await {
             Ok(Ok(_response)) => {
                 info!(sandbox_id = %sandbox_id, namespace = %obj_namespace, "Sandbox deleted from Kubernetes");
@@ -6072,6 +6069,17 @@ fn gateway_id_label_needs_backfill(
     labels
         .and_then(|labels| labels.get(LABEL_GATEWAY_ID))
         .is_none_or(|value| value != gateway_id)
+}
+
+/// Delete exactly the Sandbox resource that was looked up, whatever has updated
+/// it since. A `resourceVersion` precondition would turn every concurrent
+/// status or annotation write into a 409 that reads as "replaced", leaving a
+/// live sandbox the gateway has already forgotten.
+fn sandbox_delete_params(uid: Option<String>) -> DeleteParams {
+    DeleteParams::default().preconditions(Preconditions {
+        uid,
+        resource_version: None,
+    })
 }
 
 fn namespace_delete_params(uid: String) -> DeleteParams {
@@ -15565,6 +15573,15 @@ mod tests {
     #[test]
     fn namespace_not_owned_no_labels() {
         assert!(!is_namespace_owned_by_gateway(None, "gw-1"));
+    }
+
+    #[test]
+    fn sandbox_delete_is_guarded_by_uid_not_resource_version() {
+        let preconditions = sandbox_delete_params(Some("sandbox-uid".to_string()))
+            .preconditions
+            .expect("sandbox delete carries preconditions");
+        assert_eq!(preconditions.uid, Some("sandbox-uid".to_string()));
+        assert_eq!(preconditions.resource_version, None);
     }
 
     #[test]
