@@ -558,8 +558,9 @@ start-time values), and per-peer policy are not supported.
 
 The fork's `Niuu Dev Images` workflow builds amd64 and arm64 gateway, sandbox
 runtime and supervisor images on GitHub-hosted runners. Each architecture must
-pass the peer-workload Kubernetes acceptance test with both a per-sandbox and a
-shared gateway supervisor before publication. The final job publishes images at
+pass the peer-workload Kubernetes acceptance test with a per-sandbox supervisor
+before publication. The shared gateway supervisor is not exercised there: it
+requires gateway TLS, which the kind harness disables. The final job publishes images at
 `ghcr.io/jve/openshell/{gateway,sandbox,supervisor}:<commit>` and the matching
 chart at `oci://ghcr.io/jve/openshell/helm-chart`, version
 `0.0.0-niuu.sha<commit>`, whose `global.image.registry` points at the fork.
