@@ -522,7 +522,14 @@ resources, and declared volume mounts. The driver owns everything else:
   same peers. Before releasing a generation, the admission gate requires the
   admitted Pod to contain exactly those peers followed by `agent`, with the
   rendered image, entrypoint, security context, environment, and mounts, and
-  rejects any other container and any ephemeral container. Admission webhooks
+  rejects any other container and any ephemeral container. On `agent` and
+  every peer it also rejects probes, lifecycle hooks, and volume devices,
+  which kubelet would run or attach outside the sandbox boundary; on every
+  container it rejects privileged mode, a non-default `procMount`, seccomp,
+  or AppArmor profile, and SELinux `user`, `role`, or `type` overrides. Only
+  the trusted init container may reach the bootstrap Secret, through the
+  driver's own volume. The gate reads the raw admitted Pod and rejects any
+  field the driver's Kubernetes schema cannot inspect. Admission webhooks
   that inject containers into sandbox Pods are therefore incompatible with peer
   workloads, and with this driver generally.
 - Peers require the runtime-initiated control connection, which every new
