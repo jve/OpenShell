@@ -2819,10 +2819,9 @@ mod tests {
             .build()
             .unwrap();
         let accepted = runtime
-            .block_on(tokio::time::timeout(
-                Duration::from_secs(10),
-                broker.accept(),
-            ))
+            .block_on(async {
+                tokio::time::timeout(Duration::from_secs(10), broker.accept()).await
+            })
             .expect("accept must not hang on a stopped broker");
         assert_eq!(
             accepted.err().map(|error| error.kind()),
