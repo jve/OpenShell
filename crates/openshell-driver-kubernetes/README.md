@@ -375,9 +375,18 @@ nested schema and currently accepts:
 - `containers.agent.volume_mounts[].mount_path`
 - `containers.agent.volume_mounts[].sub_path`
 - `containers.agent.volume_mounts[].read_only`
+- `containers.workloads[].name`
+- `containers.workloads[].image`
+- `containers.workloads[].command`
+- `containers.workloads[].environment`
+- `containers.workloads[].resources.requests`
+- `containers.workloads[].resources.limits`
+- `containers.workloads[].volume_mounts[]` (same fields as the agent's)
 - `volumes[].name`
 - `volumes[].persistent_volume_claim.claim_name`
 - `volumes[].persistent_volume_claim.read_only`
+- `volumes[].empty_dir` (an empty object; exclusive with
+  `persistent_volume_claim`)
 
 Nested keys inside the `kubernetes` block use snake_case. The top-level
 `driver_config` envelope is keyed by driver names, so `kubernetes` is not part
@@ -447,6 +456,96 @@ openshell sandbox create \
   }' \
   -- claude
 ```
+
+### Peer workload containers
+
+`containers.workloads` adds peer workload containers: regular Pod containers,
+from any image, that share the sandbox's Pod network namespace (so `localhost`
+reaches the agent and every other peer), any declared `volumes`, the sandbox
+policy, and the sandbox lifecycle. A typical use is a group of cooperating agent
+processes exchanging messages over loopback and a shared Memory scratch volume:
+
+```shell
+openshell sandbox create \
+  --driver-config-json '{
+    "kubernetes": {
+      "volumes": [{"name": "flock-ipc", "empty_dir": {}}],
+      "containers": {
+        "agent": {
+          "volume_mounts": [
+            {"name": "flock-ipc", "mount_path": "/tmp/niuu-mesh", "read_only": false}
+          ]
+        },
+        "workloads": [{
+          "name": "ravn-reviewer",
+          "image": "registry.example.com/ravn:v1",
+          "command": ["python3", "-m", "ravn", "daemon"],
+          "environment": {"MESH_PEER": "tcp://127.0.0.1:7480"},
+          "resources": {"requests": {"cpu": "100m"}, "limits": {"memory": "512Mi"}},
+          "volume_mounts": [
+            {"name": "flock-ipc", "mount_path": "/tmp/niuu-mesh", "read_only": false}
+          ]
+        }]
+      }
+    }
+  }'
+```
+
+Peers do not add isolation boundaries. The supervisor still sees one boundary,
+served by the primary `openshell-sandbox` runtime in `agent`, which stays the
+only exec, SSH, and lifecycle-reporting target. Each peer container's entrypoint
+is `/.openshell/runtime/openshell-sandbox peer`, a subordinate runtime staged by
+the trusted init container. It applies the sandbox's Landlock, seccomp, and
+network mediation to the peer workload in the peer's own PID namespace and root
+filesystem, and forwards every mediated connection and DNS query to the primary
+runtime over a private Unix socket. The shared contract (paths, volume names,
+token handling) is `openshell_sandbox_backend::peer_workloads`.
+
+The caller chooses only the image, the exact argv, non-secret environment,
+resources, and declared volume mounts. The driver owns everything else:
+
+- Peers render ahead of `agent` with the agent's security context. They mount
+  the runtime volume read-only and three private Memory `emptyDir` volumes:
+  a control directory shared only with `agent`, a boot directory shared only
+  with the init container, and their own `/run`. They never mount the bootstrap
+  Secret, the runtime state, the Pod identity, or the workspace PVC.
+- `command` and `environment` are not placed on the container. The driver
+  records them in the protected boundary config, and the primary runtime starts
+  each peer workload with them once the sandbox starts. The container carries
+  only the agent's driver-owned `OPENSHELL_*` settings.
+- Each runtime generation mints a fresh 32-byte token per peer into the
+  generation's bootstrap Secret and records its SHA-256 in the boundary config.
+  The init container stages each token into that peer's boot directory; the
+  peer runtime consumes it once to authenticate to the primary.
+- The validated peer list is recorded on the Sandbox resource
+  (`openshell.ai/sandbox-runtime-peer-workloads`), so restarts reproduce the
+  same peers. Before releasing a generation, the admission gate requires the
+  admitted Pod to contain exactly those peers followed by `agent`, with the
+  rendered image, entrypoint, security context, environment, and mounts, and
+  rejects any other container and any ephemeral container. Admission webhooks
+  that inject containers into sandbox Pods are therefore incompatible with peer
+  workloads, and with this driver generally.
+- Peers require the runtime-initiated control connection, which every new
+  generation uses; they work with both a per-sandbox supervisor and
+  `supervisor_topology = "gateway"`.
+
+Validation rejects more than 16 peers, names that are not DNS-1123 labels of at
+most 40 characters, the names `agent` and `supervisor`, names starting with
+`openshell`, duplicate names, an empty image, an empty `command` or empty
+arguments (peers never fall back to the image entrypoint), environment keys
+starting with `OPENSHELL_` or containing `=`, mounts of unknown volumes, and
+mount paths under `/.openshell` or `/run`. Any other field, including
+`readiness_port`, `args`, and `security_context`, is an unknown field. Workload
+listeners are expected to bind `127.0.0.1`, which kubelet probes cannot reach,
+so peers have no readiness probes. Volume names starting with `openshell-peer-`
+are reserved.
+
+The workload Pod uses `restartPolicy: Never`, so a peer is never restarted with
+a consumed token: when a peer runtime or its workload exits, the primary
+terminates the whole sandbox, and when the agent exits, every peer is
+terminated. Per-peer exec and SSH, independent peer restart, peer output in the
+sandbox logs API, provider credential updates after start (peers receive the
+start-time values), and per-peer policy are not supported.
 
 ### Niuu fork builds
 
