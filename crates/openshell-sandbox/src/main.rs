@@ -32,6 +32,11 @@ const BOOTSTRAP_INPUT_ROOT: &str = "/.openshell/bootstrap-input";
 const SANDBOX_RUNTIME_ROOT: &str = "/.openshell/runtime";
 #[cfg(target_os = "linux")]
 const SANDBOX_STATE_ROOT: &str = "/.openshell/state";
+/// Parent of every peer boot directory mounted in the bootstrap init
+/// container; peer `i` is mounted at
+/// [`openshell_sandbox_backend::peer_workloads::peer_boot_dir_in_init`].
+#[cfg(target_os = "linux")]
+const PEER_BOOT_INIT_ROOT: &str = "/.openshell/peer-boot";
 
 const CAPABILITY_PROBE_SUBCOMMAND: &str = "capability-probe";
 const CAPABILITY_PROBE_LAUNCH_SUBCOMMAND: &str = "capability-probe-launch";
@@ -1517,6 +1522,7 @@ fn stage_kubernetes_bootstrap() -> Result<()> {
         Path::new(BOOTSTRAP_INPUT_ROOT),
         Path::new(SANDBOX_RUNTIME_ROOT),
         Path::new(SANDBOX_STATE_ROOT),
+        Path::new(PEER_BOOT_INIT_ROOT),
     )
 }
 
@@ -1536,7 +1542,12 @@ fn run_kubernetes_bootstrap() -> Result<()> {
 }
 
 #[cfg(target_os = "linux")]
-fn stage_kubernetes_bootstrap_at(source: &Path, runtime: &Path, state: &Path) -> Result<()> {
+fn stage_kubernetes_bootstrap_at(
+    source: &Path,
+    runtime: &Path,
+    state: &Path,
+    peer_boot: &Path,
+) -> Result<()> {
     use std::fs::{self, OpenOptions};
     use std::os::unix::fs::PermissionsExt as _;
 
@@ -1573,6 +1584,7 @@ fn stage_kubernetes_bootstrap_at(source: &Path, runtime: &Path, state: &Path) ->
         copy_projected_secret_file(source, name, &bundle_tmp.join(name), 0o600)?;
     }
     fs::rename(&bundle_tmp, &bundle_final).into_diagnostic()?;
+    stage_peer_tokens(source, peer_boot, &nonce)?;
 
     // Flush the two directory entries before the init container exits. Both
     // targets are tmpfs in production, but keeping the staging operation
@@ -1590,6 +1602,213 @@ fn stage_kubernetes_bootstrap_at(source: &Path, runtime: &Path, state: &Path) ->
         .sync_all()
         .into_diagnostic()?;
     Ok(())
+}
+
+/// Stage each peer's one-use token from the bootstrap Secret into that
+/// peer's private boot volume, the only place the peer container can read it.
+///
+/// The peers recorded in the protected boundary config, the Secret's
+/// `peer-<i>.token` keys, and the boot volumes mounted under `peer_boot` must
+/// name exactly the same peers: a token without its volume would never reach
+/// its peer, and a volume without a token would leave a peer that can never
+/// authenticate. Any mismatch fails the bootstrap.
+#[cfg(target_os = "linux")]
+fn stage_peer_tokens(source: &Path, peer_boot: &Path, nonce: &str) -> Result<()> {
+    let peers = recorded_peer_count(source)?;
+    let tokens = read_peer_tokens(source)?;
+    let mounts = peer_boot_mounts(peer_boot)?;
+    if !tokens.keys().copied().eq(0..peers) || !mounts.iter().copied().eq(0..peers) {
+        return Err(miette::miette!(
+            "boundary config records {peers} peer workloads, but the bootstrap Secret holds peer tokens {:?} and peer boot volumes {mounts:?} are mounted",
+            tokens.keys().collect::<Vec<_>>()
+        ));
+    }
+    for (index, token) in tokens {
+        write_peer_token(&peer_boot.join(index.to_string()), &token, nonce)?;
+    }
+    Ok(())
+}
+
+/// Number of peer workloads recorded in the projected boundary config.
+#[cfg(target_os = "linux")]
+fn recorded_peer_count(source: &Path) -> Result<usize> {
+    use miette::Context as _;
+
+    // Only the peer list matters here; the runtime validates the complete
+    // config when it consumes it.
+    #[derive(serde::Deserialize)]
+    struct RecordedPeers {
+        #[serde(default)]
+        peers: Vec<openshell_sandbox_backend::peer_workloads::PeerWorkloadConfig>,
+    }
+
+    let canonical_root = std::fs::canonicalize(source).into_diagnostic()?;
+    let canonical_config = std::fs::canonicalize(source.join("boundary.json")).into_diagnostic()?;
+    if !canonical_config.starts_with(&canonical_root) {
+        return Err(miette::miette!(
+            "projected boundary config escapes its mounted Secret"
+        ));
+    }
+    let recorded: RecordedPeers =
+        serde_json::from_slice(&std::fs::read(&canonical_config).into_diagnostic()?)
+            .into_diagnostic()
+            .wrap_err("decode projected boundary config")?;
+    openshell_sandbox_backend::peer_workloads::validate_peer_workloads(&recorded.peers)
+        .map_err(|error| miette::miette!("invalid peer workloads in boundary config: {error}"))?;
+    Ok(recorded.peers.len())
+}
+
+/// Read and validate every `peer-<i>.token` key of the projected Secret.
+#[cfg(target_os = "linux")]
+fn read_peer_tokens(source: &Path) -> Result<std::collections::BTreeMap<usize, Vec<u8>>> {
+    use std::fs;
+
+    use openshell_sandbox_backend::peer_workloads::{
+        MAX_PEER_WORKLOADS, PEER_TOKEN_BYTES, peer_token_secret_key,
+    };
+
+    let token_length = PEER_TOKEN_BYTES * 2;
+    let mut tokens = std::collections::BTreeMap::new();
+    let canonical_root = fs::canonicalize(source).into_diagnostic()?;
+    for entry in fs::read_dir(source).into_diagnostic()? {
+        let file_name = entry.into_diagnostic()?.file_name();
+        let Some(name) = file_name.to_str() else {
+            continue;
+        };
+        let Some(index) = name
+            .strip_prefix("peer-")
+            .and_then(|index| index.strip_suffix(".token"))
+        else {
+            continue;
+        };
+        let index = index
+            .parse::<usize>()
+            .ok()
+            .filter(|index| *index < MAX_PEER_WORKLOADS && peer_token_secret_key(*index) == name)
+            .ok_or_else(|| {
+                miette::miette!("bootstrap Secret has a malformed peer token key {name:?}")
+            })?;
+        let canonical_source = fs::canonicalize(source.join(name)).into_diagnostic()?;
+        if !canonical_source.starts_with(&canonical_root) {
+            return Err(miette::miette!(
+                "projected peer token escapes its mounted Secret: {}",
+                source.join(name).display()
+            ));
+        }
+        let metadata = fs::symlink_metadata(&canonical_source).into_diagnostic()?;
+        if !metadata.is_file() || metadata.len() != u64::try_from(token_length).unwrap_or(u64::MAX)
+        {
+            return Err(miette::miette!(
+                "peer token {name:?} must be a regular file of {token_length} bytes"
+            ));
+        }
+        let token = fs::read(&canonical_source).into_diagnostic()?;
+        if token.len() != token_length
+            || !token
+                .iter()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(byte))
+        {
+            return Err(miette::miette!(
+                "peer token {name:?} must be {token_length} lowercase hex characters"
+            ));
+        }
+        tokens.insert(index, token);
+    }
+    Ok(tokens)
+}
+
+/// Indices of the peer boot volumes mounted under `peer_boot`. The root
+/// exists only when the driver rendered peers.
+#[cfg(target_os = "linux")]
+fn peer_boot_mounts(peer_boot: &Path) -> Result<std::collections::BTreeSet<usize>> {
+    use std::fs;
+    use std::os::unix::fs::MetadataExt as _;
+
+    use openshell_sandbox_backend::peer_workloads::MAX_PEER_WORKLOADS;
+
+    let root = match fs::symlink_metadata(peer_boot) {
+        Ok(root) => root,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(std::collections::BTreeSet::new());
+        }
+        Err(error) => return Err(error).into_diagnostic(),
+    };
+    if !root.is_dir() {
+        return Err(miette::miette!(
+            "peer boot root must be a directory: {}",
+            peer_boot.display()
+        ));
+    }
+    let mut mounts = std::collections::BTreeSet::new();
+    for entry in fs::read_dir(peer_boot).into_diagnostic()? {
+        let entry = entry.into_diagnostic()?;
+        let name = entry.file_name();
+        let index = name
+            .to_str()
+            .and_then(|text| {
+                text.parse::<usize>()
+                    .ok()
+                    .filter(|index| *index < MAX_PEER_WORKLOADS && index.to_string() == text)
+            })
+            .ok_or_else(|| {
+                miette::miette!(
+                    "unexpected entry {name:?} in peer boot root {}",
+                    peer_boot.display()
+                )
+            })?;
+        let metadata = fs::symlink_metadata(entry.path()).into_diagnostic()?;
+        // Each boot directory is its own Memory emptyDir. A plain directory on
+        // the init container's root filesystem would never reach the peer.
+        if !metadata.is_dir() || metadata.dev() == root.dev() {
+            return Err(miette::miette!(
+                "peer boot directory {} is not a mounted volume",
+                entry.path().display()
+            ));
+        }
+        mounts.insert(index);
+    }
+    Ok(mounts)
+}
+
+/// Atomically publish one token as owner-read-only `token` in `directory`.
+#[cfg(target_os = "linux")]
+fn write_peer_token(directory: &Path, token: &[u8], nonce: &str) -> Result<()> {
+    use std::fs::{self, OpenOptions};
+    use std::io::Write as _;
+    use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
+
+    use openshell_sandbox_backend::peer_workloads::PEER_TOKEN_FILE;
+
+    let destination = directory.join(PEER_TOKEN_FILE);
+    if fs::symlink_metadata(&destination).is_ok() {
+        return Err(miette::miette!(
+            "peer boot directory {} already holds a token",
+            directory.display()
+        ));
+    }
+    let temporary = directory.join(format!(".{PEER_TOKEN_FILE}.{nonce}"));
+    let mut output = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o400)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(&temporary)
+        .into_diagnostic()?;
+    let written = output
+        .write_all(token)
+        .and_then(|()| output.set_permissions(fs::Permissions::from_mode(0o400)))
+        .and_then(|()| output.sync_all());
+    drop(output);
+    if let Err(error) = written.and_then(|()| fs::rename(&temporary, &destination)) {
+        let _ = fs::remove_file(&temporary);
+        return Err(error).into_diagnostic();
+    }
+    OpenOptions::new()
+        .read(true)
+        .open(directory)
+        .into_diagnostic()?
+        .sync_all()
+        .into_diagnostic()
 }
 
 #[cfg(target_os = "linux")]
@@ -1841,12 +2060,13 @@ mod tests {
         let revision = source.join("..2026_09_04_00_00_00");
         std::fs::create_dir(&revision).unwrap();
         for name in KUBERNETES_BOOTSTRAP_SECRET_FILES {
-            std::fs::write(revision.join(name), format!("contents-{name}")).unwrap();
+            std::fs::write(revision.join(name), secret_contents(name, 0)).unwrap();
             std::os::unix::fs::symlink(format!("..data/{name}"), source.join(name)).unwrap();
         }
         std::os::unix::fs::symlink(revision.file_name().unwrap(), source.join("..data")).unwrap();
 
-        stage_kubernetes_bootstrap_at(&source, &runtime, &state).unwrap();
+        stage_kubernetes_bootstrap_at(&source, &runtime, &state, &root.path().join("peer-boot"))
+            .unwrap();
 
         assert!(runtime.join("openshell-sandbox").is_file());
         assert_eq!(
@@ -1868,6 +2088,176 @@ mod tests {
                 0o600
             );
         }
+    }
+
+    /// Lay out a projected Secret the way the kubelet does: every key is a
+    /// symlink through `..data` into a timestamped revision directory.
+    fn projected_secret(source: &Path, entries: &[(String, String)]) {
+        std::fs::create_dir(source).unwrap();
+        let revision = source.join("..2026_10_27_00_00_00");
+        std::fs::create_dir(&revision).unwrap();
+        for (name, contents) in entries {
+            std::fs::write(revision.join(name), contents).unwrap();
+            std::os::unix::fs::symlink(format!("..data/{name}"), source.join(name)).unwrap();
+        }
+        std::os::unix::fs::symlink(revision.file_name().unwrap(), source.join("..data")).unwrap();
+    }
+
+    /// Bootstrap Secret file contents; `boundary.json` records `peers` peers.
+    fn secret_contents(name: &str, peers: usize) -> String {
+        if name != "boundary.json" {
+            return format!("contents-{name}");
+        }
+        let peers = (0..peers)
+            .map(|index| {
+                serde_json::json!({
+                    "index": index,
+                    "name": format!("peer-{index}"),
+                    "command": ["/bin/peer"],
+                    "token_sha256": "a".repeat(64),
+                })
+            })
+            .collect::<Vec<_>>();
+        serde_json::json!({"peers": peers}).to_string()
+    }
+
+    fn bootstrap_entries(peer_tokens: &[(usize, String)]) -> Vec<(String, String)> {
+        KUBERNETES_BOOTSTRAP_SECRET_FILES
+            .iter()
+            .map(|name| {
+                (
+                    (*name).to_string(),
+                    secret_contents(name, peer_tokens.len()),
+                )
+            })
+            .chain(peer_tokens.iter().map(|(index, token)| {
+                (
+                    openshell_sandbox_backend::peer_workloads::peer_token_secret_key(*index),
+                    token.clone(),
+                )
+            }))
+            .collect()
+    }
+
+    #[test]
+    fn peer_boot_root_matches_the_shared_init_layout() {
+        for index in 0..openshell_sandbox_backend::peer_workloads::MAX_PEER_WORKLOADS {
+            assert_eq!(
+                Path::new(PEER_BOOT_INIT_ROOT).join(index.to_string()),
+                Path::new(&openshell_sandbox_backend::peer_workloads::peer_boot_dir_in_init(index))
+            );
+        }
+    }
+
+    #[test]
+    fn peer_tokens_require_matching_mounted_boot_volumes() {
+        if nix::unistd::geteuid().is_root() || nix::unistd::getegid().as_raw() == 0 {
+            return;
+        }
+        let token = "ab".repeat(32);
+        // A token whose boot volume was never mounted.
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("input");
+        projected_secret(&source, &bootstrap_entries(&[(0, token.clone())]));
+        let error = stage_kubernetes_bootstrap_at(
+            &source,
+            &root.path().join("runtime"),
+            &root.path().join("state"),
+            &root.path().join("peer-boot"),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("records 1 peer workloads"), "{error}");
+
+        // A boot volume without its token.
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("input");
+        projected_secret(&source, &bootstrap_entries(&[]));
+        let peer_boot = root.path().join("peer-boot");
+        std::fs::create_dir_all(peer_boot.join("0")).unwrap();
+        assert!(stage_peer_tokens(&source, &peer_boot, "nonce").is_err());
+
+        // A recorded peer whose token key and volume are both missing.
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("input");
+        let mut entries = bootstrap_entries(&[]);
+        entries[0].1 = secret_contents("boundary.json", 1);
+        projected_secret(&source, &entries);
+        let error = stage_peer_tokens(&source, &root.path().join("peer-boot"), "nonce")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("records 1 peer workloads"), "{error}");
+    }
+
+    #[test]
+    fn peer_boot_directories_must_be_mounted_volumes() {
+        let root = tempfile::tempdir().unwrap();
+        let peer_boot = root.path().join("peer-boot");
+        assert!(peer_boot_mounts(&peer_boot).unwrap().is_empty());
+        std::fs::create_dir_all(peer_boot.join("0")).unwrap();
+        // A plain directory shares its parent's device; only a mount differs.
+        let error = peer_boot_mounts(&peer_boot).unwrap_err().to_string();
+        assert!(error.contains("not a mounted volume"), "{error}");
+
+        let root = tempfile::tempdir().unwrap();
+        let peer_boot = root.path().join("peer-boot");
+        std::fs::create_dir_all(peer_boot.join("00")).unwrap();
+        let error = peer_boot_mounts(&peer_boot).unwrap_err().to_string();
+        assert!(error.contains("unexpected entry"), "{error}");
+    }
+
+    #[test]
+    fn peer_tokens_must_be_lowercase_hex_of_the_contract_length() {
+        let root = tempfile::tempdir().unwrap();
+        for (position, token) in [
+            "AB".repeat(32),
+            "ab".repeat(31),
+            format!("{}\n", "ab".repeat(32)),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let source = root.path().join(format!("input-{position}"));
+            projected_secret(
+                &source,
+                &[(
+                    openshell_sandbox_backend::peer_workloads::peer_token_secret_key(0),
+                    token,
+                )],
+            );
+            assert!(read_peer_tokens(&source).is_err());
+        }
+        let source = root.path().join("input-key");
+        projected_secret(&source, &[("peer-00.token".to_string(), "ab".repeat(32))]);
+        let error = read_peer_tokens(&source).unwrap_err().to_string();
+        assert!(error.contains("malformed peer token key"), "{error}");
+
+        let source = root.path().join("input-valid");
+        let token = "0f".repeat(32);
+        projected_secret(&source, &bootstrap_entries(&[(3, token.clone())]));
+        let tokens = read_peer_tokens(&source).unwrap();
+        assert_eq!(tokens.len(), 1);
+        assert_eq!(tokens[&3], token.as_bytes());
+    }
+
+    #[test]
+    fn peer_token_is_published_owner_read_only_exactly_once() {
+        let root = tempfile::tempdir().unwrap();
+        let token = "0f".repeat(32);
+        write_peer_token(root.path(), token.as_bytes(), "nonce").unwrap();
+        let staged = root
+            .path()
+            .join(openshell_sandbox_backend::peer_workloads::PEER_TOKEN_FILE);
+        assert_eq!(std::fs::read(&staged).unwrap(), token.as_bytes());
+        assert_eq!(
+            std::fs::metadata(&staged).unwrap().permissions().mode() & 0o777,
+            0o400
+        );
+        assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 1);
+        let error = write_peer_token(root.path(), token.as_bytes(), "again")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("already holds a token"), "{error}");
     }
 
     #[test]
