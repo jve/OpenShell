@@ -82,18 +82,6 @@ jobs:
             "${IMAGE_REGISTRY}/supervisor:${IMAGE_TAG}"
           kind get kubeconfig --name niuu-acceptance > "${RUNNER_TEMP}/acceptance-kubeconfig"
           cp "${RUNNER_TEMP}/acceptance-kubeconfig" kubeconfig
-      - name: Preload the peer workload test image
-        # The peer container uses a second public image; a registry hiccup
-        # during the test would surface as a five-minute test timeout.
-        env:
-          PEER_TEST_IMAGE: public.ecr.aws/docker/library/python:3.13-slim
-        run: |
-          for attempt in 1 2 3 4 5; do
-            docker pull "${PEER_TEST_IMAGE}" && break
-            [ "${attempt}" = 5 ] && exit 1
-            sleep $((attempt * 10))
-          done
-          kind load docker-image --name niuu-acceptance "${PEER_TEST_IMAGE}"
       - name: Verify peer workloads with a per-sandbox supervisor
         env:
           OPENSHELL_BIN: ${{ github.workspace }}/target/debug/openshell

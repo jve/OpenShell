@@ -33,9 +33,10 @@ use tokio::task::JoinHandle;
 
 const TEST_HOST: &str = "host.openshell.internal";
 const PEER_NAME: &str = "mesh-peer";
-/// A different image from the agent's, pulled from the same public mirror
-/// other E2E fixtures build on.
-const PEER_IMAGE: &str = "public.ecr.aws/docker/library/python:3.13-slim";
+/// A different image from the agent's (Python 3.13 instead of 3.12), pinned
+/// on ghcr.io because anonymous public.ecr.aws pulls from shared CI runners
+/// hit data limits.
+const PEER_IMAGE: &str = "ghcr.io/astral-sh/uv:0.12.17-python3.13-trixie-slim@sha256:5b7499c3e4048c8f9afcca908c2f2c486923cd441b857976fb6a871e6a090737";
 const MESH_DIR: &str = "/tmp/niuu-mesh";
 const AGENT_PORT: u16 = 17480;
 const PEER_PORT: u16 = 17482;
