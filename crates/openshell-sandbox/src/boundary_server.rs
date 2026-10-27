@@ -1879,6 +1879,8 @@ mod linux {
         qualification: crate::RuntimeQualification,
         /// Peer workload runtimes; `None` for a single-container boundary.
         peer_hub: Option<Arc<crate::peer_hub::PeerHub>>,
+        /// Held for the duration of one `start_agent`.
+        agent_start: Mutex<()>,
         /// Set once a failed peer group has been torn down; the boundary
         /// then exits with this reason.
         peer_group_ended: Mutex<Option<String>>,
@@ -2179,6 +2181,7 @@ mod linux {
                 workload_launcher,
                 qualification,
                 peer_hub: None,
+                agent_start: Mutex::new(()),
                 peer_group_ended: Mutex::new(None),
             })
         }
@@ -3121,6 +3124,9 @@ mod linux {
             provider_env: std::collections::HashMap<String, String>,
             provider_files: std::collections::HashMap<String, String>,
         ) -> Response {
+            // Serializes the whole start, including the peer start that runs
+            // without the state lock.
+            let _starting = lock(&self.agent_start);
             let Some(policy) = lock(&self.attached_policy).clone() else {
                 return guest_error(
                     BoundaryErrorKind::Invalid,
@@ -3173,6 +3179,7 @@ mod linux {
                     "boundary must be confirmed before start_agent",
                 );
             };
+            let prepared = prepared.clone();
             if let Err(error) = self.network_broker.confirm_healthy() {
                 return guest_error(BoundaryErrorKind::Unavailable, error.to_string());
             }
@@ -3219,24 +3226,35 @@ mod linux {
                     format!("install provider files: {error}"),
                 );
             }
-            if let (Some(hub), Some(inputs)) = (&self.peer_hub, peer_inputs)
-                && let Err(error) = hub.start(
+            if let (Some(hub), Some(inputs)) = (&self.peer_hub, peer_inputs) {
+                // Freeze, recovery expiry and group teardown take the state
+                // lock; never hold it while waiting for peers. `agent_start`
+                // still keeps a second start out.
+                drop(state);
+                // A failed start ends the whole group, which fails the boundary.
+                if let Err(error) = hub.start(
                     |peer| inputs.for_peer(&self.config, peer, gpu_requested),
                     crate::peer_hub::PEER_START_TIMEOUT,
-                )
-            {
-                return guest_error(BoundaryErrorKind::Process, error);
+                ) {
+                    return guest_error(BoundaryErrorKind::Process, error);
+                }
+                state = lock(&self.state);
+                if !matches!(*state, RuntimeState::Ready(_)) {
+                    let reason = "boundary left the ready state while its peers started";
+                    hub.abort(reason.to_string());
+                    return guest_error(BoundaryErrorKind::Process, reason);
+                }
             }
             let process = match ManagedProcess::spawn(
                 &self.process_runtime,
                 &self.workload_launcher,
                 launch,
-                prepared.clone(),
+                prepared,
             ) {
                 Ok(process) => Arc::new(process),
                 Err(error) => {
                     if let Some(hub) = &self.peer_hub {
-                        hub.request_termination(false);
+                        hub.abort(format!("agent did not start: {error}"));
                     }
                     return guest_error(BoundaryErrorKind::Process, error);
                 }
@@ -3313,6 +3331,19 @@ mod linux {
                     BoundaryErrorKind::Invalid,
                     format!("invalid provider files: {error}"),
                 );
+            }
+            // Peers apply the snapshot first: a credential rotation or
+            // revocation is reported applied only once every runtime serving
+            // a workload of this boundary installed it.
+            if let Some(hub) = &self.peer_hub
+                && let Err(error) = hub.update_provider_environment(
+                    revision,
+                    &provider_env,
+                    &provider_files,
+                    crate::peer_hub::PEER_PROVIDER_UPDATE_TIMEOUT,
+                )
+            {
+                return guest_error(BoundaryErrorKind::Process, error);
             }
             let requested_revision = revision;
             let revision = match process

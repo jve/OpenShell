@@ -37,7 +37,6 @@ use openshell_sandbox_backend::boundary_protocol::ExitStatusWire;
 use openshell_sandbox_backend::peer_workloads::{
     PEER_CONNECT_TIMEOUT_SECS, PEER_SOCKET_FILE, PeerWorkloadConfig, peer_control_dir_in_primary,
 };
-use tokio::sync::oneshot;
 
 use crate::network_broker::{NETWORK_DECISION_TIMEOUT, NetworkBroker};
 use crate::peer_protocol::{
@@ -56,6 +55,15 @@ pub const PEER_TERMINATION_TIMEOUT: Duration = Duration::from_secs(
 );
 
 const ACCEPT_POLL_INTERVAL: Duration = Duration::from_millis(10);
+
+/// Bound on a peer delivering the relayed stream for an allowed open: its
+/// broker's own relay setup bound plus scheduling slack. Past it the open
+/// fails rather than holding a mediation stream.
+pub const PEER_RELAY_TIMEOUT: Duration =
+    Duration::from_secs(crate::network_broker::RELAY_CONNECT_TIMEOUT.as_secs() + 5);
+
+/// Bound on every peer applying a provider environment update.
+pub const PEER_PROVIDER_UPDATE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Group-ending callback registered by the boundary.
 pub type GroupFailureHandler = Arc<dyn Fn(String) + Send + Sync>;
@@ -141,13 +149,15 @@ fn production_control_dir(index: usize) -> PathBuf {
 #[derive(Default)]
 struct LinkState {
     start: Option<Result<(), String>>,
+    /// Latest provider-update acknowledgement: request ID and outcome.
+    provider_update: Option<(u64, Result<(), String>)>,
     exited: Option<ExitStatusWire>,
     closed: bool,
 }
 
 /// Relayed-stream waiters of one link; `None` once the link has closed, so
 /// no waiter can be parked on a peer that will never answer.
-type RelayWaiters = Option<HashMap<u64, oneshot::Sender<io::Result<TcpStream>>>>;
+type RelayWaiters = Option<HashMap<u64, std::sync::mpsc::SyncSender<io::Result<TcpStream>>>>;
 
 struct PeerLink {
     config: PeerWorkloadConfig,
@@ -198,10 +208,18 @@ impl PeerLink {
 pub struct PeerHub {
     links: Vec<Arc<PeerLink>>,
     broker: NetworkBroker,
-    failure: Mutex<Option<String>>,
-    handler: Mutex<Option<GroupFailureHandler>>,
+    /// Group failure and its handler share one lock, so a failure is
+    /// delivered exactly once whether it precedes or follows registration.
+    failure: Mutex<FailureState>,
     /// The boundary is ending the group; peer exits are expected.
     terminating: AtomicBool,
+    next_request_id: std::sync::atomic::AtomicU64,
+}
+
+#[derive(Default)]
+struct FailureState {
+    reason: Option<String>,
+    handler: Option<GroupFailureHandler>,
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -248,9 +266,9 @@ impl PeerHub {
         let hub = Arc::new(Self {
             links,
             broker,
-            failure: Mutex::new(None),
-            handler: Mutex::new(None),
+            failure: Mutex::new(FailureState::default()),
             terminating: AtomicBool::new(false),
+            next_request_id: std::sync::atomic::AtomicU64::new(1),
         });
         for (link, mut receiver) in hub.links.clone().into_iter().zip(receivers) {
             let hub = hub.clone();
@@ -269,15 +287,26 @@ impl PeerHub {
     /// Register the boundary's group-ending handler. A failure that happened
     /// before registration is delivered immediately.
     pub fn set_failure_handler(&self, handler: GroupFailureHandler) {
-        let pending = lock(&self.failure).clone();
-        *lock(&self.handler) = Some(handler.clone());
+        let pending = {
+            let mut failure = lock(&self.failure);
+            failure.handler = Some(handler.clone());
+            failure.reason.clone()
+        };
         if let Some(reason) = pending {
             handler(reason);
         }
     }
 
     pub fn failure(&self) -> Option<String> {
-        lock(&self.failure).clone()
+        lock(&self.failure).reason.clone()
+    }
+
+    /// End the group: record the failure, run the boundary's handler, and
+    /// terminate every peer. Used when the boundary itself cannot proceed
+    /// with its peers, such as a failed start.
+    pub fn abort(&self, reason: String) {
+        self.fail_group(reason);
+        self.request_termination(false);
     }
 
     /// Qualifications every peer measured in its own container.
@@ -309,8 +338,9 @@ impl PeerHub {
                 .sender
                 .send(&PrimaryToPeer::Start(Box::new(start_for(&link.config))))
             {
-                self.request_termination(false);
-                return Err(format!("start peer workload {}: {error}", link.name()));
+                let reason = format!("start peer workload {}: {error}", link.name());
+                self.abort(reason.clone());
+                return Err(reason);
             }
         }
         let deadline = Instant::now() + timeout;
@@ -323,9 +353,61 @@ impl PeerHub {
                 (true, None) => "peer runtime closed its channel".to_string(),
                 (false, _) => format!("no answer within {}s", timeout.as_secs()),
             };
-            self.request_termination(false);
+            let reason = format!("peer workload {} did not start: {failure}", link.name());
+            self.abort(reason.clone());
+            return Err(reason);
+        }
+        Ok(())
+    }
+
+    /// Install a rotated provider snapshot in every peer and wait until each
+    /// applied it. The caller reports the update as failed otherwise.
+    pub fn update_provider_environment(
+        &self,
+        revision: u64,
+        provider_env: &HashMap<String, String>,
+        provider_files: &HashMap<String, String>,
+        timeout: Duration,
+    ) -> Result<(), String> {
+        self.confirm_healthy()?;
+        let id = self.next_request_id.fetch_add(1, Ordering::Relaxed);
+        for link in &self.links {
+            link.sender
+                .send(&PrimaryToPeer::UpdateProviderEnvironment {
+                    id,
+                    revision,
+                    provider_env: provider_env.clone(),
+                    provider_files: provider_files.clone(),
+                })
+                .map_err(|error| {
+                    format!(
+                        "send provider environment to peer workload {}: {error}",
+                        link.name()
+                    )
+                })?;
+        }
+        let deadline = Instant::now() + timeout;
+        for link in &self.links {
+            let answered = link.wait_until(deadline, |state| {
+                state.closed
+                    || state
+                        .provider_update
+                        .as_ref()
+                        .is_some_and(|(answered, _)| *answered == id)
+            });
+            let outcome = lock(&link.state)
+                .provider_update
+                .clone()
+                .filter(|(answered, _)| *answered == id)
+                .map(|(_, outcome)| outcome);
+            let failure = match (answered, outcome) {
+                (true, Some(Ok(()))) => continue,
+                (true, Some(Err(message))) => message,
+                (true, None) => "peer runtime closed its channel".to_string(),
+                (false, _) => format!("no answer within {}s", timeout.as_secs()),
+            };
             return Err(format!(
-                "peer workload {} did not start: {failure}",
+                "peer workload {} did not apply the provider environment: {failure}",
                 link.name()
             ));
         }
@@ -379,13 +461,14 @@ impl PeerHub {
     }
 
     fn fail_group(&self, reason: String) {
-        {
+        let handler = {
             let mut failure = lock(&self.failure);
-            if failure.is_some() {
+            if failure.reason.is_some() {
                 return;
             }
-            *failure = Some(reason.clone());
-        }
+            failure.reason = Some(reason.clone());
+            failure.handler.clone()
+        };
         tracing::error!(reason = %reason, "Peer workload group failed; ending the sandbox");
         openshell_ocsf::ocsf_emit!(
             openshell_ocsf::DetectionFindingBuilder::new(openshell_ocsf::ctx::ctx())
@@ -400,7 +483,6 @@ impl PeerHub {
                 .message(format!("Peer workload group ended: {reason}"))
                 .build()
         );
-        let handler = lock(&self.handler).clone();
         if let Some(handler) = handler {
             handler(reason);
         }
@@ -443,6 +525,9 @@ impl PeerHub {
     ) -> Option<String> {
         match message {
             PeerToPrimary::Started => link.update(|state| state.start = Some(Ok(()))),
+            PeerToPrimary::ProviderEnvironmentUpdated { id, error } => link.update(|state| {
+                state.provider_update = Some((id, error.map_or(Ok(()), Err)));
+            }),
             PeerToPrimary::StartFailed { message } => {
                 link.update(|state| state.start = Some(Err(message)));
             }
@@ -477,7 +562,7 @@ impl PeerHub {
                     .as_mut()
                     .and_then(|relays| relays.remove(&id));
                 if let (Some(waiter), Some(descriptor)) = (waiter, descriptor) {
-                    let _ = waiter.send(relayed_stream(descriptor));
+                    let _ = waiter.try_send(relayed_stream(descriptor));
                 }
             }
             PeerToPrimary::TcpRelayFailed { id, message } => {
@@ -485,7 +570,7 @@ impl PeerHub {
                     .as_mut()
                     .and_then(|relays| relays.remove(&id));
                 if let Some(waiter) = waiter {
-                    let _ = waiter.send(Err(io::Error::other(message)));
+                    let _ = waiter.try_send(Err(io::Error::other(message)));
                 }
             }
             PeerToPrimary::DnsAdmit {
@@ -543,14 +628,42 @@ impl PeerHub {
                     .decision
                     .recv_timeout(NETWORK_DECISION_TIMEOUT)
                     .unwrap_or(TcpOpenDecision::Denied(TcpOpenDenial::MediationUnavailable));
-                if decision == TcpOpenDecision::RelayReady {
-                    // Park the waiter before the peer can answer; a closed
-                    // link drops it, which fails the relay instead of hanging.
-                    if let Some(relays) = lock(&link.relays).as_mut() {
-                        relays.insert(id, forwarded.relay);
-                    }
+                if decision != TcpOpenDecision::RelayReady {
+                    link.send(&PrimaryToPeer::TcpDecision { id, decision });
+                    return;
                 }
-                link.send(&PrimaryToPeer::TcpDecision { id, decision });
+                // Park a waiter before the peer can answer. Mediation blocks
+                // on this relay, so it always resolves: with the peer's
+                // stream, its failure, the link closing, or the bound.
+                let (relay_tx, relay_rx) = std::sync::mpsc::sync_channel(1);
+                let parked = lock(&link.relays)
+                    .as_mut()
+                    .map(|relays| relays.insert(id, relay_tx))
+                    .is_some();
+                let relayed = if parked {
+                    link.send(&PrimaryToPeer::TcpDecision { id, decision });
+                    relay_rx
+                        .recv_timeout(PEER_RELAY_TIMEOUT)
+                        .unwrap_or_else(|_| {
+                            if let Some(relays) = lock(&link.relays).as_mut() {
+                                relays.remove(&id);
+                            }
+                            // The answer may have landed while the waiter was
+                            // being withdrawn.
+                            relay_rx.try_recv().unwrap_or_else(|_| {
+                                Err(io::Error::new(
+                                    io::ErrorKind::TimedOut,
+                                    "peer did not deliver the relayed stream",
+                                ))
+                            })
+                        })
+                } else {
+                    Err(io::Error::new(
+                        io::ErrorKind::BrokenPipe,
+                        "peer runtime is gone",
+                    ))
+                };
+                let _ = forwarded.relay.send(relayed);
             });
         if let Err(error) = spawned {
             tracing::warn!(%error, "could not wait for a forwarded peer TCP decision");
@@ -1190,6 +1303,7 @@ mod tests {
                 })
             })
             .collect::<Vec<_>>();
+        let failures = failures(&hub);
         let error = hub
             .start(start_message, Duration::from_secs(10))
             .unwrap_err();
@@ -1197,9 +1311,167 @@ mod tests {
             error.contains("peer-1") && error.contains("image has no python"),
             "{error}"
         );
+        // A failed start ends the group, so the boundary fails instead of
+        // staying ready with dead peers.
+        assert_eq!(lock(&failures).len(), 1);
+        assert!(lock(&failures)[0].contains("did not start"));
         for peer in peers {
             drop(peer.join().unwrap());
         }
+    }
+
+    #[test]
+    fn a_failure_before_handler_registration_is_delivered_exactly_once() {
+        let (_barrier, hub, _channels) = joined_hub(1);
+        hub.abort("agent did not start".to_string());
+        hub.abort("a second reason is ignored".to_string());
+        let failures = failures(&hub);
+        assert_eq!(
+            lock(&failures).as_slice(),
+            ["agent did not start".to_string()]
+        );
+        hub.abort("still ignored".to_string());
+        assert_eq!(lock(&failures).len(), 1);
+    }
+
+    /// Answer every provider update of one peer with `error`.
+    fn answer_provider_updates(
+        (sender, mut receiver): (PeerSender, PeerReceiver),
+        error: Option<String>,
+    ) -> std::thread::JoinHandle<(PeerSender, PeerReceiver, u64)> {
+        std::thread::spawn(move || {
+            let PrimaryToPeer::UpdateProviderEnvironment {
+                id,
+                revision,
+                provider_env,
+                provider_files,
+            } = receiver.recv::<PrimaryToPeer>().unwrap().unwrap().message
+            else {
+                panic!("expected a provider update");
+            };
+            assert_eq!(provider_env["TOKEN"], "rotated");
+            assert_eq!(provider_files.len(), 1);
+            sender
+                .send(&PeerToPrimary::ProviderEnvironmentUpdated { id, error })
+                .unwrap();
+            (sender, receiver, revision)
+        })
+    }
+
+    #[test]
+    fn provider_updates_succeed_only_when_every_peer_applies_them() {
+        let provider_env = HashMap::from([("TOKEN".to_string(), "rotated".to_string())]);
+        let provider_files =
+            HashMap::from([("/run/creds/token".to_string(), "rotated".to_string())]);
+
+        let (_barrier, hub, channels) = joined_hub(2);
+        let peers = channels
+            .into_iter()
+            .map(|channel| answer_provider_updates(channel, None))
+            .collect::<Vec<_>>();
+        hub.update_provider_environment(7, &provider_env, &provider_files, Duration::from_secs(10))
+            .unwrap();
+        for peer in peers {
+            assert_eq!(peer.join().unwrap().2, 7);
+        }
+
+        let (_barrier, hub, mut channels) = joined_hub(2);
+        let refusing = answer_provider_updates(
+            channels.pop().unwrap(),
+            Some("invalid provider files".to_string()),
+        );
+        let applying = answer_provider_updates(channels.pop().unwrap(), None);
+        let error = hub
+            .update_provider_environment(8, &provider_env, &provider_files, Duration::from_secs(10))
+            .unwrap_err();
+        assert!(
+            error.contains("peer-1") && error.contains("invalid provider files"),
+            "{error}"
+        );
+        drop((refusing.join().unwrap(), applying.join().unwrap()));
+
+        let (_barrier, hub, _channels) = joined_hub(1);
+        let error = hub
+            .update_provider_environment(
+                9,
+                &provider_env,
+                &provider_files,
+                Duration::from_millis(200),
+            )
+            .unwrap_err();
+        assert!(error.contains("no answer"), "{error}");
+    }
+
+    /// Queue one allowed open from peer 0 and return its mediation outcome
+    /// once the peer has been told to relay.
+    fn allowed_open(
+        hub: &PeerHub,
+        channel: &mut (PeerSender, PeerReceiver),
+        id: u64,
+    ) -> std::thread::JoinHandle<io::Result<Option<TcpStream>>> {
+        let broker = hub.broker.clone();
+        channel
+            .0
+            .send(&PeerToPrimary::TcpOpen {
+                id,
+                destination: "203.0.113.9:443".parse().unwrap(),
+                identity:
+                    openshell_sandbox_backend::boundary_protocol::BinaryIdentityWire::Failed {
+                        message: "unresolved".to_string(),
+                    },
+                socket: openshell_isolation_interface::contract::NetworkSocketMetadata {
+                    socket_cookie: id,
+                    nonblocking: false,
+                    process_generation: 2,
+                },
+                notification_to_queue_us: 0,
+                queue_wait_us: 0,
+            })
+            .unwrap();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let pending = runtime.block_on(broker.accept()).unwrap();
+        let completion = std::thread::spawn(move || {
+            runtime.block_on(pending.complete(TcpOpenDecision::RelayReady))
+        });
+        match channel.1.recv::<PrimaryToPeer>().unwrap().unwrap().message {
+            PrimaryToPeer::TcpDecision {
+                id: answered,
+                decision: TcpOpenDecision::RelayReady,
+            } => assert_eq!(answered, id),
+            other => panic!("unexpected {other:?}"),
+        }
+        completion
+    }
+
+    #[test]
+    fn an_allowed_open_always_resolves_when_the_peer_cannot_relay() {
+        let (_barrier, hub, mut channels) = joined_hub(1);
+        // The peer abandoned the open and says so.
+        let completion = allowed_open(&hub, &mut channels[0], 31);
+        channels[0]
+            .0
+            .send(&PeerToPrimary::TcpRelayFailed {
+                id: 31,
+                message: "the peer runtime no longer tracks this open".to_string(),
+            })
+            .unwrap();
+        assert!(completion.join().unwrap().is_err());
+
+        // The peer never answers: the parked relay is bounded.
+        let started = Instant::now();
+        let completion = allowed_open(&hub, &mut channels[0], 32);
+        assert!(completion.join().unwrap().is_err());
+        assert!(started.elapsed() >= PEER_RELAY_TIMEOUT);
+
+        // The peer runtime disappears: the relay fails at once.
+        let completion = allowed_open(&hub, &mut channels[0], 33);
+        drop(channels.remove(0));
+        let started = Instant::now();
+        assert!(completion.join().unwrap().is_err());
+        assert!(started.elapsed() < PEER_RELAY_TIMEOUT);
     }
 
     #[test]

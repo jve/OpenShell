@@ -29,6 +29,8 @@
 //!    [`PeerToPrimary::TcpRelay`] for external TCP opens, and
 //!    [`PeerToPrimary::DnsAdmit`] / [`PrimaryToPeer::DnsAdmitResult`] to
 //!    register a workload DNS socket with the primary's resolver relay.
+//!    Provider rotation: [`PrimaryToPeer::UpdateProviderEnvironment`] /
+//!    [`PeerToPrimary::ProviderEnvironmentUpdated`].
 //! 5. Lifecycle: [`PrimaryToPeer::Freeze`], [`PrimaryToPeer::Thaw`],
 //!    [`PrimaryToPeer::Terminate`]; peer → [`PeerToPrimary::WorkloadExited`]
 //!    when its workload tree is gone and [`PeerToPrimary::Failed`] before it
@@ -229,6 +231,9 @@ pub enum PeerToPrimary {
         transport: DnsTransport,
         sources: Vec<SocketAddr>,
     },
+    /// Outcome of one provider environment update; `error` is set when the
+    /// peer did not apply it.
+    ProviderEnvironmentUpdated { id: u64, error: Option<String> },
     /// The peer workload tree has exited.
     WorkloadExited { status: ExitStatusWire },
     /// The peer runtime cannot keep its workload under the boundary and is
@@ -248,6 +253,7 @@ impl PeerToPrimary {
             Self::TcpRelayFailed { .. } => "tcp_relay_failed",
             Self::DnsAdmit { .. } => "dns_admit",
             Self::DnsRevoke { .. } => "dns_revoke",
+            Self::ProviderEnvironmentUpdated { .. } => "provider_environment_updated",
             Self::WorkloadExited { .. } => "workload_exited",
             Self::Failed { .. } => "failed",
         }
@@ -267,6 +273,13 @@ pub enum PrimaryToPeer {
     TcpDecision { id: u64, decision: TcpOpenDecision },
     /// Outcome of one DNS admission; `errno` is set when it was refused.
     DnsAdmitResult { id: u64, errno: Option<i32> },
+    /// Install a rotated provider snapshot, exactly as the agent's.
+    UpdateProviderEnvironment {
+        id: u64,
+        revision: u64,
+        provider_env: HashMap<String, String>,
+        provider_files: HashMap<String, String>,
+    },
     /// Stop the peer workload while supervisor control recovers.
     Freeze,
     /// Resume the peer workload after authenticated recovery.
@@ -283,6 +296,7 @@ impl PrimaryToPeer {
             Self::Start(_) => "start",
             Self::TcpDecision { .. } => "tcp_decision",
             Self::DnsAdmitResult { .. } => "dns_admit_result",
+            Self::UpdateProviderEnvironment { .. } => "update_provider_environment",
             Self::Freeze => "freeze",
             Self::Thaw => "thaw",
             Self::Terminate { .. } => "terminate",

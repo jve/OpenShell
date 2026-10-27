@@ -37,7 +37,7 @@ const DNS_RELAY_ADDRESS: SocketAddr = SocketAddr::V4(std::net::SocketAddrV4::new
     Ipv4Addr::new(127, 0, 0, 53),
     53,
 ));
-const RELAY_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+pub const RELAY_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 pub const NETWORK_DECISION_TIMEOUT: Duration = Duration::from_secs(30);
 /// Live DNS sockets one peer runtime may register with the primary relay.
 /// The peer reclaims closed sockets before it reaches this bound; the
@@ -289,8 +289,9 @@ pub struct NetworkBroker {
     pending: Arc<tokio::sync::Mutex<mpsc::Receiver<PendingTcpOpen>>>,
     pending_dns: Arc<tokio::sync::Mutex<mpsc::Receiver<PendingDnsQuery>>>,
     /// Feeds TCP opens forwarded by peer runtimes into the same queue as
-    /// this runtime's own.
-    injector: mpsc::Sender<PendingTcpOpen>,
+    /// this runtime's own. Weak, so the queue still closes, and `accept`
+    /// still fails, when the broker thread that owns the strong sender dies.
+    injector: mpsc::WeakSender<PendingTcpOpen>,
     dns_relay: DnsRelay,
     protected_control_port: Option<u16>,
     registry: Arc<Mutex<SocketRegistry>>,
@@ -470,7 +471,7 @@ impl NetworkBroker {
             workload_frozen,
             pending: Arc::new(tokio::sync::Mutex::new(pending_rx)),
             pending_dns: Arc::new(tokio::sync::Mutex::new(pending_dns_rx)),
-            injector: pending_tx,
+            injector: pending_tx.downgrade(),
             dns_relay,
             protected_control_port,
             registry,
@@ -559,7 +560,11 @@ impl NetworkBroker {
         let (decision_tx, decision_rx) = std::sync::mpsc::sync_channel(1);
         let (relay_tx, relay_rx) = oneshot::channel();
         let now = Instant::now();
-        self.injector
+        let injector = self
+            .injector
+            .upgrade()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::BrokenPipe, "network broker stopped"))?;
+        injector
             .try_send(PendingTcpOpen {
                 destination,
                 identity,
@@ -2795,6 +2800,50 @@ mod tests {
         let (stream, _) = relay.accept().unwrap();
         forwarded.relay.send(Ok(stream)).unwrap();
         assert!(completion.join().unwrap().unwrap().is_some());
+    }
+
+    #[test]
+    fn accept_fails_once_the_broker_thread_stops() {
+        let (launcher, listener) = crate::linux::workload_launcher::start().unwrap();
+        let broker = NetworkBroker::start_for_test(listener).unwrap();
+        // The dispatcher exits after its next notification; it owns the only
+        // strong open-queue sender, so the queue closes with it.
+        broker.healthy.store(false, Ordering::Release);
+        let _ = launcher
+            .execute(|| {
+                socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::DGRAM, None).map(drop)
+            })
+            .unwrap();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let accepted = runtime
+            .block_on(tokio::time::timeout(
+                Duration::from_secs(10),
+                broker.accept(),
+            ))
+            .expect("accept must not hang on a stopped broker");
+        assert_eq!(
+            accepted.err().map(|error| error.kind()),
+            Some(io::ErrorKind::BrokenPipe)
+        );
+        assert!(broker.confirm_healthy().is_err());
+        let error = broker
+            .inject_tcp_open(
+                "203.0.113.7:443".parse().unwrap(),
+                Err(ResolveError::Failed("test".to_string())),
+                NetworkSocketMetadata {
+                    socket_cookie: 1,
+                    nonblocking: false,
+                    process_generation: 1,
+                },
+                Duration::ZERO,
+                Duration::ZERO,
+            )
+            .err()
+            .unwrap();
+        assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
     }
 
     #[test]
