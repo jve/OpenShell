@@ -605,8 +605,28 @@ pub fn sandbox_bootstrap_secret(
     boundary_config: Vec<u8>,
     boundary_certificate: Vec<u8>,
     boundary_private_key: Vec<u8>,
+    peer_tokens: Vec<String>,
     owner: OwnerReference,
 ) -> Secret {
+    let mut data = BTreeMap::from([
+        (BOUNDARY_CONFIG_KEY.to_string(), ByteString(boundary_config)),
+        (
+            BOUNDARY_CERTIFICATE_KEY.to_string(),
+            ByteString(boundary_certificate),
+        ),
+        (
+            BOUNDARY_PRIVATE_KEY.to_string(),
+            ByteString(boundary_private_key),
+        ),
+    ]);
+    // One-use peer tokens ride in the same immutable, init-container-only
+    // Secret; the trusted init container stages each into its peer's boot dir.
+    data.extend(peer_tokens.into_iter().enumerate().map(|(index, token)| {
+        (
+            openshell_sandbox_backend::peer_workloads::peer_token_secret_key(index),
+            ByteString(token.into_bytes()),
+        )
+    }));
     Secret {
         metadata: ObjectMeta {
             name: Some(names.sandbox_secret.clone()),
@@ -615,17 +635,7 @@ pub fn sandbox_bootstrap_secret(
             labels: Some(common_labels(sandbox_id, SANDBOX_SECRET_COMPONENT)),
             ..Default::default()
         },
-        data: Some(BTreeMap::from([
-            (BOUNDARY_CONFIG_KEY.to_string(), ByteString(boundary_config)),
-            (
-                BOUNDARY_CERTIFICATE_KEY.to_string(),
-                ByteString(boundary_certificate),
-            ),
-            (
-                BOUNDARY_PRIVATE_KEY.to_string(),
-                ByteString(boundary_private_key),
-            ),
-        ])),
+        data: Some(data),
         immutable: Some(true),
         type_: Some("Opaque".to_string()),
         ..Default::default()
@@ -1327,6 +1337,7 @@ mod tests {
             Vec::new(),
             Vec::new(),
             Vec::new(),
+            Vec::new(),
             owner(),
         );
         assert_eq!(
@@ -1347,6 +1358,22 @@ mod tests {
                 BOUNDARY_PRIVATE_KEY.to_string(),
             ])
         );
+
+        let with_peers = sandbox_bootstrap_secret(
+            "sandbox",
+            &names,
+            "pair",
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            vec!["a".repeat(64), "b".repeat(64)],
+            owner(),
+        );
+        assert_eq!(with_peers.immutable, Some(true));
+        let peer_data = with_peers.data.expect("Secret data");
+        assert_eq!(peer_data["peer-0.token"].0, "a".repeat(64).into_bytes());
+        assert_eq!(peer_data["peer-1.token"].0, "b".repeat(64).into_bytes());
+        assert_eq!(peer_data.len(), 5);
 
         let supervisor = supervisor_bootstrap_secret(
             "sandbox",

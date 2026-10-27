@@ -31,8 +31,8 @@ use k8s_openapi::api::authentication::v1::{
     TokenReview, TokenReviewSpec, TokenReviewStatus, UserInfo,
 };
 use k8s_openapi::api::core::v1::{
-    Event as KubeEventObj, Namespace, Node, PersistentVolumeClaimVolumeSource, Pod, Secret,
-    Service, ServiceAccount, Volume, VolumeMount,
+    EmptyDirVolumeSource, Event as KubeEventObj, Namespace, Node,
+    PersistentVolumeClaimVolumeSource, Pod, Secret, Service, ServiceAccount, Volume, VolumeMount,
 };
 use k8s_openapi::api::networking::v1::{
     NetworkPolicy, NetworkPolicyIngressRule, NetworkPolicyPeer, NetworkPolicyPort,
@@ -74,11 +74,16 @@ use openshell_sandbox_backend::boundary_protocol::{
     GatewayVerificationKey, SandboxTlsClientConfig, SandboxTlsServerConfig,
     generate_sandbox_tls_material,
 };
+use openshell_sandbox_backend::peer_workloads::{
+    MAX_PEER_WORKLOADS, PEER_BOOT_DIR, PEER_CONTROL_DIR, PEER_SUBCOMMAND, PEER_TOKEN_BYTES,
+    PeerWorkloadConfig, peer_boot_dir_in_init, peer_boot_volume_name, peer_control_dir_in_primary,
+    peer_control_volume_name, validate_peer_name,
+};
 use openshell_supervisor_control::{
     InstanceSupervision, LaunchError, RecoverableInstance, RecoveryBaseline,
     RegistrationTraceContext, SandboxInstanceRegistration, SharedSupervision,
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
@@ -110,6 +115,11 @@ const ANNOTATION_SANDBOX_RUNTIME_SUPERVISOR_UID: &str =
 const ANNOTATION_SANDBOX_RUNTIME_MAIN_PROCESS_SPEC: &str =
     "openshell.ai/sandbox-runtime-main-process-spec";
 const ANNOTATION_SANDBOX_RUNTIME_LOG_LEVEL: &str = "openshell.ai/sandbox-runtime-log-level";
+/// Validated peer workload containers requested at create time, as JSON.
+/// Absent when the sandbox has no peers. Every generation derives the peer
+/// boundary config and the admission gate's expectations from this record.
+const ANNOTATION_SANDBOX_RUNTIME_PEER_WORKLOADS: &str =
+    "openshell.ai/sandbox-runtime-peer-workloads";
 const ANNOTATION_SANDBOX_RUNTIME_NETWORK_POLICY_UID: &str =
     "openshell.ai/sandbox-runtime-network-policy-uid";
 const ANNOTATION_SANDBOX_RUNTIME_NETWORK_POLICY_GENERATION: &str =
@@ -424,15 +434,9 @@ const SANDBOX_RUNTIME_RECONCILE_INTERVAL: Duration = Duration::from_secs(30);
 const SANDBOX_RUNTIME_BOOTSTRAP_GRACE: Duration = Duration::from_mins(5);
 
 fn random_sandbox_runtime_token() -> Result<String, KubernetesDriverError> {
-    use std::fmt::Write as _;
-
     let bytes = openshell_crypto::random_bytes::<32>()
         .map_err(|error| KubernetesDriverError::Message(error.to_string()))?;
-    let mut token = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        write!(token, "{byte:02x}").expect("writing to String cannot fail");
-    }
-    Ok(token)
+    Ok(lower_hex(&bytes))
 }
 
 fn decode_launch_authentication(
@@ -532,7 +536,17 @@ impl KubernetesSandboxDriverConfig {
         validate_kubernetes_driver_volume_mounts(
             &self.volumes,
             &self.containers.agent.volume_mounts,
-        )
+            "containers.agent.volume_mounts",
+        )?;
+        validate_kubernetes_peer_workloads(&self.containers.workloads)?;
+        for peer in &self.containers.workloads {
+            validate_kubernetes_driver_volume_mounts(
+                &self.volumes,
+                &peer.volume_mounts,
+                "containers.workloads[].volume_mounts",
+            )?;
+        }
+        Ok(())
     }
 
     fn has_explicit_sandbox_data_mount(&self) -> bool {
@@ -558,6 +572,28 @@ struct KubernetesPodDriverConfig {
 #[serde(default, deny_unknown_fields)]
 struct KubernetesDriverContainersConfig {
     agent: KubernetesContainerDriverConfig,
+    /// Peer workload containers rendered next to `agent`. See
+    /// [`openshell_sandbox_backend::peer_workloads`] for the runtime contract.
+    workloads: Vec<KubernetesPeerWorkloadConfig>,
+}
+
+/// One caller-requested peer workload container.
+///
+/// The caller selects only the image, the exact workload argv, non-secret
+/// environment, resources, and declared volume mounts. The driver owns the
+/// container entrypoint, security context, and every other `PodSpec` field.
+/// The validated list is recorded on the Sandbox resource (see
+/// [`ANNOTATION_SANDBOX_RUNTIME_PEER_WORKLOADS`]) so later generations and the
+/// admission gate use exactly what the caller requested at create time.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+struct KubernetesPeerWorkloadConfig {
+    name: String,
+    image: String,
+    command: Vec<String>,
+    environment: BTreeMap<String, String>,
+    resources: KubernetesContainerResourceConfig,
+    volume_mounts: Vec<KubernetesDriverVolumeMountConfig>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -567,7 +603,7 @@ struct KubernetesContainerDriverConfig {
     volume_mounts: Vec<KubernetesDriverVolumeMountConfig>,
 }
 
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 struct KubernetesContainerResourceConfig {
     requests: BTreeMap<String, String>,
@@ -578,8 +614,16 @@ struct KubernetesContainerResourceConfig {
 #[serde(default, deny_unknown_fields)]
 struct KubernetesDriverVolumeConfig {
     name: String,
-    persistent_volume_claim: KubernetesPersistentVolumeClaimConfig,
+    /// Exactly one of `persistent_volume_claim` and `empty_dir` is required.
+    persistent_volume_claim: Option<KubernetesPersistentVolumeClaimConfig>,
+    empty_dir: Option<KubernetesEmptyDirConfig>,
 }
+
+/// A Pod-lifetime scratch volume, typically shared between `agent` and peer
+/// workload containers. No `emptyDir` options are exposed.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct KubernetesEmptyDirConfig {}
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -597,7 +641,7 @@ impl Default for KubernetesPersistentVolumeClaimConfig {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 struct KubernetesDriverVolumeMountConfig {
     name: String,
@@ -621,10 +665,16 @@ impl From<&KubernetesDriverVolumeConfig> for Volume {
     fn from(volume: &KubernetesDriverVolumeConfig) -> Self {
         Self {
             name: volume.name.clone(),
-            persistent_volume_claim: Some(PersistentVolumeClaimVolumeSource {
-                claim_name: volume.persistent_volume_claim.claim_name.clone(),
-                read_only: Some(volume.persistent_volume_claim.read_only),
+            persistent_volume_claim: volume.persistent_volume_claim.as_ref().map(|claim| {
+                PersistentVolumeClaimVolumeSource {
+                    claim_name: claim.claim_name.clone(),
+                    read_only: Some(claim.read_only),
+                }
             }),
+            empty_dir: volume
+                .empty_dir
+                .as_ref()
+                .map(|_| EmptyDirVolumeSource::default()),
             ..Default::default()
         }
     }
@@ -678,15 +728,28 @@ fn validate_kubernetes_driver_volumes(
                 "volume name '{name}' is reserved for OpenShell-managed volumes"
             ));
         }
+        if name.starts_with(PEER_WORKLOAD_VOLUME_PREFIX) {
+            return Err(format!(
+                "volume name '{name}' uses the prefix '{PEER_WORKLOAD_VOLUME_PREFIX}' reserved for OpenShell-managed peer workload volumes"
+            ));
+        }
         if !names.insert(name) {
             return Err(format!(
                 "duplicate kubernetes driver_config volume '{name}'"
             ));
         }
-        validate_kubernetes_dns1123_subdomain(
-            &volume.persistent_volume_claim.claim_name,
-            "volumes[].persistent_volume_claim.claim_name",
-        )?;
+        match (&volume.persistent_volume_claim, &volume.empty_dir) {
+            (Some(claim), None) => validate_kubernetes_dns1123_subdomain(
+                &claim.claim_name,
+                "volumes[].persistent_volume_claim.claim_name",
+            )?,
+            (None, Some(_)) => {}
+            _ => {
+                return Err(format!(
+                    "volume '{name}' requires exactly one of persistent_volume_claim or empty_dir"
+                ));
+            }
+        }
     }
     Ok(())
 }
@@ -694,18 +757,22 @@ fn validate_kubernetes_driver_volumes(
 fn validate_kubernetes_driver_volume_mounts(
     volumes: &[KubernetesDriverVolumeConfig],
     volume_mounts: &[KubernetesDriverVolumeMountConfig],
+    field: &str,
 ) -> Result<(), String> {
     let mut volume_read_only = BTreeMap::new();
     for volume in volumes {
         volume_read_only.insert(
             volume.name.as_str(),
-            volume.persistent_volume_claim.read_only,
+            volume
+                .persistent_volume_claim
+                .as_ref()
+                .is_some_and(|claim| claim.read_only),
         );
     }
 
     let mut mount_paths = HashSet::new();
     for mount in volume_mounts {
-        validate_kubernetes_dns1123_label(&mount.name, "containers.agent.volume_mounts[].name")?;
+        validate_kubernetes_dns1123_label(&mount.name, &format!("{field}[].name"))?;
         let volume_name = mount.name.as_str();
         let Some(volume_is_read_only) = volume_read_only.get(volume_name) else {
             return Err(format!(
@@ -732,6 +799,80 @@ fn validate_kubernetes_driver_volume_mounts(
 
         if let Some(sub_path) = mount.sub_path.as_ref() {
             driver_mounts::validate_mount_subpath(sub_path)?;
+        }
+    }
+    Ok(())
+}
+
+/// Name prefix of every driver-owned peer workload volume. Caller volumes may
+/// not use it, so a declared volume can never alias a peer's private control,
+/// boot, or run directory.
+const PEER_WORKLOAD_VOLUME_PREFIX: &str = "openshell-peer-";
+
+/// Memory `emptyDir` mounted at `/run` in peer `index`.
+///
+/// The sandbox runtime stages supervisor CA material and provider files under
+/// `/run` (see [`SANDBOX_PROXY_CA_MOUNT_PATH`] for the agent). Each peer runtime
+/// needs the same writable, private location in its own root filesystem; it is
+/// never shared with the agent, whose `/run` also holds runtime sockets.
+fn peer_run_volume_name(index: usize) -> String {
+    format!("{PEER_WORKLOAD_VOLUME_PREFIX}{index}-run")
+}
+
+/// Validate caller-requested peer workload containers.
+///
+/// Names follow the shared runtime contract. Every peer needs an explicit
+/// image and argv: the driver never falls back to the image entrypoint because
+/// the peer runtime, not the image, is the container entrypoint. Environment is
+/// non-secret workload configuration and cannot reach `OPENSHELL_*` runtime
+/// settings.
+fn validate_kubernetes_peer_workloads(
+    peers: &[KubernetesPeerWorkloadConfig],
+) -> Result<(), String> {
+    if peers.len() > MAX_PEER_WORKLOADS {
+        return Err(format!(
+            "containers.workloads supports at most {MAX_PEER_WORKLOADS} peer workloads, got {}",
+            peers.len()
+        ));
+    }
+    let mut names = HashSet::new();
+    for peer in peers {
+        validate_peer_name(&peer.name)
+            .map_err(|error| format!("containers.workloads[].name: {error}"))?;
+        let name = peer.name.as_str();
+        if !names.insert(name) {
+            return Err(format!("duplicate peer workload name '{name}'"));
+        }
+        if peer.image.is_empty()
+            || peer
+                .image
+                .chars()
+                .any(|character| character.is_whitespace() || character.is_control())
+        {
+            return Err(format!(
+                "peer workload '{name}' requires a non-empty image reference without whitespace"
+            ));
+        }
+        if peer.command.is_empty()
+            || peer
+                .command
+                .iter()
+                .any(|argument| argument.is_empty() || argument.contains('\0'))
+        {
+            return Err(format!(
+                "peer workload '{name}' requires an explicit command without empty or NUL-bearing arguments"
+            ));
+        }
+        for (key, value) in &peer.environment {
+            if key.is_empty()
+                || key.contains(['=', '\0'])
+                || key.starts_with("OPENSHELL_")
+                || value.contains('\0')
+            {
+                return Err(format!(
+                    "peer workload '{name}' environment key {key:?} is empty, contains '=' or NUL, uses the reserved OPENSHELL_ prefix, or has a NUL-bearing value"
+                ));
+            }
         }
     }
     Ok(())
@@ -2272,6 +2413,12 @@ impl KubernetesComputeDriver {
         let kube_name = self.config.kube_resource_name(workspace, name);
         let mut data = sandbox_to_k8s_spec(sandbox.spec.as_ref(), &params)
             .map_err(KubernetesDriverError::InvalidArgument)?;
+        let peer_workloads = encode_peer_workloads_annotation(
+            &kubernetes_driver_config_for_spec(sandbox.spec.as_ref())
+                .map_err(KubernetesDriverError::InvalidArgument)?
+                .containers
+                .workloads,
+        )?;
         self.create_sandbox_runtime_fence(&target_namespace, &proxy_names)
             .await?;
         // A missing bootstrap Secret keeps both pods inert as defense in
@@ -2328,6 +2475,12 @@ impl KubernetesComputeDriver {
             ANNOTATION_SANDBOX_RUNTIME_LOG_LEVEL.to_string(),
             log_level.clone(),
         );
+        if let Some(peer_workloads) = peer_workloads {
+            annotations.insert(
+                ANNOTATION_SANDBOX_RUNTIME_PEER_WORKLOADS.to_string(),
+                peer_workloads,
+            );
+        }
         let control_connection = KubernetesControlConnection::RuntimeInitiated;
         annotations.insert(
             ANNOTATION_SANDBOX_RUNTIME_CONTROL_CONNECTION.to_string(),
@@ -2701,6 +2854,7 @@ impl KubernetesComputeDriver {
         uid: u32,
         gid: u32,
         sandbox_secret_name: &str,
+        peers: &[KubernetesPeerWorkloadConfig],
     ) -> Result<(), KubernetesDriverError> {
         let fail = |message: &str| {
             KubernetesDriverError::Precondition(format!(
@@ -2826,36 +2980,35 @@ impl KubernetesComputeDriver {
         let check_container = |container: &k8s_openapi::api::core::v1::Container,
                                name: &str|
          -> Result<(), KubernetesDriverError> {
-            let context = container
-                .security_context
-                .as_ref()
-                .ok_or_else(|| fail(&format!("{name} has no security context")))?;
-            let drops_all = context
-                .capabilities
-                .as_ref()
-                .and_then(|capabilities| capabilities.drop.as_deref())
-                .is_some_and(|drops| drops.iter().any(|capability| capability == "ALL"));
-            let adds_none = context
-                .capabilities
-                .as_ref()
-                .and_then(|capabilities| capabilities.add.as_deref())
-                .is_none_or(<[String]>::is_empty);
-            if context.run_as_user != Some(i64::from(uid))
-                || context.run_as_group != Some(i64::from(gid))
-                || context.run_as_non_root != Some(true)
-                || context.allow_privilege_escalation != Some(false)
-                || !drops_all
-                || !adds_none
-            {
-                return Err(fail(&format!("{name} security context changed")));
-            }
-            Ok(())
+            validate_workload_container_security_context(container, name, uid, gid)
+                .map_err(|message| fail(&message))
         };
-        let agent = spec
+        if spec
+            .ephemeral_containers
+            .as_deref()
+            .is_some_and(|containers| !containers.is_empty())
+        {
+            return Err(fail("ephemeral containers are not permitted"));
+        }
+        // Exactly the recorded peers, in order, followed by `agent`: nothing
+        // added, removed, renamed, or reordered after rendering.
+        let expected_names = peers
+            .iter()
+            .map(|peer| peer.name.as_str())
+            .chain(std::iter::once("agent"));
+        if !spec
             .containers
             .iter()
-            .find(|container| container.name == "agent")
-            .ok_or_else(|| fail("agent container missing"))?;
+            .map(|container| container.name.as_str())
+            .eq(expected_names)
+        {
+            return Err(fail(if spec.containers.iter().any(|c| c.name == "agent") {
+                "containers differ from the recorded peer workloads and agent"
+            } else {
+                "agent container missing"
+            }));
+        }
+        let agent = &spec.containers[peers.len()];
         check_container(agent, "agent")?;
         let bootstrap = spec
             .init_containers
@@ -2897,7 +3050,7 @@ impl KubernetesComputeDriver {
         if !secret_matches {
             return Err(fail("generation-specific sandbox Secret changed"));
         }
-        Ok(())
+        validate_peer_workload_pod(spec, peers, uid, gid).map_err(|message| fail(&message))
     }
 
     #[allow(clippy::too_many_arguments, clippy::similar_names)]
@@ -3408,6 +3561,7 @@ impl KubernetesComputeDriver {
         self.admit_stored_resources(&admission_object)
             .await
             .map_err(admission_error)?;
+        let peer_workloads = sandbox_peer_workloads(&admission_object)?;
         Self::validate_capability_free_workload_pod(
             &workload_pod,
             cr_uid,
@@ -3415,6 +3569,7 @@ impl KubernetesComputeDriver {
             agent_uid,
             agent_gid,
             &names.sandbox_secret,
+            &peer_workloads,
         )?;
         let workload_pod_uid =
             workload_pod.metadata.uid.clone().ok_or_else(|| {
@@ -3488,6 +3643,7 @@ impl KubernetesComputeDriver {
                 },
             ),
         };
+        let (peer_tokens, peers) = peer_boundary_material(&peer_workloads)?;
         let provisioned = KubernetesSandboxRuntimeBoundarySpec {
             boundary_id: sandbox_id.to_string(),
             generation: launch_authentication
@@ -3518,6 +3674,7 @@ impl KubernetesComputeDriver {
             host_gateway_ip: self.config.host_gateway_ip.parse().ok(),
             workload_identity,
             child_env,
+            peers,
         }
         .provision()
         .map_err(|error| KubernetesDriverError::Message(error.to_string()))?;
@@ -3533,6 +3690,7 @@ impl KubernetesComputeDriver {
                 .map_err(|error| KubernetesDriverError::Message(error.to_string()))?,
             tls.certificate_chain_pem.into_bytes(),
             tls.private_key_pem.into_bytes(),
+            peer_tokens,
             workload_owner.clone(),
         );
         let secrets = Api::<Secret>::namespaced(self.client.clone(), namespace);
@@ -4007,6 +4165,7 @@ impl KubernetesComputeDriver {
                 self.config.sandbox_runtime_image_pull_policy,
                 agent_uid,
                 agent_gid,
+                sandbox_peer_workloads(&object)?.len(),
             ),
         )?;
         let supervisor = match &placement {
@@ -6934,11 +7093,16 @@ fn sandbox_bootstrap_secret_name(spec: &serde_json::Value) -> Option<&str> {
 }
 
 /// Render the trusted init container that stages the sandbox runtime binary.
+///
+/// With peer workloads it also mounts every peer's boot volume, into which it
+/// stages that peer's one-use token from the bootstrap Secret. It is the only
+/// container that sees both the Secret and a peer boot directory.
 fn sandbox_bootstrap_init_container(
     image: &str,
     pull_policy: Option<crate::KubernetesImagePullPolicy>,
     uid: u32,
     gid: u32,
+    peer_count: usize,
 ) -> serde_json::Value {
     let mut bootstrap = serde_json::json!({
         "name": SANDBOX_BOOTSTRAP_CONTAINER_NAME,
@@ -6958,10 +7122,422 @@ fn sandbox_bootstrap_init_container(
             {"name": SANDBOX_STATE_VOLUME_NAME, "mountPath": SANDBOX_STATE_MOUNT_PATH}
         ]
     });
+    bootstrap["volumeMounts"]
+        .as_array_mut()
+        .expect("bootstrap volume mounts are an array")
+        .extend((0..peer_count).map(|index| {
+            serde_json::json!({
+                "name": peer_boot_volume_name(index),
+                "mountPath": peer_boot_dir_in_init(index)
+            })
+        }));
     if let Some(policy) = pull_policy {
         bootstrap["imagePullPolicy"] = serde_json::json!(policy.as_kubernetes_str());
     }
     bootstrap
+}
+
+/// Check the exact security context the driver renders for `agent` and peers.
+fn validate_workload_container_security_context(
+    container: &k8s_openapi::api::core::v1::Container,
+    name: &str,
+    uid: u32,
+    gid: u32,
+) -> Result<(), String> {
+    let context = container
+        .security_context
+        .as_ref()
+        .ok_or_else(|| format!("{name} has no security context"))?;
+    let drops_all = context
+        .capabilities
+        .as_ref()
+        .and_then(|capabilities| capabilities.drop.as_deref())
+        .is_some_and(|drops| drops.iter().any(|capability| capability == "ALL"));
+    let adds_none = context
+        .capabilities
+        .as_ref()
+        .and_then(|capabilities| capabilities.add.as_deref())
+        .is_none_or(<[String]>::is_empty);
+    if context.run_as_user != Some(i64::from(uid))
+        || context.run_as_group != Some(i64::from(gid))
+        || context.run_as_non_root != Some(true)
+        || context.allow_privilege_escalation != Some(false)
+        || context.privileged == Some(true)
+        || context
+            .seccomp_profile
+            .as_ref()
+            .is_some_and(|profile| profile.type_ != "RuntimeDefault")
+        || !drops_all
+        || !adds_none
+    {
+        return Err(format!("{name} security context changed"));
+    }
+    Ok(())
+}
+
+/// A container's volume mounts as comparable `(name, path, read-only,
+/// subPath)` tuples, rejecting mount features the driver never renders.
+fn container_mount_set(
+    container: &k8s_openapi::api::core::v1::Container,
+) -> Result<std::collections::BTreeSet<VolumeMountKey>, String> {
+    let mut mounts = std::collections::BTreeSet::new();
+    for mount in container.volume_mounts.as_deref().unwrap_or_default() {
+        if mount.sub_path_expr.is_some()
+            || mount
+                .mount_propagation
+                .as_deref()
+                .is_some_and(|propagation| propagation != "None")
+        {
+            return Err(format!(
+                "{} mount '{}' uses a propagation or subPathExpr the driver never renders",
+                container.name, mount.name
+            ));
+        }
+        if !mounts.insert(volume_mount_key(mount)) {
+            return Err(format!(
+                "{} mounts '{}' at '{}' twice",
+                container.name, mount.name, mount.mount_path
+            ));
+        }
+    }
+    Ok(mounts)
+}
+
+/// Gate the admitted Pod's peer workload containers and their private volumes.
+///
+/// Each peer must be exactly what the driver renders from the recorded peer
+/// list: image, runtime entrypoint without arguments, security context,
+/// mounts, and only the agent's driver-owned runtime settings as environment.
+/// Each private peer volume must be a Memory `emptyDir` mounted only where the
+/// shared runtime contract places it, so no other container (including
+/// `workspace-init`) can reach a peer token or control socket.
+fn validate_peer_workload_pod(
+    spec: &k8s_openapi::api::core::v1::PodSpec,
+    peers: &[KubernetesPeerWorkloadConfig],
+    uid: u32,
+    gid: u32,
+) -> Result<(), String> {
+    if peers.is_empty() {
+        let peer_volume = spec
+            .volumes
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .any(|volume| volume.name.starts_with(PEER_WORKLOAD_VOLUME_PREFIX));
+        if peer_volume {
+            return Err("peer workload volume present without recorded peers".to_string());
+        }
+        return Ok(());
+    }
+    let agent = &spec.containers[peers.len()];
+    let runtime_env = agent
+        .env
+        .as_deref()
+        .unwrap_or_default()
+        .iter()
+        .filter(|entry| entry.name.starts_with("OPENSHELL_"))
+        .map(|entry| (entry.name.clone(), entry.value.clone()))
+        .collect::<std::collections::BTreeSet<_>>();
+    let mut expected_owners: BTreeMap<String, std::collections::BTreeSet<(String, String)>> =
+        BTreeMap::new();
+    for (index, (peer, container)) in peers.iter().zip(&spec.containers).enumerate() {
+        let name = peer.name.as_str();
+        validate_workload_container_security_context(container, name, uid, gid)?;
+        if container.image.as_deref() != Some(peer.image.as_str()) {
+            return Err(format!("peer workload {name} image changed"));
+        }
+        if container.command.as_deref() != Some(peer_workload_entrypoint().as_slice())
+            || container
+                .args
+                .as_deref()
+                .is_some_and(|args| !args.is_empty())
+            || container.working_dir.is_some()
+        {
+            return Err(format!("peer workload {name} entrypoint changed"));
+        }
+        if container.stdin == Some(true)
+            || container.tty == Some(true)
+            || container.restart_policy.is_some()
+            || container.lifecycle.is_some()
+            || container
+                .ports
+                .as_deref()
+                .is_some_and(|ports| !ports.is_empty())
+        {
+            return Err(format!(
+                "peer workload {name} has container fields the driver never renders"
+            ));
+        }
+        if container
+            .env_from
+            .as_deref()
+            .is_some_and(|sources| !sources.is_empty())
+            || container
+                .env
+                .as_deref()
+                .unwrap_or_default()
+                .iter()
+                .any(|entry| entry.value_from.is_some())
+        {
+            return Err(format!(
+                "peer workload {name} environment references external values"
+            ));
+        }
+        let env = container
+            .env
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .map(|entry| (entry.name.clone(), entry.value.clone()))
+            .collect::<std::collections::BTreeSet<_>>();
+        if env != runtime_env {
+            return Err(format!(
+                "peer workload {name} environment differs from the agent's runtime settings"
+            ));
+        }
+        let expected_mounts = peer_workload_volume_mounts(index, peer)
+            .iter()
+            .map(volume_mount_key)
+            .collect::<std::collections::BTreeSet<_>>();
+        if container_mount_set(container)? != expected_mounts {
+            return Err(format!("peer workload {name} volume mounts changed"));
+        }
+        expected_owners.insert(
+            peer_control_volume_name(index),
+            std::collections::BTreeSet::from([
+                ("agent".to_string(), peer_control_dir_in_primary(index)),
+                (peer.name.clone(), PEER_CONTROL_DIR.to_string()),
+            ]),
+        );
+        expected_owners.insert(
+            peer_boot_volume_name(index),
+            std::collections::BTreeSet::from([
+                (
+                    SANDBOX_BOOTSTRAP_CONTAINER_NAME.to_string(),
+                    peer_boot_dir_in_init(index),
+                ),
+                (peer.name.clone(), PEER_BOOT_DIR.to_string()),
+            ]),
+        );
+        expected_owners.insert(
+            peer_run_volume_name(index),
+            std::collections::BTreeSet::from([(
+                peer.name.clone(),
+                SANDBOX_PROXY_CA_MOUNT_PATH.to_string(),
+            )]),
+        );
+    }
+
+    let mut actual_owners: BTreeMap<String, std::collections::BTreeSet<(String, String)>> =
+        BTreeMap::new();
+    for container in spec
+        .init_containers
+        .as_deref()
+        .unwrap_or_default()
+        .iter()
+        .chain(&spec.containers)
+    {
+        for mount in container.volume_mounts.as_deref().unwrap_or_default() {
+            if mount.name.starts_with(PEER_WORKLOAD_VOLUME_PREFIX) {
+                actual_owners
+                    .entry(mount.name.clone())
+                    .or_default()
+                    .insert((container.name.clone(), mount.mount_path.clone()));
+            }
+        }
+    }
+    if actual_owners != expected_owners {
+        return Err("peer workload volumes are mounted outside the peer contract".to_string());
+    }
+    let mut actual_volumes = std::collections::BTreeSet::new();
+    for volume in spec.volumes.as_deref().unwrap_or_default() {
+        if !volume.name.starts_with(PEER_WORKLOAD_VOLUME_PREFIX) {
+            continue;
+        }
+        let memory_empty_dir = serde_json::to_value(volume).map_err(|error| error.to_string())?
+            == serde_json::json!({"name": volume.name, "emptyDir": {"medium": "Memory"}});
+        if !memory_empty_dir || !actual_volumes.insert(volume.name.clone()) {
+            return Err(format!(
+                "peer workload volume {} is not a single Memory emptyDir",
+                volume.name
+            ));
+        }
+    }
+    if actual_volumes != expected_owners.into_keys().collect() {
+        return Err("peer workload volumes changed".to_string());
+    }
+    Ok(())
+}
+
+/// Security context shared by the `agent` container and every peer workload
+/// container. The admission gate requires these exact values.
+fn sandbox_workload_container_security_context(uid: u32, gid: u32) -> serde_json::Value {
+    serde_json::json!({
+        "runAsUser": uid,
+        "runAsGroup": gid,
+        "runAsNonRoot": true,
+        "allowPrivilegeEscalation": false,
+        "capabilities": {"drop": ["ALL"]}
+    })
+}
+
+/// Entrypoint of every peer workload container: the subordinate runtime staged
+/// by the trusted init container. The workload argv is not on the container;
+/// the primary runtime delivers it from the protected boundary config.
+fn peer_workload_entrypoint() -> [String; 2] {
+    [
+        format!("{SANDBOX_RUNTIME_MOUNT_PATH}/openshell-sandbox"),
+        PEER_SUBCOMMAND.to_string(),
+    ]
+}
+
+/// Exact volume mounts of peer `index`: the driver-owned mounts followed by
+/// the caller's declared mounts. No peer mounts the bootstrap Secret, the
+/// runtime state, the Pod identity, the workspace, or another peer's volumes.
+fn peer_workload_volume_mounts(
+    index: usize,
+    peer: &KubernetesPeerWorkloadConfig,
+) -> Vec<VolumeMount> {
+    let driver_mount = |name: String, mount_path: &str, read_only: bool| VolumeMount {
+        name,
+        mount_path: mount_path.to_string(),
+        read_only: read_only.then_some(true),
+        ..Default::default()
+    };
+    let mut mounts = vec![
+        driver_mount(
+            SANDBOX_RUNTIME_VOLUME_NAME.to_string(),
+            SANDBOX_RUNTIME_MOUNT_PATH,
+            true,
+        ),
+        driver_mount(peer_control_volume_name(index), PEER_CONTROL_DIR, false),
+        driver_mount(peer_boot_volume_name(index), PEER_BOOT_DIR, false),
+        driver_mount(
+            peer_run_volume_name(index),
+            SANDBOX_PROXY_CA_MOUNT_PATH,
+            false,
+        ),
+    ];
+    mounts.extend(peer.volume_mounts.iter().map(VolumeMount::from));
+    mounts
+}
+
+/// Comparable identity of a volume mount: name, path, read-only, subPath.
+type VolumeMountKey = (String, String, bool, Option<String>);
+
+fn volume_mount_key(mount: &VolumeMount) -> VolumeMountKey {
+    (
+        mount.name.clone(),
+        mount.mount_path.clone(),
+        mount.read_only == Some(true),
+        mount
+            .sub_path
+            .clone()
+            .filter(|sub_path| !sub_path.is_empty()),
+    )
+}
+
+/// Render peer workload containers next to an already-rendered `agent`.
+///
+/// Peers become regular `spec.containers` entries ahead of `agent`, so the
+/// kubelet starts them first; each runs the subordinate peer runtime, which
+/// waits for the primary runtime in `agent`. Each peer gets private Memory
+/// `emptyDir` volumes for its control socket (shared only with `agent`), its
+/// one-use token (shared only with the trusted init container), and its `/run`.
+/// Peer environment never appears on the container: the primary delivers it
+/// from the protected boundary config. Only the agent's driver-owned
+/// `OPENSHELL_*` settings are mirrored so the peer runtime starts with the
+/// same log level, telemetry, and identity settings.
+fn apply_peer_workload_containers(
+    spec: &mut serde_json::Map<String, serde_json::Value>,
+    peers: &[KubernetesPeerWorkloadConfig],
+    params: &SandboxPodParams<'_>,
+) {
+    if peers.is_empty() {
+        return;
+    }
+    let volumes = spec
+        .get_mut("volumes")
+        .and_then(serde_json::Value::as_array_mut)
+        .expect("pod volumes must be an array");
+    for index in 0..peers.len() {
+        for name in [
+            peer_control_volume_name(index),
+            peer_boot_volume_name(index),
+            peer_run_volume_name(index),
+        ] {
+            volumes.push(serde_json::json!({"name": name, "emptyDir": {"medium": "Memory"}}));
+        }
+    }
+
+    let containers = spec
+        .get_mut("containers")
+        .and_then(serde_json::Value::as_array_mut)
+        .expect("pod containers must be an array");
+    let agent_index = containers
+        .iter()
+        .position(|container| {
+            container.get("name").and_then(serde_json::Value::as_str) == Some("agent")
+        })
+        .expect("sandbox pod template has an agent container");
+    let agent = containers[agent_index]
+        .as_object_mut()
+        .expect("agent container must be an object");
+    agent
+        .entry("volumeMounts")
+        .or_insert_with(|| serde_json::json!([]))
+        .as_array_mut()
+        .expect("agent volume mounts must be an array")
+        .extend((0..peers.len()).map(|index| {
+            serde_json::json!({
+                "name": peer_control_volume_name(index),
+                "mountPath": peer_control_dir_in_primary(index)
+            })
+        }));
+    let runtime_env = agent
+        .get("env")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|entry| {
+            entry
+                .get("name")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|name| name.starts_with("OPENSHELL_"))
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+
+    let rendered = peers.iter().enumerate().map(|(index, peer)| {
+        let mounts = peer_workload_volume_mounts(index, peer)
+            .iter()
+            .map(|mount| serde_json::to_value(mount).expect("VolumeMount serializes to JSON"))
+            .collect::<Vec<_>>();
+        let mut container = serde_json::json!({
+            "name": peer.name,
+            "image": peer.image,
+            "command": peer_workload_entrypoint(),
+            "env": runtime_env,
+            "securityContext": sandbox_workload_container_security_context(
+                params.sandbox_uid,
+                params.sandbox_gid,
+            ),
+            "volumeMounts": mounts,
+        });
+        if let Some(policy) = params.image_pull_policy {
+            container["imagePullPolicy"] = serde_json::json!(policy.as_kubernetes_str());
+        }
+        apply_agent_driver_resources(
+            container
+                .as_object_mut()
+                .expect("peer container is an object"),
+            &peer.resources,
+        );
+        container
+    });
+    let tail = containers.split_off(agent_index);
+    containers.extend(rendered);
+    containers.extend(tail);
 }
 
 /// Render the workload Pod that runs the `OpenShell` sandbox runtime.
@@ -6972,6 +7548,7 @@ fn sandbox_bootstrap_init_container(
 /// protocol identity binds the request to the exact supervisor generation.
 fn apply_supervisor_sandbox_runtime_boundary(
     pod_template: &mut serde_json::Value,
+    peers: &[KubernetesPeerWorkloadConfig],
     params: &SandboxPodParams<'_>,
 ) {
     let metadata = pod_template
@@ -7088,6 +7665,7 @@ fn apply_supervisor_sandbox_runtime_boundary(
         params.sandbox_runtime_image_pull_policy,
         params.sandbox_uid,
         params.sandbox_gid,
+        peers.len(),
     ));
 
     let containers = spec
@@ -7113,13 +7691,7 @@ fn apply_supervisor_sandbox_runtime_boundary(
     );
     container.insert(
         "securityContext".to_string(),
-        serde_json::json!({
-            "runAsUser": params.sandbox_uid,
-            "runAsGroup": params.sandbox_gid,
-            "runAsNonRoot": true,
-            "allowPrivilegeEscalation": false,
-            "capabilities": {"drop": ["ALL"]}
-        }),
+        sandbox_workload_container_security_context(params.sandbox_uid, params.sandbox_gid),
     );
     container.insert(
         "ports".to_string(),
@@ -7171,6 +7743,7 @@ fn apply_supervisor_sandbox_runtime_boundary(
         remove_env(env, key);
     }
     apply_resolved_identity_env(env, params.sandbox_uid, params.sandbox_gid);
+    apply_peer_workload_containers(spec, peers, params);
 }
 
 /// Apply workspace persistence transforms to an already-built pod template.
@@ -7416,6 +7989,12 @@ fn kubernetes_driver_config_for_spec(
         &config.containers.agent.volume_mounts,
         KUBERNETES_DRIVER_PROTECTED_MOUNT_PATHS,
     )?;
+    for peer in &config.containers.workloads {
+        validate_kubernetes_protected_path_conflicts(
+            &peer.volume_mounts,
+            KUBERNETES_DRIVER_PROTECTED_MOUNT_PATHS,
+        )?;
+    }
     Ok(config)
 }
 
@@ -7564,6 +8143,14 @@ fn sandbox_template_to_k8s_with_validated_config(
             serde_json::Value::String(params.sandbox_id.to_string()),
         );
     }
+    // Peer workload containers precede `agent`; keep `kubectl logs`/`exec`
+    // defaulting to the canonical workload container.
+    if !driver_config.containers.workloads.is_empty() {
+        pod_annotations.insert(
+            "kubectl.kubernetes.io/default-container".to_string(),
+            serde_json::json!("agent"),
+        );
+    }
     if !pod_annotations.is_empty() {
         metadata.insert(
             "annotations".to_string(),
@@ -7694,7 +8281,11 @@ fn sandbox_template_to_k8s_with_validated_config(
 
     let mut result = serde_json::Value::Object(template_value);
 
-    apply_supervisor_sandbox_runtime_boundary(&mut result, params);
+    apply_supervisor_sandbox_runtime_boundary(
+        &mut result,
+        &driver_config.containers.workloads,
+        params,
+    );
 
     // Inject workspace persistence (init container + PVC volume mount) so
     // that /sandbox data survives pod rescheduling. Skipped when the user
@@ -7982,11 +8573,17 @@ fn platform_config_struct(template: &SandboxTemplate, key: &str) -> Option<serde
 fn child_environment_from_sandbox_object(
     object: &DynamicObject,
 ) -> std::collections::HashMap<String, String> {
+    // Peer workload containers precede `agent`, so select it by name.
     object
         .data
-        .pointer("/spec/podTemplate/spec/containers/0/env")
+        .pointer("/spec/podTemplate/spec/containers")
         .and_then(serde_json::Value::as_array)
         .into_iter()
+        .flatten()
+        .filter(|container| {
+            container.get("name").and_then(serde_json::Value::as_str) == Some("agent")
+        })
+        .filter_map(|container| container.get("env").and_then(serde_json::Value::as_array))
         .flatten()
         .filter_map(|entry| {
             let name = entry.get("name")?.as_str()?;
@@ -7994,6 +8591,112 @@ fn child_environment_from_sandbox_object(
             (!name.starts_with("OPENSHELL_")).then(|| (name.to_string(), value.to_string()))
         })
         .collect()
+}
+
+/// Encode the validated peer list for [`ANNOTATION_SANDBOX_RUNTIME_PEER_WORKLOADS`].
+fn encode_peer_workloads_annotation(
+    peers: &[KubernetesPeerWorkloadConfig],
+) -> Result<Option<String>, KubernetesDriverError> {
+    if peers.is_empty() {
+        return Ok(None);
+    }
+    serde_json::to_string(peers).map(Some).map_err(|error| {
+        KubernetesDriverError::Message(format!("encode peer workload record: {error}"))
+    })
+}
+
+/// Peer workloads recorded on a Sandbox resource at create time.
+///
+/// A missing record means the sandbox has no peers. A record that does not
+/// decode or validate fails closed: the driver never starts a generation whose
+/// peer set it cannot reproduce exactly.
+fn sandbox_peer_workloads(
+    object: &DynamicObject,
+) -> Result<Vec<KubernetesPeerWorkloadConfig>, KubernetesDriverError> {
+    let Some(encoded) = object
+        .metadata
+        .annotations
+        .as_ref()
+        .and_then(|annotations| annotations.get(ANNOTATION_SANDBOX_RUNTIME_PEER_WORKLOADS))
+    else {
+        return Ok(Vec::new());
+    };
+    let peers: Vec<KubernetesPeerWorkloadConfig> =
+        serde_json::from_str(encoded).map_err(|error| {
+            KubernetesDriverError::Precondition(format!(
+                "Sandbox peer workload record does not decode: {error}"
+            ))
+        })?;
+    if peers.is_empty() {
+        return Err(KubernetesDriverError::Precondition(
+            "Sandbox peer workload record is present but empty".to_string(),
+        ));
+    }
+    validate_kubernetes_peer_workloads(&peers).map_err(|error| {
+        KubernetesDriverError::Precondition(format!(
+            "Sandbox peer workload record is invalid: {error}"
+        ))
+    })?;
+    for peer in &peers {
+        validate_kubernetes_protected_path_conflicts(
+            &peer.volume_mounts,
+            KUBERNETES_DRIVER_PROTECTED_MOUNT_PATHS,
+        )
+        .map_err(|error| {
+            KubernetesDriverError::Precondition(format!(
+                "Sandbox peer workload record is invalid: {error}"
+            ))
+        })?;
+    }
+    Ok(peers)
+}
+
+/// Generate one peer's one-use bootstrap token and its boundary-config digest.
+///
+/// The token is [`PEER_TOKEN_BYTES`] random bytes, lowercase hex encoded. It is
+/// stored in the bootstrap Secret exactly as returned, and the digest is the
+/// lowercase hex SHA-256 of those ASCII hex bytes (no trailing newline).
+fn generate_peer_token() -> Result<(String, String), KubernetesDriverError> {
+    let bytes = openshell_crypto::random_bytes::<PEER_TOKEN_BYTES>()
+        .map_err(|error| KubernetesDriverError::Message(error.to_string()))?;
+    let token = lower_hex(&bytes);
+    let digest = openshell_crypto::sha256(token.as_bytes())
+        .map_err(|error| KubernetesDriverError::Message(error.to_string()))?;
+    Ok((token, lower_hex(&digest)))
+}
+
+/// Per-generation peer bootstrap material: the Secret tokens, by peer index,
+/// and the boundary-config entries bound to their digests.
+///
+/// Every generation gets fresh tokens, so a restarted generation never accepts
+/// a token a previous peer may have observed.
+fn peer_boundary_material(
+    peers: &[KubernetesPeerWorkloadConfig],
+) -> Result<(Vec<String>, Vec<PeerWorkloadConfig>), KubernetesDriverError> {
+    let mut tokens = Vec::with_capacity(peers.len());
+    let mut configs = Vec::with_capacity(peers.len());
+    for (index, peer) in peers.iter().enumerate() {
+        let (token, token_sha256) = generate_peer_token()?;
+        tokens.push(token);
+        configs.push(PeerWorkloadConfig {
+            index,
+            name: peer.name.clone(),
+            command: peer.command.clone(),
+            environment: peer.environment.clone(),
+            token_sha256,
+        });
+    }
+    Ok((tokens, configs))
+}
+
+fn lower_hex(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+
+    let mut encoded = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        write!(encoded, "{byte:02x}").expect("writing to String cannot fail");
+    }
+    encoded
 }
 
 fn required_sandbox_annotation(
@@ -10431,6 +11134,662 @@ mod tests {
         assert!(err.contains("gpu_device_ids"));
     }
 
+    fn peer_driver_config() -> serde_json::Value {
+        serde_json::json!({
+            "volumes": [{"name": "flock-ipc", "empty_dir": {}}],
+            "containers": {
+                "agent": {"volume_mounts": [
+                    {"name": "flock-ipc", "mount_path": "/tmp/niuu-mesh", "read_only": false}
+                ]},
+                "workloads": [
+                    {
+                        "name": "ravn-reviewer",
+                        "image": "registry.example.com/ravn:v1",
+                        "command": ["python3", "-m", "ravn", "daemon"],
+                        "environment": {"MESH_PEER": "tcp://127.0.0.1:7480"},
+                        "resources": {"requests": {"cpu": "100m"}, "limits": {"memory": "512Mi"}},
+                        "volume_mounts": [
+                            {"name": "flock-ipc", "mount_path": "/tmp/niuu-mesh", "read_only": false}
+                        ]
+                    },
+                    {
+                        "name": "ravn-coder",
+                        "image": "registry.example.com/coder:v2",
+                        "command": ["/usr/bin/coder"]
+                    }
+                ]
+            }
+        })
+    }
+
+    fn peer_sandbox_spec(driver_config: serde_json::Value) -> SandboxSpec {
+        SandboxSpec {
+            log_level: "debug".to_string(),
+            environment: std::collections::HashMap::from([(
+                "AGENT_ONLY".to_string(),
+                "agent".to_string(),
+            )]),
+            template: Some(SandboxTemplate {
+                image: "registry.example.com/agent:v1".to_string(),
+                driver_config: Some(json_struct(driver_config)),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    fn peer_pod_params() -> SandboxPodParams<'static> {
+        SandboxPodParams {
+            sandbox_id: "sandbox-peers",
+            sandbox_runtime_image: "registry.example.com/openshell/sandbox:test",
+            image_pull_policy: Some(crate::KubernetesImagePullPolicy::IfNotPresent),
+            ..Default::default()
+        }
+    }
+
+    fn peer_config_error(driver_config: serde_json::Value) -> String {
+        kubernetes_driver_config_for_spec(Some(&peer_sandbox_spec(driver_config)))
+            .expect_err("peer driver config must be rejected")
+    }
+
+    /// The workload Pod the controller would admit from the rendered template.
+    fn admitted_peer_pod(driver_config: serde_json::Value) -> Pod {
+        let params = peer_pod_params();
+        let cr = sandbox_to_k8s_spec_for_test(Some(&peer_sandbox_spec(driver_config)), &params);
+        let mut pod = cr["spec"]["podTemplate"].clone();
+        pod["metadata"]["name"] = serde_json::json!("sandbox-peers");
+        pod["metadata"]["uid"] = serde_json::json!("pod-uid");
+        pod["metadata"]["ownerReferences"] = serde_json::json!([{
+            "apiVersion": "agents.x-k8s.io/v1beta1",
+            "kind": SANDBOX_KIND,
+            "name": "sandbox-peers",
+            "uid": "cr-uid",
+            "controller": true
+        }]);
+        serde_json::from_value(pod).expect("rendered template is a valid Pod")
+    }
+
+    fn gate_peer_pod(
+        pod: &Pod,
+        peers: &[KubernetesPeerWorkloadConfig],
+    ) -> Result<(), KubernetesDriverError> {
+        KubernetesComputeDriver::validate_capability_free_workload_pod(
+            pod,
+            "cr-uid",
+            "sandbox-peers",
+            DEFAULT_SANDBOX_UID,
+            DEFAULT_SANDBOX_UID,
+            SandboxPodParams::default().sandbox_secret_name,
+            peers,
+        )
+    }
+
+    fn recorded_peers() -> Vec<KubernetesPeerWorkloadConfig> {
+        kubernetes_driver_config_for_spec(Some(&peer_sandbox_spec(peer_driver_config())))
+            .unwrap()
+            .containers
+            .workloads
+    }
+
+    fn mount_paths(container: &serde_json::Value) -> Vec<(String, String, bool)> {
+        container["volumeMounts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|mount| {
+                (
+                    mount["name"].as_str().unwrap().to_string(),
+                    mount["mountPath"].as_str().unwrap().to_string(),
+                    mount["readOnly"] == true,
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn peer_workload_driver_config_parses_the_flock_request() {
+        let config =
+            kubernetes_driver_config_for_spec(Some(&peer_sandbox_spec(peer_driver_config())))
+                .unwrap();
+        let [reviewer, coder] = config.containers.workloads.as_slice() else {
+            panic!("expected two peers");
+        };
+        assert_eq!(reviewer.name, "ravn-reviewer");
+        assert_eq!(reviewer.command, ["python3", "-m", "ravn", "daemon"]);
+        assert_eq!(
+            reviewer.environment["MESH_PEER"],
+            "tcp://127.0.0.1:7480".to_string()
+        );
+        assert_eq!(reviewer.resources.limits["memory"], "512Mi");
+        assert!(!reviewer.volume_mounts[0].read_only);
+        assert!(coder.environment.is_empty() && coder.volume_mounts.is_empty());
+        assert!(config.volumes[0].empty_dir.is_some());
+        assert!(config.volumes[0].persistent_volume_claim.is_none());
+    }
+
+    #[test]
+    fn peer_workload_driver_config_rejects_unsafe_requests() {
+        let peer = |overrides: serde_json::Value| {
+            let mut peer = serde_json::json!({
+                "name": "ravn", "image": "ravn:v1", "command": ["ravn"]
+            });
+            peer.as_object_mut()
+                .unwrap()
+                .extend(overrides.as_object().unwrap().clone());
+            serde_json::json!({
+                "volumes": [{"name": "flock-ipc", "empty_dir": {}}],
+                "containers": {"workloads": [peer]}
+            })
+        };
+        for (config, needle) in [
+            (
+                peer(serde_json::json!({"readiness_port": 7482})),
+                "unknown field",
+            ),
+            (
+                peer(serde_json::json!({"security_context": {"privileged": true}})),
+                "unknown field",
+            ),
+            (peer(serde_json::json!({"args": ["x"]})), "unknown field"),
+            (peer(serde_json::json!({"name": "agent"})), "reserved"),
+            (
+                peer(serde_json::json!({"name": "openshell-net"})),
+                "reserved",
+            ),
+            (peer(serde_json::json!({"name": "Ravn"})), "DNS-1123"),
+            (peer(serde_json::json!({"image": ""})), "image"),
+            (peer(serde_json::json!({"image": "ravn :v1"})), "image"),
+            (peer(serde_json::json!({"command": []})), "explicit command"),
+            (
+                peer(serde_json::json!({"command": ["ravn", ""]})),
+                "explicit command",
+            ),
+            (
+                peer(serde_json::json!({"environment": {"OPENSHELL_LOG_LEVEL": "trace"}})),
+                "OPENSHELL_",
+            ),
+            (
+                peer(serde_json::json!({"environment": {"A=B": "x"}})),
+                "environment key",
+            ),
+            (
+                peer(serde_json::json!({"volume_mounts": [
+                    {"name": "missing", "mount_path": "/tmp/missing"}
+                ]})),
+                "unknown kubernetes driver_config volume",
+            ),
+            (
+                peer(serde_json::json!({"volume_mounts": [
+                    {"name": "flock-ipc", "mount_path": "/.openshell/peers/0"}
+                ]})),
+                "reserved OpenShell path",
+            ),
+            (
+                peer(serde_json::json!({"volume_mounts": [
+                    {"name": "flock-ipc", "mount_path": "/run/openshell"}
+                ]})),
+                "reserved OpenShell path",
+            ),
+        ] {
+            let error = peer_config_error(config);
+            assert!(error.contains(needle), "{error} should mention {needle}");
+        }
+
+        let duplicate = serde_json::json!({"containers": {"workloads": [
+            {"name": "ravn", "image": "ravn:v1", "command": ["ravn"]},
+            {"name": "ravn", "image": "ravn:v1", "command": ["ravn"]}
+        ]}});
+        assert!(peer_config_error(duplicate).contains("duplicate"));
+
+        let too_many = (0..=MAX_PEER_WORKLOADS)
+            .map(|index| {
+                serde_json::json!({"name": format!("peer-{index}"), "image": "ravn:v1", "command": ["ravn"]})
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            peer_config_error(serde_json::json!({"containers": {"workloads": too_many}}))
+                .contains("at most")
+        );
+    }
+
+    #[test]
+    fn driver_config_volumes_require_exactly_one_source() {
+        for (volume, needle) in [
+            (
+                serde_json::json!({"name": "both", "empty_dir": {},
+                    "persistent_volume_claim": {"claim_name": "data"}}),
+                "exactly one",
+            ),
+            (serde_json::json!({"name": "neither"}), "exactly one"),
+            (
+                serde_json::json!({"name": "sized", "empty_dir": {"medium": "Memory"}}),
+                "unknown field",
+            ),
+            (
+                serde_json::json!({"name": "openshell-peer-0-control", "empty_dir": {}}),
+                "reserved",
+            ),
+        ] {
+            let error = peer_config_error(serde_json::json!({"volumes": [volume]}));
+            assert!(error.contains(needle), "{error} should mention {needle}");
+        }
+    }
+
+    #[test]
+    fn peer_workloads_render_before_agent_with_private_runtime_volumes() {
+        let params = peer_pod_params();
+        let cr =
+            sandbox_to_k8s_spec_for_test(Some(&peer_sandbox_spec(peer_driver_config())), &params);
+        let spec = &cr["spec"]["podTemplate"]["spec"];
+        let containers = spec["containers"].as_array().unwrap();
+        let names = containers
+            .iter()
+            .map(|container| container["name"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(names, ["ravn-reviewer", "ravn-coder", "agent"]);
+        assert_eq!(
+            cr["spec"]["podTemplate"]["metadata"]["annotations"]["kubectl.kubernetes.io/default-container"],
+            "agent"
+        );
+        let [reviewer, coder, agent] = containers.as_slice() else {
+            unreachable!()
+        };
+
+        for (index, peer) in [reviewer, coder].into_iter().enumerate() {
+            assert_eq!(
+                peer["command"],
+                serde_json::json!(["/.openshell/runtime/openshell-sandbox", "peer"])
+            );
+            assert!(peer.get("args").is_none());
+            assert_eq!(peer["securityContext"], agent["securityContext"]);
+            assert_eq!(peer["imagePullPolicy"], "IfNotPresent");
+            assert!(peer.get("ports").is_none());
+            let mut expected = vec![
+                (
+                    SANDBOX_RUNTIME_VOLUME_NAME.to_string(),
+                    "/.openshell/runtime".to_string(),
+                    true,
+                ),
+                (
+                    format!("openshell-peer-{index}-control"),
+                    "/.openshell/peer-control".to_string(),
+                    false,
+                ),
+                (
+                    format!("openshell-peer-{index}-boot"),
+                    "/.openshell/peer-boot".to_string(),
+                    false,
+                ),
+                (
+                    format!("openshell-peer-{index}-run"),
+                    "/run".to_string(),
+                    false,
+                ),
+            ];
+            if index == 0 {
+                expected.push(("flock-ipc".to_string(), "/tmp/niuu-mesh".to_string(), false));
+            }
+            assert_eq!(mount_paths(peer), expected);
+            // Only the agent's driver-owned runtime settings are mirrored; the
+            // workload environment travels in the protected boundary config.
+            let agent_runtime_env = agent["env"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|entry| entry["name"].as_str().unwrap().starts_with("OPENSHELL_"))
+                .cloned()
+                .collect::<Vec<_>>();
+            assert_eq!(peer["env"], serde_json::Value::Array(agent_runtime_env));
+            assert_eq!(rendered_env(peer, "OPENSHELL_LOG_LEVEL"), Some("debug"));
+            assert_eq!(rendered_env(peer, "MESH_PEER"), None);
+            assert_eq!(rendered_env(peer, "AGENT_ONLY"), None);
+        }
+        assert_eq!(reviewer["image"], "registry.example.com/ravn:v1");
+        assert_eq!(coder["image"], "registry.example.com/coder:v2");
+        assert_eq!(reviewer["resources"]["requests"]["cpu"], "100m");
+        assert_eq!(reviewer["resources"]["limits"]["memory"], "512Mi");
+        assert!(coder.get("resources").is_none());
+        assert_eq!(rendered_env(agent, "AGENT_ONLY"), Some("agent"));
+
+        let agent_mounts = mount_paths(agent);
+        for (index, path) in ["/.openshell/peers/0", "/.openshell/peers/1"]
+            .into_iter()
+            .enumerate()
+        {
+            assert!(agent_mounts.contains(&(
+                format!("openshell-peer-{index}-control"),
+                path.to_string(),
+                false
+            )));
+        }
+        assert!(agent_mounts.contains(&(
+            "flock-ipc".to_string(),
+            "/tmp/niuu-mesh".to_string(),
+            false
+        )));
+        assert!(!agent_mounts.iter().any(|(name, _, _)| {
+            name.starts_with(PEER_WORKLOAD_VOLUME_PREFIX)
+                && (name.ends_with("-boot") || name.ends_with("-run"))
+        }));
+
+        let bootstrap = spec["initContainers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|container| container["name"] == SANDBOX_BOOTSTRAP_CONTAINER_NAME)
+            .unwrap();
+        let bootstrap_mounts = mount_paths(bootstrap);
+        for index in 0..2 {
+            assert!(bootstrap_mounts.contains(&(
+                format!("openshell-peer-{index}-boot"),
+                format!("/.openshell/peer-boot/{index}"),
+                false
+            )));
+        }
+        assert!(!bootstrap_mounts.iter().any(|(name, _, _)| {
+            name.starts_with(PEER_WORKLOAD_VOLUME_PREFIX)
+                && (name.ends_with("-control") || name.ends_with("-run"))
+        }));
+
+        let volumes = spec["volumes"].as_array().unwrap();
+        for index in 0..2 {
+            for suffix in ["control", "boot", "run"] {
+                let name = format!("openshell-peer-{index}-{suffix}");
+                let volume = volumes
+                    .iter()
+                    .find(|volume| volume["name"] == name)
+                    .unwrap();
+                assert_eq!(volume["emptyDir"], serde_json::json!({"medium": "Memory"}));
+            }
+        }
+        let flock = volumes
+            .iter()
+            .find(|volume| volume["name"] == "flock-ipc")
+            .unwrap();
+        assert_eq!(flock["emptyDir"], serde_json::json!({}));
+        assert!(flock.get("persistentVolumeClaim").is_none());
+
+        // No peer sees the bootstrap Secret or the workspace.
+        for peer in [reviewer, coder] {
+            assert!(!mount_paths(peer).iter().any(|(name, _, _)| {
+                name == SANDBOX_BOOTSTRAP_VOLUME_NAME || name == WORKSPACE_VOLUME_NAME
+            }));
+        }
+    }
+
+    #[test]
+    fn sandboxes_without_peers_render_unchanged_containers() {
+        let params = peer_pod_params();
+        let cr =
+            sandbox_to_k8s_spec_for_test(Some(&peer_sandbox_spec(serde_json::json!({}))), &params);
+        let spec = &cr["spec"]["podTemplate"]["spec"];
+        assert_eq!(spec["containers"].as_array().unwrap().len(), 1);
+        assert!(!spec["volumes"].as_array().unwrap().iter().any(|volume| {
+            volume["name"]
+                .as_str()
+                .unwrap()
+                .starts_with(PEER_WORKLOAD_VOLUME_PREFIX)
+        }));
+    }
+
+    #[test]
+    fn workload_gate_accepts_exactly_the_rendered_peers() {
+        gate_peer_pod(&admitted_peer_pod(peer_driver_config()), &recorded_peers())
+            .expect("rendered peer pod passes the gate");
+        gate_peer_pod(&admitted_peer_pod(serde_json::json!({})), &[])
+            .expect("rendered pod without peers passes the gate");
+    }
+
+    #[test]
+    fn workload_gate_rejects_tampered_unknown_or_ephemeral_containers() {
+        use k8s_openapi::api::core::v1::{
+            Container, EnvVar, EphemeralContainer, VolumeMount as K8sVolumeMount,
+        };
+        let peers = recorded_peers();
+        let tamper = |edit: &dyn Fn(&mut k8s_openapi::api::core::v1::PodSpec)| {
+            let mut pod = admitted_peer_pod(peer_driver_config());
+            edit(pod.spec.as_mut().unwrap());
+            pod
+        };
+        let cases: Vec<(&str, Pod)> = vec![
+            (
+                "peer image",
+                tamper(&|spec| spec.containers[0].image = Some("evil:latest".to_string())),
+            ),
+            (
+                "peer arguments",
+                tamper(&|spec| spec.containers[0].args = Some(vec!["--debug".to_string()])),
+            ),
+            (
+                "peer command",
+                tamper(&|spec| spec.containers[1].command = Some(vec!["/bin/sh".to_string()])),
+            ),
+            (
+                "peer privilege",
+                tamper(&|spec| {
+                    spec.containers[0]
+                        .security_context
+                        .as_mut()
+                        .unwrap()
+                        .privileged = Some(true);
+                }),
+            ),
+            (
+                "peer identity",
+                tamper(&|spec| {
+                    spec.containers[1]
+                        .security_context
+                        .as_mut()
+                        .unwrap()
+                        .run_as_user = Some(0);
+                }),
+            ),
+            (
+                "peer Secret mount",
+                tamper(&|spec| {
+                    spec.containers[0]
+                        .volume_mounts
+                        .get_or_insert_default()
+                        .push(K8sVolumeMount {
+                            name: SANDBOX_BOOTSTRAP_VOLUME_NAME.to_string(),
+                            mount_path: "/secret".to_string(),
+                            ..Default::default()
+                        });
+                }),
+            ),
+            (
+                "peer workload environment on the container",
+                tamper(&|spec| {
+                    spec.containers[0].env.get_or_insert_default().push(EnvVar {
+                        name: "MESH_PEER".to_string(),
+                        value: Some("tcp://127.0.0.1:7480".to_string()),
+                        ..Default::default()
+                    });
+                }),
+            ),
+            (
+                "unknown container",
+                tamper(&|spec| {
+                    spec.containers.push(Container {
+                        name: "istio-proxy".to_string(),
+                        ..Default::default()
+                    });
+                }),
+            ),
+            (
+                "reordered containers",
+                tamper(&|spec| spec.containers.swap(0, 1)),
+            ),
+            (
+                "missing peer",
+                tamper(&|spec| drop(spec.containers.remove(1))),
+            ),
+            (
+                "ephemeral container",
+                tamper(&|spec| {
+                    spec.ephemeral_containers = Some(vec![EphemeralContainer {
+                        name: "debugger".to_string(),
+                        ..Default::default()
+                    }]);
+                }),
+            ),
+            (
+                "peer boot volume mounted by workspace-init",
+                tamper(&|spec| {
+                    let init = spec
+                        .init_containers
+                        .as_mut()
+                        .unwrap()
+                        .iter_mut()
+                        .find(|container| container.name == WORKSPACE_INIT_CONTAINER_NAME)
+                        .unwrap();
+                    init.volume_mounts
+                        .get_or_insert_default()
+                        .push(K8sVolumeMount {
+                            name: "openshell-peer-0-boot".to_string(),
+                            mount_path: "/steal".to_string(),
+                            ..Default::default()
+                        });
+                }),
+            ),
+            (
+                "peer control volume on disk",
+                tamper(&|spec| {
+                    let volume = spec
+                        .volumes
+                        .as_mut()
+                        .unwrap()
+                        .iter_mut()
+                        .find(|volume| volume.name == "openshell-peer-1-control")
+                        .unwrap();
+                    volume.empty_dir.as_mut().unwrap().medium = None;
+                }),
+            ),
+            (
+                "peer declared mount made read-only",
+                tamper(&|spec| {
+                    let mount = spec.containers[0]
+                        .volume_mounts
+                        .as_mut()
+                        .unwrap()
+                        .iter_mut()
+                        .find(|mount| mount.name == "flock-ipc")
+                        .unwrap();
+                    mount.read_only = Some(true);
+                }),
+            ),
+        ];
+        for (case, pod) in cases {
+            let error = gate_peer_pod(&pod, &peers).expect_err(case).to_string();
+            assert!(
+                error.contains("capability-free isolation"),
+                "{case}: {error}"
+            );
+        }
+
+        // A Pod rendered with peers never passes for a sandbox recorded
+        // without them, and vice versa.
+        assert!(gate_peer_pod(&admitted_peer_pod(peer_driver_config()), &[]).is_err());
+        assert!(gate_peer_pod(&admitted_peer_pod(serde_json::json!({})), &peers).is_err());
+    }
+
+    #[test]
+    fn peer_workload_record_round_trips_and_fails_closed() {
+        let peers = recorded_peers();
+        let mut object = sandbox_object_for_test("cr-uid", "sandbox-peers");
+        assert!(sandbox_peer_workloads(&object).unwrap().is_empty());
+        assert_eq!(encode_peer_workloads_annotation(&[]).unwrap(), None);
+
+        let encoded = encode_peer_workloads_annotation(&peers).unwrap().unwrap();
+        object.metadata.annotations = Some(BTreeMap::from([(
+            ANNOTATION_SANDBOX_RUNTIME_PEER_WORKLOADS.to_string(),
+            encoded,
+        )]));
+        assert_eq!(sandbox_peer_workloads(&object).unwrap(), peers);
+
+        for corrupt in [
+            "not json".to_string(),
+            "[]".to_string(),
+            serde_json::json!([{"name": "agent", "image": "x", "command": ["x"]}]).to_string(),
+            serde_json::json!([{"name": "ravn", "image": "x", "command": ["x"], "readiness_port": 1}])
+                .to_string(),
+            serde_json::json!([{"name": "ravn", "image": "x", "command": ["x"],
+                "volume_mounts": [{"name": "v", "mount_path": "/.openshell/peers"}]}])
+            .to_string(),
+        ] {
+            object.metadata.annotations = Some(BTreeMap::from([(
+                ANNOTATION_SANDBOX_RUNTIME_PEER_WORKLOADS.to_string(),
+                corrupt.clone(),
+            )]));
+            assert!(
+                matches!(
+                    sandbox_peer_workloads(&object),
+                    Err(KubernetesDriverError::Precondition(_))
+                ),
+                "{corrupt} must fail closed"
+            );
+        }
+    }
+
+    #[test]
+    fn peer_tokens_are_fresh_and_bound_to_boundary_digests() {
+        let peers = recorded_peers();
+        let (tokens, configs) = peer_boundary_material(&peers).unwrap();
+        let (again, _) = peer_boundary_material(&peers).unwrap();
+        assert_ne!(tokens, again, "every generation gets fresh tokens");
+        openshell_sandbox_backend::peer_workloads::validate_peer_workloads(&configs).unwrap();
+
+        let secret = sandbox_bootstrap_secret(
+            "sandbox",
+            &SandboxRuntimeNames::new("sandbox-peers"),
+            "sandbox-peers",
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            tokens,
+            OwnerReference::default(),
+        );
+        let data = secret.data.unwrap();
+        for (index, (peer, config)) in peers.iter().zip(&configs).enumerate() {
+            assert_eq!(config.index, index);
+            assert_eq!(config.name, peer.name);
+            assert_eq!(config.command, peer.command);
+            assert_eq!(config.environment, peer.environment);
+            let token =
+                &data[&openshell_sandbox_backend::peer_workloads::peer_token_secret_key(index)].0;
+            assert_eq!(token.len(), PEER_TOKEN_BYTES * 2);
+            assert!(
+                token
+                    .iter()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(byte))
+            );
+            assert_eq!(
+                lower_hex(&openshell_crypto::sha256(token).unwrap()),
+                config.token_sha256
+            );
+        }
+    }
+
+    #[test]
+    fn restarted_generations_keep_peer_boot_mounts_and_agent_environment() {
+        let bootstrap = sandbox_bootstrap_init_container("sandbox:0.1.3", None, 1500, 1500, 2);
+        let mounts = mount_paths(&bootstrap);
+        assert!(mounts.contains(&(
+            "openshell-peer-1-boot".to_string(),
+            "/.openshell/peer-boot/1".to_string(),
+            false
+        )));
+
+        let params = peer_pod_params();
+        let cr =
+            sandbox_to_k8s_spec_for_test(Some(&peer_sandbox_spec(peer_driver_config())), &params);
+        let mut object = sandbox_object_for_test("cr-uid", "sandbox-peers");
+        object.data = cr;
+        let env = child_environment_from_sandbox_object(&object);
+        assert_eq!(env.get("AGENT_ONLY").map(String::as_str), Some("agent"));
+        assert!(!env.contains_key("MESH_PEER"));
+    }
+
     #[test]
     fn driver_config_pvc_subpath_mounts_render_in_pod_template() {
         let template = SandboxTemplate {
@@ -10565,10 +11924,20 @@ mod tests {
         assert_eq!(config.volumes.len(), 1);
         assert_eq!(config.volumes[0].name, "user-data");
         assert_eq!(
-            config.volumes[0].persistent_volume_claim.claim_name,
+            config.volumes[0]
+                .persistent_volume_claim
+                .as_ref()
+                .unwrap()
+                .claim_name,
             "pvc-user-data"
         );
-        assert!(!config.volumes[0].persistent_volume_claim.read_only);
+        assert!(
+            !config.volumes[0]
+                .persistent_volume_claim
+                .as_ref()
+                .unwrap()
+                .read_only
+        );
         assert_eq!(config.containers.agent.volume_mounts.len(), 3);
         assert!(
             config
@@ -10651,7 +12020,11 @@ mod tests {
             .expect("DNS-1123 subdomain PVC names should validate");
 
         assert_eq!(
-            config.volumes[0].persistent_volume_claim.claim_name,
+            config.volumes[0]
+                .persistent_volume_claim
+                .as_ref()
+                .unwrap()
+                .claim_name,
             "pvc.user-data.123"
         );
     }
@@ -13344,7 +14717,7 @@ mod tests {
             serde_json::json!({"name": "openshell-sandbox-bootstrap", "image": "sandbox:0.1.2"}),
             workspace_init.clone(),
         ];
-        let bootstrap = sandbox_bootstrap_init_container("sandbox:0.1.3", None, 1500, 1500);
+        let bootstrap = sandbox_bootstrap_init_container("sandbox:0.1.3", None, 1500, 1500, 0);
 
         replace_sandbox_bootstrap_init_container(&mut init_containers, bootstrap.clone()).unwrap();
 

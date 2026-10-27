@@ -27,6 +27,7 @@ use openshell_sandbox_backend::boundary_protocol::{
     BoundaryConfig, BoundaryListener, GatewayVerificationKey, SandboxRuntimeDescriptor,
     SandboxTlsClientConfig, SandboxTlsServerConfig, SandboxTransport,
 };
+use openshell_sandbox_backend::peer_workloads::{PeerWorkloadConfig, validate_peer_workloads};
 use serde::Serialize;
 
 use crate::config::KubernetesControlConnection;
@@ -408,6 +409,9 @@ pub struct KubernetesSandboxRuntimeBoundarySpec {
     pub host_gateway_ip: Option<IpAddr>,
     pub workload_identity: ResolvedWorkloadIdentity,
     pub child_env: HashMap<String, String>,
+    /// Peer workload containers served by the primary runtime, in container
+    /// index order, each bound to the digest of its bootstrap Secret token.
+    pub peers: Vec<PeerWorkloadConfig>,
 }
 
 /// Protected workload-pod config and matching sandbox-runtime descriptor.
@@ -420,6 +424,21 @@ impl KubernetesSandboxRuntimeBoundarySpec {
     /// Produce both sides of the common protocol from one observed Kubernetes
     /// resource set so a stale or recreated object cannot be attached.
     pub fn provision(self) -> Result<KubernetesSandboxRuntimeBoundaryProvisioning, BackendError> {
+        validate_peer_workloads(&self.peers).map_err(BackendError::Descriptor)?;
+        // Peers share the Pod's loopback interface, so a workload listener
+        // would be reachable from every peer. Peers are served only when the
+        // runtime dials its supervisor and opens no inbound control listener.
+        if !self.peers.is_empty()
+            && matches!(
+                self.control_path,
+                KubernetesControlPath::SupervisorInitiated { .. }
+            )
+        {
+            return Err(BackendError::Descriptor(
+                "peer workload containers require a runtime-initiated control connection"
+                    .to_string(),
+            ));
+        }
         let mut resource_claims = BTreeMap::from([
             ("kubernetes.namespace_uid".to_string(), self.namespace_uid),
             (
@@ -566,7 +585,7 @@ impl KubernetesSandboxRuntimeBoundarySpec {
                 workload_identity: self.workload_identity.clone(),
                 provisioning_evidence: provisioning_evidence.clone(),
                 child_env: self.child_env,
-                peers: Vec::new(),
+                peers: self.peers,
             },
             runtime_descriptor: SandboxRuntimeDescriptor {
                 boundary_id: self.boundary_id,
@@ -677,7 +696,71 @@ mod tests {
             )
             .unwrap(),
             child_env: HashMap::new(),
+            peers: Vec::new(),
         }
+    }
+
+    fn peer(index: usize, name: &str) -> PeerWorkloadConfig {
+        PeerWorkloadConfig {
+            index,
+            name: name.to_string(),
+            command: vec!["python3".to_string(), "-m".to_string(), "ravn".to_string()],
+            environment: BTreeMap::from([("MESH".to_string(), "1".to_string())]),
+            token_sha256: "0".repeat(64),
+        }
+    }
+
+    fn runtime_initiated_spec() -> KubernetesSandboxRuntimeBoundarySpec {
+        KubernetesSandboxRuntimeBoundarySpec {
+            control_path: KubernetesControlPath::RuntimeInitiated {
+                control_authority: "os-control-sandbox.default.svc:5500".to_string(),
+                supervisor_address: "10.42.0.8:5500".parse().expect("valid target"),
+                supervisor_listen: "0.0.0.0:5500".parse().expect("valid listener"),
+                control_policy_uid: "control-policy-uid".to_string(),
+                control_policy_resource_version: "7".to_string(),
+            },
+            ..spec()
+        }
+    }
+
+    #[test]
+    fn provisioning_records_peers_in_the_protected_boundary_config() {
+        let peers = vec![peer(0, "reviewer"), peer(1, "coder")];
+        let provisioned = KubernetesSandboxRuntimeBoundarySpec {
+            peers: peers.clone(),
+            ..runtime_initiated_spec()
+        }
+        .provision()
+        .unwrap();
+
+        assert_eq!(provisioned.boundary_config.peers, peers);
+        let decoded: BoundaryConfig =
+            serde_json::from_slice(&provisioned.boundary_config.encode().unwrap()).unwrap();
+        assert_eq!(decoded.peers, peers);
+    }
+
+    #[test]
+    fn provisioning_refuses_peers_without_runtime_initiated_control() {
+        let error = KubernetesSandboxRuntimeBoundarySpec {
+            peers: vec![peer(0, "reviewer")],
+            ..spec()
+        }
+        .provision()
+        .err()
+        .expect("supervisor-initiated control must not serve peers");
+        assert!(error.to_string().contains("runtime-initiated"), "{error}");
+    }
+
+    #[test]
+    fn provisioning_refuses_peers_that_break_the_shared_contract() {
+        let error = KubernetesSandboxRuntimeBoundarySpec {
+            peers: vec![peer(1, "reviewer")],
+            ..runtime_initiated_spec()
+        }
+        .provision()
+        .err()
+        .expect("misindexed peers must not provision");
+        assert!(error.to_string().contains("index"), "{error}");
     }
 
     #[test]
