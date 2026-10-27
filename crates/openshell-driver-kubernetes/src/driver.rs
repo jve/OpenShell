@@ -75,9 +75,10 @@ use openshell_sandbox_backend::boundary_protocol::{
     generate_sandbox_tls_material,
 };
 use openshell_sandbox_backend::peer_workloads::{
-    MAX_PEER_WORKLOADS, PEER_BOOT_DIR, PEER_CONTROL_DIR, PEER_SUBCOMMAND, PEER_TOKEN_BYTES,
-    PeerWorkloadConfig, peer_boot_dir_in_init, peer_boot_volume_name, peer_control_dir_in_primary,
-    peer_control_volume_name, peer_run_volume_name, validate_peer_name,
+    MAX_PEER_WORKLOADS, PEER_BOOT_DIR, PEER_CONTROL_DIR, PEER_RUN_DIR, PEER_SUBCOMMAND,
+    PEER_TOKEN_BYTES, PeerWorkloadConfig, peer_boot_dir_in_init, peer_boot_volume_name,
+    peer_control_dir_in_primary, peer_control_volume_name, peer_run_volume_name,
+    validate_peer_name,
 };
 use openshell_supervisor_control::{
     InstanceSupervision, LaunchError, RecoverableInstance, RecoveryBaseline,
@@ -2836,9 +2837,38 @@ impl KubernetesComputeDriver {
         }
     }
 
+    /// Read the admitted workload Pod as raw JSON, so the gate also sees
+    /// fields the typed schema compiled into this driver does not model.
+    async fn admitted_workload_pod_json(
+        &self,
+        namespace: &str,
+        name: &str,
+        observed: &Pod,
+    ) -> Result<serde_json::Value, KubernetesDriverError> {
+        let pods = Api::<DynamicObject>::namespaced_with(
+            self.client.clone(),
+            namespace,
+            &ApiResource::erase::<Pod>(&()),
+        );
+        let raw = tokio::time::timeout(KUBE_API_TIMEOUT, pods.get(name))
+            .await
+            .map_err(|_| {
+                KubernetesDriverError::Message(format!("timed out reading workload Pod {name}"))
+            })?
+            .map_err(KubernetesDriverError::from_kube)?;
+        if raw.metadata.uid.is_none() || raw.metadata.uid != observed.metadata.uid {
+            return Err(KubernetesDriverError::Precondition(format!(
+                "workload Pod {name} was replaced while it was being admitted"
+            )));
+        }
+        serde_json::to_value(&raw).map_err(|error| {
+            KubernetesDriverError::Message(format!("encode workload Pod {name}: {error}"))
+        })
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn validate_capability_free_workload_pod(
-        pod: &Pod,
+        pod_json: &serde_json::Value,
         sandbox_resource_uid: &str,
         sandbox_id: &str,
         uid: u32,
@@ -2851,6 +2881,14 @@ impl KubernetesComputeDriver {
                 "admitted workload Pod does not preserve capability-free isolation: {message}"
             ))
         };
+        // Gate the raw admitted object: the typed schema compiled into this
+        // driver silently drops fields it does not model, so every such field
+        // must be rejected or checked in the raw JSON directly.
+        let pod: Pod = serde_json::from_value(pod_json.clone())
+            .map_err(|error| fail(&format!("Pod does not decode: {error}")))?;
+        let pod = &pod;
+        validate_inspectable_pod_spec(pod_json, pod).map_err(|message| fail(&message))?;
+        validate_raw_app_armor(pod_json).map_err(|message| fail(&message))?;
         if pod.metadata.uid.as_deref().is_none() {
             return Err(fail("missing Pod UID"));
         }
@@ -2938,8 +2976,7 @@ impl KubernetesComputeDriver {
         {
             return Err(fail("numeric identity, groups, or seccomp profile changed"));
         }
-        let pod_json = serde_json::to_value(pod)
-            .map_err(|error| KubernetesDriverError::Message(error.to_string()))?;
+        validate_pod_confinement(security).map_err(|message| fail(&message))?;
         if let Some(policy) = pod_json.pointer("/spec/securityContext/supplementalGroupsPolicy")
             && policy != &serde_json::json!("Strict")
         {
@@ -3000,6 +3037,7 @@ impl KubernetesComputeDriver {
         }
         let agent = &spec.containers[peers.len()];
         check_container(agent, "agent")?;
+        validate_no_kubelet_side_channels(agent, "agent").map_err(|message| fail(&message))?;
         let bootstrap = spec
             .init_containers
             .as_deref()
@@ -3008,6 +3046,18 @@ impl KubernetesComputeDriver {
             .find(|container| container.name == SANDBOX_BOOTSTRAP_CONTAINER_NAME)
             .ok_or_else(|| fail("trusted bootstrap init container missing"))?;
         check_container(bootstrap, "bootstrap init container")?;
+        for init in spec.init_containers.as_deref().unwrap_or_default() {
+            validate_container_confinement(init.security_context.as_ref(), &init.name)
+                .map_err(|message| fail(&message))?;
+            // A restartable ("sidecar") init container keeps running beside
+            // the workload outside the sandbox boundary.
+            if init.restart_policy.is_some() {
+                return Err(fail(&format!(
+                    "init container {} sets a restartPolicy",
+                    init.name
+                )));
+            }
+        }
         let mounts_volume = |container: &k8s_openapi::api::core::v1::Container,
                              volume_name: &str| {
             container
@@ -3040,6 +3090,8 @@ impl KubernetesComputeDriver {
         if !secret_matches {
             return Err(fail("generation-specific sandbox Secret changed"));
         }
+        validate_bootstrap_secret_exposure(spec, sandbox_secret_name)
+            .map_err(|message| fail(&message))?;
         validate_peer_workload_pod(spec, peers, uid, gid).map_err(|message| fail(&message))
     }
 
@@ -3552,8 +3604,11 @@ impl KubernetesComputeDriver {
             .await
             .map_err(admission_error)?;
         let peer_workloads = sandbox_peer_workloads(&admission_object)?;
+        let admitted_pod = self
+            .admitted_workload_pod_json(namespace, cr_name, &workload_pod)
+            .await?;
         Self::validate_capability_free_workload_pod(
-            &workload_pod,
+            &admitted_pod,
             cr_uid,
             sandbox_id,
             agent_uid,
@@ -7152,15 +7207,257 @@ fn validate_workload_container_security_context(
         || context.run_as_group != Some(i64::from(gid))
         || context.run_as_non_root != Some(true)
         || context.allow_privilege_escalation != Some(false)
-        || context.privileged == Some(true)
-        || context
-            .seccomp_profile
-            .as_ref()
-            .is_some_and(|profile| profile.type_ != "RuntimeDefault")
         || !drops_all
         || !adds_none
     {
         return Err(format!("{name} security context changed"));
+    }
+    validate_container_confinement(Some(context), name)
+}
+
+/// `SELinux` options that only narrow confinement: unset, or only an MCS
+/// `level`, which platforms such as `OpenShift` assign per namespace. Any
+/// `user`, `role`, or `type` (for example `spc_t`) can widen it.
+fn se_linux_options_are_default(options: &k8s_openapi::api::core::v1::SELinuxOptions) -> bool {
+    options.user.is_none() && options.role.is_none() && options.type_.is_none()
+}
+
+/// Reject container security-context settings that weaken kernel
+/// confinement: privileged mode, a non-default `procMount`, a seccomp profile
+/// other than `RuntimeDefault`, and `SELinux` overrides. `AppArmor` is checked on
+/// the raw Pod by [`validate_raw_app_armor`] because the typed schema does not
+/// model it.
+fn validate_container_confinement(
+    context: Option<&k8s_openapi::api::core::v1::SecurityContext>,
+    name: &str,
+) -> Result<(), String> {
+    let Some(context) = context else {
+        return Ok(());
+    };
+    if context.privileged == Some(true)
+        || context
+            .proc_mount
+            .as_deref()
+            .is_some_and(|proc_mount| proc_mount != "Default")
+        || context
+            .seccomp_profile
+            .as_ref()
+            .is_some_and(|profile| profile.type_ != "RuntimeDefault")
+        || context
+            .se_linux_options
+            .as_ref()
+            .is_some_and(|options| !se_linux_options_are_default(options))
+    {
+        return Err(format!(
+            "{name} security context weakens privileged, procMount, seccomp, or SELinux confinement"
+        ));
+    }
+    Ok(())
+}
+
+/// Pod-level counterpart of [`validate_container_confinement`].
+fn validate_pod_confinement(
+    context: &k8s_openapi::api::core::v1::PodSecurityContext,
+) -> Result<(), String> {
+    if context
+        .se_linux_options
+        .as_ref()
+        .is_some_and(|options| !se_linux_options_are_default(options))
+    {
+        return Err("Pod security context overrides SELinux confinement".to_string());
+    }
+    Ok(())
+}
+
+/// Kubelet runs probes and lifecycle hooks itself, in the shared network
+/// namespace and outside the runtime's seccomp, Landlock, and network
+/// mediation; raw block devices bypass the filesystem policy. The driver never
+/// renders any of them on `agent` or a peer.
+fn validate_no_kubelet_side_channels(
+    container: &k8s_openapi::api::core::v1::Container,
+    name: &str,
+) -> Result<(), String> {
+    if container.liveness_probe.is_some()
+        || container.readiness_probe.is_some()
+        || container.startup_probe.is_some()
+        || container.lifecycle.is_some()
+        || container
+            .volume_devices
+            .as_deref()
+            .is_some_and(|devices| !devices.is_empty())
+    {
+        return Err(format!(
+            "{name} has a probe, lifecycle hook, or volume device the driver never renders"
+        ));
+    }
+    Ok(())
+}
+
+/// The bootstrap Secret (boundary config, TLS key, and peer tokens) reaches
+/// only the trusted init container, through exactly the driver's volume.
+fn validate_bootstrap_secret_exposure(
+    spec: &k8s_openapi::api::core::v1::PodSpec,
+    secret_name: &str,
+) -> Result<(), String> {
+    for volume in spec.volumes.as_deref().unwrap_or_default() {
+        let secret_volume = volume
+            .secret
+            .as_ref()
+            .and_then(|secret| secret.secret_name.as_deref())
+            == Some(secret_name);
+        let projected = volume
+            .projected
+            .as_ref()
+            .into_iter()
+            .flat_map(|projected| projected.sources.as_deref().unwrap_or_default())
+            .any(|source| {
+                source
+                    .secret
+                    .as_ref()
+                    .is_some_and(|secret| secret.name == secret_name)
+            });
+        if projected || (secret_volume && volume.name != SANDBOX_BOOTSTRAP_VOLUME_NAME) {
+            return Err(format!(
+                "volume {} exposes the bootstrap Secret",
+                volume.name
+            ));
+        }
+    }
+    let init_containers = spec.init_containers.as_deref().unwrap_or_default();
+    for (container, trusted) in init_containers
+        .iter()
+        .map(|container| {
+            (
+                container,
+                container.name == SANDBOX_BOOTSTRAP_CONTAINER_NAME,
+            )
+        })
+        .chain(spec.containers.iter().map(|container| (container, false)))
+    {
+        let mounts_secret = container
+            .volume_mounts
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .any(|mount| mount.name == SANDBOX_BOOTSTRAP_VOLUME_NAME);
+        if mounts_secret && !trusted {
+            return Err(format!(
+                "{} mounts the bootstrap Secret; only the trusted init container may",
+                container.name
+            ));
+        }
+        let env_reference = container
+            .env
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|entry| entry.value_from.as_ref())
+            .filter_map(|source| source.secret_key_ref.as_ref())
+            .any(|selector| selector.name == secret_name)
+            || container
+                .env_from
+                .as_deref()
+                .unwrap_or_default()
+                .iter()
+                .filter_map(|source| source.secret_ref.as_ref())
+                .any(|source| source.name == secret_name);
+        if env_reference {
+            return Err(format!(
+                "{} reads the bootstrap Secret through its environment",
+                container.name
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Raw Pod fields the typed schema compiled into this driver does not model,
+/// which the gate checks in the raw object instead.
+const RAW_CHECKED_POD_FIELDS: &[&str] = &[
+    "spec.securityContext.supplementalGroupsPolicy",
+    "spec.securityContext.appArmorProfile",
+    "spec.containers[].securityContext.appArmorProfile",
+    "spec.initContainers[].securityContext.appArmorProfile",
+    "spec.ephemeralContainers[].securityContext.appArmorProfile",
+];
+
+/// Fail closed on any admitted Pod `spec` field the typed schema dropped and
+/// the gate does not check in the raw object: the gate cannot vouch for what
+/// it cannot see.
+fn validate_inspectable_pod_spec(pod_json: &serde_json::Value, pod: &Pod) -> Result<(), String> {
+    fn collect(
+        raw: &serde_json::Value,
+        typed: &serde_json::Value,
+        path: &str,
+        missing: &mut Vec<String>,
+    ) {
+        match (raw, typed) {
+            (serde_json::Value::Object(raw), serde_json::Value::Object(typed)) => {
+                for (key, value) in raw {
+                    if value.is_null() {
+                        continue;
+                    }
+                    let child = format!("{path}.{key}");
+                    match typed.get(key) {
+                        Some(typed) => collect(value, typed, &child, missing),
+                        None => missing.push(child),
+                    }
+                }
+            }
+            (serde_json::Value::Array(raw), serde_json::Value::Array(typed)) => {
+                for (raw, typed) in raw.iter().zip(typed) {
+                    collect(raw, typed, &format!("{path}[]"), missing);
+                }
+            }
+            _ => {}
+        }
+    }
+    let typed = serde_json::to_value(&pod.spec).map_err(|error| error.to_string())?;
+    let mut missing = Vec::new();
+    collect(&pod_json["spec"], &typed, "spec", &mut missing);
+    missing.retain(|path| !RAW_CHECKED_POD_FIELDS.contains(&path.as_str()));
+    if !missing.is_empty() {
+        missing.sort();
+        missing.dedup();
+        return Err(format!(
+            "Pod spec carries fields the driver cannot inspect: {}",
+            missing.join(", ")
+        ));
+    }
+    Ok(())
+}
+
+/// `AppArmor` must stay at the runtime default for the Pod and every container,
+/// through both the `appArmorProfile` fields and the legacy annotations.
+fn validate_raw_app_armor(pod_json: &serde_json::Value) -> Result<(), String> {
+    let is_default = |profile: Option<&serde_json::Value>| {
+        profile.is_none_or(|profile| {
+            profile.is_null() || profile == &serde_json::json!({"type": "RuntimeDefault"})
+        })
+    };
+    if !is_default(pod_json.pointer("/spec/securityContext/appArmorProfile")) {
+        return Err("Pod overrides the AppArmor profile".to_string());
+    }
+    for field in ["containers", "initContainers", "ephemeralContainers"] {
+        for container in pod_json["spec"][field].as_array().into_iter().flatten() {
+            if !is_default(container.pointer("/securityContext/appArmorProfile")) {
+                return Err(format!(
+                    "{} overrides the AppArmor profile",
+                    container["name"].as_str().unwrap_or("<unnamed>")
+                ));
+            }
+        }
+    }
+    let legacy = pod_json["metadata"]["annotations"]
+        .as_object()
+        .into_iter()
+        .flatten()
+        .any(|(key, value)| {
+            key.starts_with("container.apparmor.security.beta.kubernetes.io/")
+                && value != "runtime/default"
+        });
+    if legacy {
+        return Err("Pod annotations override the AppArmor profile".to_string());
     }
     Ok(())
 }
@@ -7245,10 +7542,10 @@ fn validate_peer_workload_pod(
         {
             return Err(format!("peer workload {name} entrypoint changed"));
         }
+        validate_no_kubelet_side_channels(container, name)?;
         if container.stdin == Some(true)
             || container.tty == Some(true)
             || container.restart_policy.is_some()
-            || container.lifecycle.is_some()
             || container
                 .ports
                 .as_deref()
@@ -7311,10 +7608,7 @@ fn validate_peer_workload_pod(
         );
         expected_owners.insert(
             peer_run_volume_name(index),
-            std::collections::BTreeSet::from([(
-                peer.name.clone(),
-                SANDBOX_PROXY_CA_MOUNT_PATH.to_string(),
-            )]),
+            std::collections::BTreeSet::from([(peer.name.clone(), PEER_RUN_DIR.to_string())]),
         );
     }
 
@@ -7402,11 +7696,7 @@ fn peer_workload_volume_mounts(
         ),
         driver_mount(peer_control_volume_name(index), PEER_CONTROL_DIR, false),
         driver_mount(peer_boot_volume_name(index), PEER_BOOT_DIR, false),
-        driver_mount(
-            peer_run_volume_name(index),
-            SANDBOX_PROXY_CA_MOUNT_PATH,
-            false,
-        ),
+        driver_mount(peer_run_volume_name(index), PEER_RUN_DIR, false),
     ];
     mounts.extend(peer.volume_mounts.iter().map(VolumeMount::from));
     mounts
@@ -11184,6 +11474,13 @@ mod tests {
 
     /// The workload Pod the controller would admit from the rendered template.
     fn admitted_peer_pod(driver_config: serde_json::Value) -> Pod {
+        serde_json::from_value(admitted_raw_peer_pod(driver_config))
+            .expect("rendered template is a valid Pod")
+    }
+
+    /// The admitted Pod as the API server returns it, including fields the
+    /// typed schema does not model.
+    fn admitted_raw_peer_pod(driver_config: serde_json::Value) -> serde_json::Value {
         let params = peer_pod_params();
         let cr = sandbox_to_k8s_spec_for_test(Some(&peer_sandbox_spec(driver_config)), &params);
         let mut pod = cr["spec"]["podTemplate"].clone();
@@ -11196,11 +11493,18 @@ mod tests {
             "uid": "cr-uid",
             "controller": true
         }]);
-        serde_json::from_value(pod).expect("rendered template is a valid Pod")
+        pod
     }
 
     fn gate_peer_pod(
         pod: &Pod,
+        peers: &[KubernetesPeerWorkloadConfig],
+    ) -> Result<(), KubernetesDriverError> {
+        gate_raw_peer_pod(&serde_json::to_value(pod).unwrap(), peers)
+    }
+
+    fn gate_raw_peer_pod(
+        pod: &serde_json::Value,
         peers: &[KubernetesPeerWorkloadConfig],
     ) -> Result<(), KubernetesDriverError> {
         KubernetesComputeDriver::validate_capability_free_workload_pod(
@@ -11681,6 +11985,328 @@ mod tests {
         // without them, and vice versa.
         assert!(gate_peer_pod(&admitted_peer_pod(peer_driver_config()), &[]).is_err());
         assert!(gate_peer_pod(&admitted_peer_pod(serde_json::json!({})), &peers).is_err());
+    }
+
+    type RawPodEdit = fn(&mut serde_json::Value);
+    type PodSpecEdit = Box<dyn Fn(&mut k8s_openapi::api::core::v1::PodSpec)>;
+
+    #[test]
+    fn workload_gate_accepts_the_raw_pod_with_default_confinement() {
+        let peers = recorded_peers();
+        let mut pod = admitted_raw_peer_pod(peer_driver_config());
+        assert_eq!(
+            pod["spec"]["securityContext"]["supplementalGroupsPolicy"],
+            "Strict"
+        );
+        gate_raw_peer_pod(&pod, &peers).expect("raw rendered Pod passes the gate");
+
+        // Defaults a platform may apply: runtime-default AppArmor and an MCS
+        // level assigned by SELinux admission.
+        pod["spec"]["securityContext"]["appArmorProfile"] =
+            serde_json::json!({"type": "RuntimeDefault"});
+        pod["spec"]["securityContext"]["seLinuxOptions"] =
+            serde_json::json!({"level": "s0:c26,c5"});
+        for container in pod["spec"]["containers"].as_array_mut().unwrap() {
+            container["securityContext"]["appArmorProfile"] =
+                serde_json::json!({"type": "RuntimeDefault"});
+            container["securityContext"]["seLinuxOptions"] =
+                serde_json::json!({"level": "s0:c26,c5"});
+            container["securityContext"]["procMount"] = serde_json::json!("Default");
+        }
+        pod["metadata"]["annotations"]["container.apparmor.security.beta.kubernetes.io/agent"] =
+            serde_json::json!("runtime/default");
+        gate_raw_peer_pod(&pod, &peers).expect("default confinement passes the gate");
+    }
+
+    #[test]
+    fn workload_gate_rejects_raw_fields_it_cannot_inspect() {
+        let peers = recorded_peers();
+        let cases: Vec<(&str, RawPodEdit)> = vec![
+            ("peer AppArmor unconfined", |pod| {
+                pod["spec"]["containers"][0]["securityContext"]["appArmorProfile"] =
+                    serde_json::json!({"type": "Unconfined"});
+            }),
+            ("agent AppArmor localhost", |pod| {
+                pod["spec"]["containers"][2]["securityContext"]["appArmorProfile"] =
+                    serde_json::json!({"type": "Localhost", "localhostProfile": "loose"});
+            }),
+            ("Pod AppArmor unconfined", |pod| {
+                pod["spec"]["securityContext"]["appArmorProfile"] =
+                    serde_json::json!({"type": "Unconfined"});
+            }),
+            ("legacy AppArmor annotation", |pod| {
+                pod["metadata"]["annotations"]["container.apparmor.security.beta.kubernetes.io/ravn-reviewer"] =
+                    serde_json::json!("unconfined");
+            }),
+            ("supplemental groups merged", |pod| {
+                pod["spec"]["securityContext"]["supplementalGroupsPolicy"] =
+                    serde_json::json!("Merge");
+            }),
+            ("unknown container field", |pod| {
+                pod["spec"]["containers"][1]["futureSideChannel"] = serde_json::json!(true);
+            }),
+            ("unknown Pod field", |pod| {
+                pod["spec"]["futureHostAccess"] = serde_json::json!({"enabled": true});
+            }),
+        ];
+        for (case, edit) in cases {
+            let mut pod = admitted_raw_peer_pod(peer_driver_config());
+            edit(&mut pod);
+            let error = gate_raw_peer_pod(&pod, &peers).expect_err(case).to_string();
+            assert!(
+                error.contains("capability-free isolation"),
+                "{case}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn workload_gate_rejects_kubelet_side_channels_and_weak_confinement() {
+        use k8s_openapi::api::core::v1::{
+            ExecAction, Lifecycle, LifecycleHandler, Probe, SELinuxOptions, VolumeDevice,
+        };
+        let peers = recorded_peers();
+        let exec_probe = || Probe {
+            exec: Some(ExecAction {
+                command: Some(vec![
+                    "/bin/sh".to_string(),
+                    "-c".to_string(),
+                    "id".to_string(),
+                ]),
+            }),
+            ..Default::default()
+        };
+        let cases: Vec<(&str, PodSpecEdit)> = vec![
+            (
+                "peer liveness probe",
+                Box::new(move |spec| spec.containers[0].liveness_probe = Some(exec_probe())),
+            ),
+            (
+                "agent readiness probe",
+                Box::new(move |spec| spec.containers[2].readiness_probe = Some(exec_probe())),
+            ),
+            (
+                "peer startup probe",
+                Box::new(move |spec| spec.containers[1].startup_probe = Some(exec_probe())),
+            ),
+            (
+                "agent lifecycle hook",
+                Box::new(|spec| {
+                    spec.containers[2].lifecycle = Some(Lifecycle {
+                        post_start: Some(LifecycleHandler::default()),
+                        ..Default::default()
+                    });
+                }),
+            ),
+            (
+                "agent volume device",
+                Box::new(|spec| {
+                    spec.containers[2].volume_devices = Some(vec![VolumeDevice {
+                        name: "flock-ipc".to_string(),
+                        device_path: "/dev/xvda".to_string(),
+                    }]);
+                }),
+            ),
+            (
+                "peer volume device",
+                Box::new(|spec| {
+                    spec.containers[0].volume_devices = Some(vec![VolumeDevice {
+                        name: "flock-ipc".to_string(),
+                        device_path: "/dev/xvda".to_string(),
+                    }]);
+                }),
+            ),
+            (
+                "peer unmasked procMount",
+                Box::new(|spec| {
+                    spec.containers[0]
+                        .security_context
+                        .as_mut()
+                        .unwrap()
+                        .proc_mount = Some("Unmasked".to_string());
+                }),
+            ),
+            (
+                "agent SELinux type",
+                Box::new(|spec| {
+                    spec.containers[2]
+                        .security_context
+                        .as_mut()
+                        .unwrap()
+                        .se_linux_options = Some(SELinuxOptions {
+                        type_: Some("spc_t".to_string()),
+                        ..Default::default()
+                    });
+                }),
+            ),
+            (
+                "Pod SELinux user",
+                Box::new(|spec| {
+                    spec.security_context.as_mut().unwrap().se_linux_options =
+                        Some(SELinuxOptions {
+                            user: Some("system_u".to_string()),
+                            ..Default::default()
+                        });
+                }),
+            ),
+            (
+                "privileged workspace-init",
+                Box::new(|spec| {
+                    let init = spec
+                        .init_containers
+                        .as_mut()
+                        .unwrap()
+                        .iter_mut()
+                        .find(|container| container.name == WORKSPACE_INIT_CONTAINER_NAME)
+                        .unwrap();
+                    init.security_context.get_or_insert_default().privileged = Some(true);
+                }),
+            ),
+            (
+                "restartable init container",
+                Box::new(|spec| {
+                    spec.init_containers.as_mut().unwrap()[0].restart_policy =
+                        Some("Always".to_string());
+                }),
+            ),
+        ];
+        for (case, edit) in cases {
+            let mut pod = admitted_peer_pod(peer_driver_config());
+            edit(pod.spec.as_mut().unwrap());
+            let error = gate_peer_pod(&pod, &peers).expect_err(case).to_string();
+            assert!(
+                error.contains("capability-free isolation"),
+                "{case}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn workload_gate_confines_the_bootstrap_secret_to_the_trusted_init_container() {
+        use k8s_openapi::api::core::v1::{
+            EnvFromSource, EnvVar, EnvVarSource, ProjectedVolumeSource, SecretEnvSource,
+            SecretKeySelector, SecretProjection, SecretVolumeSource, VolumeMount as K8sVolumeMount,
+            VolumeProjection,
+        };
+        let peers = recorded_peers();
+        let secret = SandboxPodParams::default().sandbox_secret_name.to_string();
+        let mount = |name: &str| K8sVolumeMount {
+            name: name.to_string(),
+            mount_path: "/leak".to_string(),
+            ..Default::default()
+        };
+        let workspace_init = |spec: &mut k8s_openapi::api::core::v1::PodSpec| {
+            spec.init_containers
+                .as_ref()
+                .unwrap()
+                .iter()
+                .position(|container| container.name == WORKSPACE_INIT_CONTAINER_NAME)
+                .unwrap()
+        };
+        let cases: Vec<(&str, PodSpecEdit)> = vec![
+            (
+                "second Secret volume",
+                Box::new({
+                    let secret = secret.clone();
+                    move |spec| {
+                        spec.volumes.as_mut().unwrap().push(Volume {
+                            name: "copy".to_string(),
+                            secret: Some(SecretVolumeSource {
+                                secret_name: Some(secret.clone()),
+                                ..Default::default()
+                            }),
+                            ..Default::default()
+                        });
+                    }
+                }),
+            ),
+            (
+                "projected Secret volume",
+                Box::new({
+                    let secret = secret.clone();
+                    move |spec| {
+                        spec.volumes.as_mut().unwrap().push(Volume {
+                            name: "projected".to_string(),
+                            projected: Some(ProjectedVolumeSource {
+                                sources: Some(vec![VolumeProjection {
+                                    secret: Some(SecretProjection {
+                                        name: secret.clone(),
+                                        ..Default::default()
+                                    }),
+                                    ..Default::default()
+                                }]),
+                                ..Default::default()
+                            }),
+                            ..Default::default()
+                        });
+                    }
+                }),
+            ),
+            (
+                "workspace-init mounting the Secret",
+                Box::new(move |spec| {
+                    let index = workspace_init(spec);
+                    spec.init_containers.as_mut().unwrap()[index]
+                        .volume_mounts
+                        .get_or_insert_default()
+                        .push(mount(SANDBOX_BOOTSTRAP_VOLUME_NAME));
+                }),
+            ),
+            (
+                "peer mounting the Secret",
+                Box::new(move |spec| {
+                    spec.containers[1]
+                        .volume_mounts
+                        .get_or_insert_default()
+                        .push(mount(SANDBOX_BOOTSTRAP_VOLUME_NAME));
+                }),
+            ),
+            (
+                "Secret key in init container environment",
+                Box::new({
+                    let secret = secret.clone();
+                    move |spec| {
+                        let index = workspace_init(spec);
+                        spec.init_containers.as_mut().unwrap()[index]
+                            .env
+                            .get_or_insert_default()
+                            .push(EnvVar {
+                                name: "TOKEN".to_string(),
+                                value_from: Some(EnvVarSource {
+                                    secret_key_ref: Some(SecretKeySelector {
+                                        name: secret.clone(),
+                                        key: "peer-0.token".to_string(),
+                                        ..Default::default()
+                                    }),
+                                    ..Default::default()
+                                }),
+                                ..Default::default()
+                            });
+                    }
+                }),
+            ),
+            (
+                "Secret in agent envFrom",
+                Box::new(move |spec| {
+                    spec.containers[2].env_from = Some(vec![EnvFromSource {
+                        secret_ref: Some(SecretEnvSource {
+                            name: secret.clone(),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    }]);
+                }),
+            ),
+        ];
+        for (case, edit) in cases {
+            let mut pod = admitted_peer_pod(peer_driver_config());
+            edit(pod.spec.as_mut().unwrap());
+            let error = gate_peer_pod(&pod, &peers).expect_err(case).to_string();
+            assert!(
+                error.contains("capability-free isolation"),
+                "{case}: {error}"
+            );
+        }
     }
 
     #[test]
