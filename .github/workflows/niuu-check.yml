@@ -59,5 +59,9 @@ jobs:
         run: mise exec -- cargo clippy ${FORK_CRATES} --all-targets -- -D warnings
       - name: Unit tests
         run: mise exec -- cargo test ${FORK_CRATES}
-      - name: E2E crate compiles
-        run: mise exec -- cargo clippy --manifest-path e2e/rust/Cargo.toml --all-targets --all-features -- -D warnings
+      - name: Peer workload e2e compiles
+        # Upstream lints the e2e crate without feature-gated suites; lint only
+        # the fork's own Kubernetes test with its feature enabled.
+        run: >-
+          mise exec -- cargo clippy --manifest-path e2e/rust/Cargo.toml
+          --features e2e-kubernetes --test kubernetes_peer_workloads -- -D warnings
