@@ -4565,6 +4565,7 @@ mod linux {
                 workload_identity: test_workload_identity(),
                 provisioning_evidence: test_provisioning_evidence(),
                 child_env: std::collections::HashMap::new(),
+                peers: Vec::new(),
             };
             let debug = format!("{config:?}");
             assert!(debug.contains("test-key"));
@@ -4679,6 +4680,7 @@ mod linux {
                 workload_identity: test_workload_identity(),
                 provisioning_evidence: test_provisioning_evidence(),
                 child_env: std::collections::HashMap::new(),
+                peers: Vec::new(),
             };
             assert!(allows_runtime_supplementary_groups(&config));
         }
@@ -4763,6 +4765,7 @@ mod linux {
                     workload_identity: test_workload_identity(),
                     provisioning_evidence: test_provisioning_evidence(),
                     child_env: std::collections::HashMap::new(),
+                    peers: Vec::new(),
                 },
                 tokio::runtime::Handle::current(),
                 broker,
@@ -5520,6 +5523,7 @@ mod linux {
                 workload_identity: test_workload_identity(),
                 provisioning_evidence: test_provisioning_evidence(),
                 child_env: std::collections::HashMap::new(),
+                peers: Vec::new(),
             };
 
             validate_config(&config).unwrap();
@@ -5697,6 +5701,7 @@ mod linux {
                 workload_identity: test_workload_identity(),
                 provisioning_evidence: test_provisioning_evidence(),
                 child_env: std::collections::HashMap::new(),
+                peers: Vec::new(),
             };
             for address in [
                 "127.0.0.1:5500",
@@ -5744,6 +5749,7 @@ mod linux {
                 workload_identity: test_workload_identity(),
                 provisioning_evidence: test_provisioning_evidence(),
                 child_env: std::collections::HashMap::new(),
+                peers: Vec::new(),
             };
 
             validate_config(&config).expect("valid runtime claim configuration");
@@ -6041,6 +6047,7 @@ mod linux {
                         workload_identity: test_workload_identity(),
                         provisioning_evidence: test_provisioning_evidence(),
                         child_env: std::collections::HashMap::new(),
+                        peers: Vec::new(),
                     },
                     tokio::runtime::Handle::current(),
                     network_broker,
@@ -6347,6 +6354,7 @@ mod linux {
                         workload_identity: test_workload_identity(),
                         provisioning_evidence: test_provisioning_evidence(),
                         child_env: std::collections::HashMap::new(),
+                        peers: Vec::new(),
                     },
                     process_runtime.handle().clone(),
                     network_broker,
@@ -6709,6 +6717,7 @@ mod linux {
                         workload_identity: test_workload_identity(),
                         provisioning_evidence: test_provisioning_evidence(),
                         child_env: std::collections::HashMap::new(),
+                        peers: Vec::new(),
                     },
                     process_runtime.handle().clone(),
                     network_broker,

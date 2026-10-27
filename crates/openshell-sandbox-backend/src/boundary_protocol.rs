@@ -577,6 +577,10 @@ pub struct BoundaryConfig {
     /// Driver-resolved environment exposed only to workload processes.
     #[serde(default)]
     pub child_env: std::collections::HashMap<String, String>,
+    /// Peer workload containers served by this boundary's primary runtime.
+    /// Empty for every driver except Kubernetes sandboxes that request them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub peers: Vec<crate::peer_workloads::PeerWorkloadConfig>,
 }
 
 impl fmt::Debug for BoundaryConfig {
@@ -603,6 +607,7 @@ impl fmt::Debug for BoundaryConfig {
             .field("workload_identity", &self.workload_identity)
             .field("provisioning_evidence", &self.provisioning_evidence)
             .field("child_env_keys", &self.child_env.keys().collect::<Vec<_>>())
+            .field("peers", &self.peers)
             .finish()
     }
 }

@@ -15,6 +15,7 @@ pub mod boundary_protocol;
 pub mod delegated;
 pub mod isolation_protocol;
 pub mod mediation;
+pub mod peer_workloads;
 pub mod protobuf;
 mod runtime;
 mod runtime_initiated;
