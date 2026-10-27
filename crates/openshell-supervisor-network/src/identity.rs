@@ -7,6 +7,12 @@
 //! and caches it as the "golden" hash. Subsequent requests from the same binary
 //! path must match the cached hash. A mismatch indicates the binary was replaced
 //! mid-sandbox and the request is denied.
+//!
+//! Pins are scoped to the backend-assigned execution environment of a supplied
+//! identity. A boundary that runs cooperating workloads from different images
+//! legitimately has different executables at the same path in each image;
+//! each environment pins its own digests, and a change within one environment
+//! is still a violation. The boundary's own workload has no environment name.
 
 use crate::procfs;
 use miette::Result;
@@ -93,10 +99,14 @@ struct CachedBinary {
     fingerprint: Option<FileFingerprint>,
 }
 
+/// Pin key: the backend-assigned execution environment (`None` for the
+/// boundary's own workload) and the executable path inside it.
+type PinKey = (Option<String>, PathBuf);
+
 /// Thread-safe cache of binary SHA256 hashes for TOFU enforcement.
 pub struct BinaryIdentityCache {
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-    hashes: Mutex<HashMap<PathBuf, CachedBinary>>,
+    hashes: Mutex<HashMap<PinKey, CachedBinary>>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -134,7 +144,8 @@ impl BinaryIdentityCache {
     }
 
     /// Atomically verify or pin every authorization-capable executable in a
-    /// backend-supplied identity chain.
+    /// backend-supplied identity chain, scoped to the identity's execution
+    /// environment.
     pub(crate) fn verify_or_cache_supplied_identity(
         &self,
         identity: &BinaryIdentity,
@@ -167,12 +178,22 @@ impl BinaryIdentityCache {
             SuppliedIdentityError::Unavailable("Binary identity cache lock poisoned".to_string())
         })?;
 
-        for (path, digest) in &supplied {
-            if let Some(existing) = hashes.get(path)
+        let environment = &identity.execution_environment;
+        let supplied = supplied
+            .into_iter()
+            .map(|(path, digest)| ((environment.clone(), path), digest))
+            .collect::<HashMap<PinKey, _>>();
+        for (key, digest) in &supplied {
+            let path = &key.1;
+            if let Some(existing) = hashes.get(key)
                 && existing.hash != digest.to_string()
             {
+                let scope = environment
+                    .as_ref()
+                    .map(|environment| format!(" in execution environment {environment}"))
+                    .unwrap_or_default();
                 return Err(SuppliedIdentityError::Unavailable(format!(
-                    "Binary integrity violation: {} executable changed",
+                    "Binary integrity violation: {} executable changed{scope}",
                     path.display()
                 )));
             }
@@ -180,14 +201,14 @@ impl BinaryIdentityCache {
 
         let new_entry_count = supplied
             .keys()
-            .filter(|path| !hashes.contains_key(*path))
+            .filter(|key| !hashes.contains_key(*key))
             .count();
         if new_entry_count > MAX_IDENTITY_CACHE_ENTRIES.saturating_sub(hashes.len()) {
             return Err(SuppliedIdentityError::CapacityExhausted);
         }
 
-        for (path, digest) in supplied {
-            hashes.entry(path).or_insert_with(|| CachedBinary {
+        for (key, digest) in supplied {
+            hashes.entry(key).or_insert_with(|| CachedBinary {
                 hash: digest.to_string(),
                 fingerprint: None,
             });
@@ -215,11 +236,13 @@ impl BinaryIdentityCache {
             .map_err(|error| miette::miette!("Failed to stat {}: {error}", cache_path.display()))?;
         let fingerprint = FileFingerprint::from_metadata(&metadata);
 
+        // Locally hashed executables belong to the boundary's own workload.
+        let key: PinKey = (None, cache_path.to_path_buf());
         let cached = self
             .hashes
             .lock()
             .map_err(|_| miette::miette!("Binary identity cache lock poisoned"))?
-            .get(cache_path)
+            .get(&key)
             .cloned();
 
         if let Some(cached_binary) = &cached
@@ -246,7 +269,7 @@ impl BinaryIdentityCache {
             .lock()
             .map_err(|_| miette::miette!("Binary identity cache lock poisoned"))?;
 
-        if let Some(existing) = hashes.get(cache_path)
+        if let Some(existing) = hashes.get(&key)
             && existing.hash != current_hash
         {
             return Err(miette::miette!(
@@ -255,14 +278,14 @@ impl BinaryIdentityCache {
             ));
         }
 
-        if !hashes.contains_key(cache_path) && hashes.len() >= MAX_IDENTITY_CACHE_ENTRIES {
+        if !hashes.contains_key(&key) && hashes.len() >= MAX_IDENTITY_CACHE_ENTRIES {
             return Err(miette::miette!(
                 "Binary identity cache capacity exhausted (maximum {MAX_IDENTITY_CACHE_ENTRIES} pinned paths)"
             ));
         }
 
         hashes.insert(
-            cache_path.to_path_buf(),
+            key,
             CachedBinary {
                 hash: current_hash.clone(),
                 fingerprint: Some(fingerprint),
@@ -312,6 +335,7 @@ mod tests {
                 })
                 .collect(),
             cmdline_paths: Vec::new(),
+            execution_environment: None,
         }
     }
 
@@ -332,6 +356,71 @@ mod tests {
         assert!(error.contains("integrity violation"));
         assert!(!error.contains(&"11".repeat(32)));
         assert!(!error.contains(&"22".repeat(32)));
+    }
+
+    fn in_environment(mut identity: BinaryIdentity, environment: &str) -> BinaryIdentity {
+        identity.execution_environment = Some(environment.to_string());
+        identity
+    }
+
+    #[test]
+    fn supplied_identity_pins_each_execution_environment_independently() {
+        let cache = BinaryIdentityCache::new();
+        let agent = supplied_identity("/usr/bin/python3", Some("11"), &[]);
+        let reviewer = in_environment(
+            supplied_identity("/usr/bin/python3", Some("22"), &[]),
+            "ravn-reviewer",
+        );
+        let coder = in_environment(
+            supplied_identity("/usr/bin/python3", Some("33"), &[]),
+            "ravn-coder",
+        );
+
+        cache.verify_or_cache_supplied_identity(&agent).unwrap();
+        cache.verify_or_cache_supplied_identity(&reviewer).unwrap();
+        cache.verify_or_cache_supplied_identity(&coder).unwrap();
+        cache.verify_or_cache_supplied_identity(&reviewer).unwrap();
+        cache.verify_or_cache_supplied_identity(&agent).unwrap();
+    }
+
+    #[test]
+    fn supplied_identity_rejects_replacement_within_one_execution_environment() {
+        let cache = BinaryIdentityCache::new();
+        let original = in_environment(
+            supplied_identity("/usr/bin/python3", Some("22"), &[]),
+            "ravn-reviewer",
+        );
+        let replaced = in_environment(
+            supplied_identity("/usr/bin/python3", Some("33"), &[]),
+            "ravn-reviewer",
+        );
+
+        cache.verify_or_cache_supplied_identity(&original).unwrap();
+        let error = cache
+            .verify_or_cache_supplied_identity(&replaced)
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("integrity violation"), "{error}");
+        assert!(error.contains("ravn-reviewer"), "{error}");
+        // The boundary's own workload is a separate environment: its first
+        // use pins its own digest rather than inheriting a peer's pin.
+        cache
+            .verify_or_cache_supplied_identity(&supplied_identity(
+                "/usr/bin/python3",
+                Some("33"),
+                &[],
+            ))
+            .unwrap();
+        assert!(
+            cache
+                .verify_or_cache_supplied_identity(&supplied_identity(
+                    "/usr/bin/python3",
+                    Some("22"),
+                    &[],
+                ))
+                .is_err()
+        );
     }
 
     #[test]
@@ -464,7 +553,7 @@ mod tests {
                 .hashes
                 .lock()
                 .unwrap()
-                .contains_key(&executable_path("/sandbox/other"))
+                .contains_key(&(None, executable_path("/sandbox/other")))
         );
     }
 
@@ -494,8 +583,8 @@ mod tests {
         assert!(error.contains("capacity"));
         let hashes = cache.hashes.lock().unwrap();
         assert_eq!(hashes.len(), 4095);
-        assert!(!hashes.contains_key(&executable_path("/sandbox/new-leaf")));
-        assert!(!hashes.contains_key(&executable_path("/sandbox/new-ancestor")));
+        assert!(!hashes.contains_key(&(None, executable_path("/sandbox/new-leaf"))));
+        assert!(!hashes.contains_key(&(None, executable_path("/sandbox/new-ancestor"))));
     }
 
     #[test]
@@ -540,6 +629,7 @@ mod tests {
             },
             ancestors: Vec::new(),
             cmdline_paths: Vec::new(),
+            execution_environment: None,
         };
         let different = supplied_identity(path.to_str().unwrap(), Some("11"), &[]);
 
@@ -562,6 +652,7 @@ mod tests {
             },
             ancestors: Vec::new(),
             cmdline_paths: Vec::new(),
+            execution_environment: None,
         };
         let cache = BinaryIdentityCache::new();
 
@@ -721,7 +812,7 @@ mod tests {
                 .hashes
                 .lock()
                 .unwrap()
-                .contains_key(Path::new("/usr/bin/python3"))
+                .contains_key(&(None, PathBuf::from("/usr/bin/python3")))
         );
     }
 

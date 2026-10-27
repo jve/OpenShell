@@ -324,10 +324,11 @@ struct BinaryIdentity {
     executable: ExecutableIdentity,
     ancestors: Vec<ExecutableIdentity>,  // nearest first
     cmdline_paths: Vec<PathBuf>,         // diagnostic context; never authorizes
+    execution_environment: Option<String>, // backend-assigned; None for the boundary's own workload
 }
 ```
 
-Identity describes the executable identity resolved for the accepted connection before policy evaluation. Paths are expressed in the workload's filesystem namespace. Both the connection-owning executable and its ancestors can authorize access, so each carries integrity evidence as one inseparable path-and-digest value. Command-line paths are diagnostic context only and never authorize.
+Identity describes the executable identity resolved for the accepted connection before policy evaluation. Paths are expressed in the workload's filesystem namespace. Both the connection-owning executable and its ancestors can authorize access, so each carries integrity evidence as one inseparable path-and-digest value. Command-line paths are diagnostic context only and never authorize. A backend that runs cooperating workloads from different root filesystems under one boundary names the execution environment each identity was resolved in, from its own topology and never from workload input; trust-on-first-use pins are scoped to that environment so the same path in two images is pinned independently. Policy matching remains path-based.
 
 If binary identity cannot be resolved, the connection is denied. `ResolveError` reports that failure. A missing digest is represented as `None`; missing or conflicting evidence for any authorization-capable executable denies binary-scoped access. How a backend resolves identity is implementation-specific.
 

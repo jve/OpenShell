@@ -7158,6 +7158,7 @@ process:
             },
             ancestors: Vec::new(),
             cmdline_paths: Vec::new(),
+            execution_environment: None,
         });
 
         let mut decision = authorize_supplied_identity(
@@ -7216,6 +7217,7 @@ process:
                 },
                 ancestors: Vec::new(),
                 cmdline_paths: Vec::new(),
+                execution_environment: None,
             })
         };
         let intent = || EgressIntent::connect("api.example.com".to_string(), 443);
@@ -7274,6 +7276,7 @@ process:
                     digest: Some(ancestor_digest.repeat(32).parse().expect("digest")),
                 }],
                 cmdline_paths: Vec::new(),
+                execution_environment: None,
             })
         };
         let intent = || EgressIntent::connect("api.example.com".to_string(), 443);
@@ -7324,6 +7327,7 @@ process:
                 },
                 ancestors: Vec::new(),
                 cmdline_paths: Vec::new(),
+                execution_environment: None,
             })
         };
         let identity_cache = BinaryIdentityCache::new();
@@ -7384,6 +7388,7 @@ process:
                 digest: None,
             }],
             cmdline_paths: Vec::new(),
+            execution_environment: None,
         });
 
         let decision = authorize_supplied_identity(
@@ -7439,6 +7444,7 @@ process:
                 },
                 ancestors: Vec::new(),
                 cmdline_paths: Vec::new(),
+                execution_environment: None,
             })
         };
         let pending = |destination: &str| {
@@ -7639,6 +7645,7 @@ process: { run_as_user: sandbox, run_as_group: sandbox }
                     },
                     ancestors: Vec::new(),
                     cmdline_paths: Vec::new(),
+                    execution_environment: None,
                 }),
                 destination,
                 socket: Some(
@@ -8077,6 +8084,7 @@ process: { run_as_user: sandbox, run_as_group: sandbox }
             },
             ancestors: Vec::new(),
             cmdline_paths: Vec::new(),
+            execution_environment: None,
         };
         let (stream, mut workload) = tokio::io::duplex(4096);
         let (decision, completion) = tokio::sync::oneshot::channel();
@@ -8215,6 +8223,7 @@ network_policies:
                 },
                 ancestors: Vec::new(),
                 cmdline_paths: Vec::new(),
+                execution_environment: None,
             }),
             destination,
             socket: Some(
@@ -8358,6 +8367,7 @@ process:
                 },
                 ancestors: Vec::new(),
                 cmdline_paths: Vec::new(),
+                execution_environment: None,
             }),
             destination: "203.0.113.7:443".parse().unwrap(),
             socket: Some(
@@ -8429,6 +8439,7 @@ process:
                     },
                     ancestors: Vec::new(),
                     cmdline_paths: Vec::new(),
+                    execution_environment: None,
                 })
                 .unwrap();
         }
@@ -8443,6 +8454,7 @@ process:
                 },
                 ancestors: Vec::new(),
                 cmdline_paths: Vec::new(),
+                execution_environment: None,
             }),
             destination: "203.0.113.7:443".parse().unwrap(),
             socket: Some(

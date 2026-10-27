@@ -355,6 +355,13 @@ message ResolvedBinaryIdentity {
   ExecutableIdentity executable = 1;
   repeated ExecutableIdentity ancestors = 2;
   repeated string cmdline_paths = 3;
+  // Backend-assigned name of the execution environment (root filesystem and
+  // PID namespace) the executable paths were resolved in. Absent for the
+  // boundary's own workload. A backend that runs cooperating workloads from
+  // different images under one boundary sets it, never from workload input,
+  // so equal paths in different images are pinned independently. Policy
+  // matching stays path-based.
+  optional string execution_environment = 4;
 }
 message BinaryIdentity {
   oneof result {

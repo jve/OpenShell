@@ -1098,6 +1098,10 @@ pub enum BinaryIdentityWire {
         executable: ExecutableIdentityWire,
         ancestors: Vec<ExecutableIdentityWire>,
         cmdline_paths: Vec<PathBuf>,
+        /// See [`BinaryIdentity::execution_environment`]; omitted when absent
+        /// so single-environment boundaries encode exactly as before.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        execution_environment: Option<String>,
     },
     Failed {
         message: String,
@@ -1111,6 +1115,7 @@ impl From<Result<BinaryIdentity, ResolveError>> for BinaryIdentityWire {
                 executable: identity.executable.into(),
                 ancestors: identity.ancestors.into_iter().map(Into::into).collect(),
                 cmdline_paths: identity.cmdline_paths,
+                execution_environment: identity.execution_environment,
             },
             Err(error) => Self::Failed {
                 message: error.to_string(),
@@ -1126,10 +1131,12 @@ impl BinaryIdentityWire {
                 executable,
                 ancestors,
                 cmdline_paths,
+                execution_environment,
             } => Ok(BinaryIdentity {
                 executable: executable.into(),
                 ancestors: ancestors.into_iter().map(Into::into).collect(),
                 cmdline_paths,
+                execution_environment,
             }),
             Self::Failed { message } => Err(ResolveError::Failed(message)),
         }
@@ -1601,11 +1608,40 @@ mod tests {
                 digest: Some("b".repeat(64).parse().unwrap()),
             }],
             cmdline_paths: Vec::new(),
+            execution_environment: None,
         }));
         let encoded = serde_json::to_vec(&identity).unwrap();
         assert_eq!(
             serde_json::from_slice::<BinaryIdentityWire>(&encoded).unwrap(),
             identity
+        );
+        // Agent identities keep their exact previous encoding.
+        assert!(
+            !String::from_utf8(encoded)
+                .unwrap()
+                .contains("execution_environment")
+        );
+    }
+
+    #[test]
+    fn binary_identity_wire_round_trips_execution_environment() {
+        let identity = BinaryIdentity {
+            executable: ExecutableIdentity {
+                path: PathBuf::from("/usr/bin/python3"),
+                digest: Some("c".repeat(64).parse().unwrap()),
+            },
+            ancestors: Vec::new(),
+            cmdline_paths: Vec::new(),
+            execution_environment: Some("ravn-reviewer".to_string()),
+        };
+        let wire = BinaryIdentityWire::from(Ok(identity.clone()));
+        let encoded = serde_json::to_vec(&wire).unwrap();
+        let decoded = serde_json::from_slice::<BinaryIdentityWire>(&encoded).unwrap();
+        assert_eq!(decoded.into_result().unwrap(), identity);
+        let proto = crate::protobuf::WireMessage::to_proto(&wire).unwrap();
+        assert_eq!(
+            <BinaryIdentityWire as crate::protobuf::WireMessage>::from_proto(proto).unwrap(),
+            wire
         );
     }
 

@@ -152,6 +152,7 @@ fn resolve_linux_process(
         executable: executable_identity,
         ancestors,
         cmdline_paths,
+        execution_environment: None,
     })
 }
 
