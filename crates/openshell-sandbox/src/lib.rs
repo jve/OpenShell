@@ -21,6 +21,12 @@ pub mod main_session;
 pub mod managed_children;
 #[cfg(target_os = "linux")]
 mod network_broker;
+#[cfg(target_os = "linux")]
+mod peer_hub;
+#[cfg(target_os = "linux")]
+mod peer_protocol;
+#[cfg(target_os = "linux")]
+mod peer_runtime;
 #[cfg(all(target_os = "linux", feature = "perf-harness"))]
 pub mod perf;
 #[cfg(target_os = "linux")]
@@ -78,3 +84,27 @@ pub fn run(
 
 #[cfg(target_os = "linux")]
 mod native_api;
+
+#[cfg(target_os = "linux")]
+pub use peer_runtime::PeerToken;
+
+/// Read and unlink the one-use token staged for this peer container.
+///
+/// # Errors
+///
+/// Returns an error when the token is missing or malformed.
+#[cfg(target_os = "linux")]
+pub fn consume_peer_token() -> miette::Result<PeerToken> {
+    peer_runtime::consume_staged_token().map_err(|error| miette::miette!(error))
+}
+
+/// Run the subordinate runtime of a peer workload container.
+///
+/// # Errors
+///
+/// Returns an error when the peer cannot join the boundary, loses the
+/// primary runtime, or its workload exits without the boundary ending it.
+#[cfg(target_os = "linux")]
+pub fn run_peer(token: PeerToken, qualification: RuntimeQualification) -> miette::Result<()> {
+    peer_runtime::run(token, qualification).map_err(|error| miette::miette!(error))
+}

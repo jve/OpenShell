@@ -38,7 +38,13 @@ const DNS_RELAY_ADDRESS: SocketAddr = SocketAddr::V4(std::net::SocketAddrV4::new
     53,
 ));
 const RELAY_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
-const NETWORK_DECISION_TIMEOUT: Duration = Duration::from_secs(30);
+pub const NETWORK_DECISION_TIMEOUT: Duration = Duration::from_secs(30);
+/// Live DNS sockets one peer runtime may register with the primary relay.
+/// The peer reclaims closed sockets before it reaches this bound; the
+/// primary enforces it independently. Every peer together stays below half
+/// of the relay's admission capacity, which the primary's own workload keeps.
+pub const FORWARDED_DNS_ADMISSIONS_PER_PEER: usize =
+    SOCKET_CAPACITY / 2 / openshell_sandbox_backend::peer_workloads::MAX_PEER_WORKLOADS;
 
 fn retry_notification_receive(error: &io::Error) -> bool {
     error.kind() == io::ErrorKind::Interrupted || error.raw_os_error() == Some(libc::ENOENT)
@@ -129,11 +135,96 @@ impl PendingDnsQuery {
     }
 }
 
+/// One workload DNS socket the relay answers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DnsAdmission {
+    /// A socket of this runtime's own workload.
+    Local(SocketIdentity),
+    /// A socket of peer workload `index`, registered by that peer's runtime
+    /// over its authenticated channel. The peer reclaims it once closed; its
+    /// socket is not visible in this runtime's PID namespace.
+    Peer(usize),
+}
+
+type DnsAdmissionMap = Arc<Mutex<HashMap<SocketAddr, DnsAdmission>>>;
+
+/// Registers workload DNS sockets with a resolver relay this runtime does
+/// not serve: a peer runtime's workloads share the primary's network
+/// namespace, and only the primary's relay can answer from the configured
+/// nameserver address.
+pub trait DnsAdmissionForwarder: Send + Sync {
+    /// Register `source` before the workload socket reaches the relay.
+    fn admit(
+        &self,
+        transport: DnsTransport,
+        source: SocketAddr,
+        socket: SocketIdentity,
+    ) -> io::Result<()>;
+    /// Withdraw an admission whose connect failed.
+    fn revoke(&self, transport: DnsTransport, source: SocketAddr);
+}
+
+#[derive(Clone)]
+enum DnsAdmissions {
+    /// This runtime serves the relay; admissions live in its maps.
+    Served {
+        udp: DnsAdmissionMap,
+        tcp: DnsAdmissionMap,
+    },
+    /// The primary runtime serves the relay.
+    Forwarded(Arc<dyn DnsAdmissionForwarder>),
+}
+
 #[derive(Clone)]
 struct DnsRelay {
     address: SocketAddr,
-    udp_admissions: Arc<Mutex<HashMap<SocketAddr, SocketIdentity>>>,
-    tcp_admissions: Arc<Mutex<HashMap<SocketAddr, SocketIdentity>>>,
+    admissions: DnsAdmissions,
+}
+
+const fn dns_transport(kind: InetKind) -> DnsTransport {
+    match kind {
+        InetKind::Tcp => DnsTransport::Tcp,
+        InetKind::DnsUdp => DnsTransport::Udp,
+    }
+}
+
+impl DnsRelay {
+    fn admit(&self, kind: InetKind, source: SocketAddr, socket: SocketIdentity) -> io::Result<()> {
+        match &self.admissions {
+            DnsAdmissions::Served { udp, tcp } => {
+                let admissions = match kind {
+                    InetKind::Tcp => tcp,
+                    InetKind::DnsUdp => udp,
+                };
+                register_dns_socket(admissions, source, DnsAdmission::Local(socket))
+            }
+            DnsAdmissions::Forwarded(forwarder) => {
+                forwarder.admit(dns_transport(kind), source, socket)
+            }
+        }
+    }
+
+    fn revoke(&self, kind: InetKind, source: SocketAddr) {
+        match &self.admissions {
+            DnsAdmissions::Served { udp, tcp } => {
+                let admissions = match kind {
+                    InetKind::Tcp => tcp,
+                    InetKind::DnsUdp => udp,
+                };
+                lock(admissions).remove(&source);
+            }
+            DnsAdmissions::Forwarded(forwarder) => {
+                forwarder.revoke(dns_transport(kind), source);
+            }
+        }
+    }
+
+    fn served_maps(&self) -> Option<(&DnsAdmissionMap, &DnsAdmissionMap)> {
+        match &self.admissions {
+            DnsAdmissions::Served { udp, tcp } => Some((udp, tcp)),
+            DnsAdmissions::Forwarded(_) => None,
+        }
+    }
 }
 
 fn dns_sender_identity() -> Result<BinaryIdentity, ResolveError> {
@@ -146,20 +237,25 @@ fn dns_sender_identity() -> Result<BinaryIdentity, ResolveError> {
 }
 
 fn register_dns_socket(
-    admissions: &Mutex<HashMap<SocketAddr, SocketIdentity>>,
+    admissions: &Mutex<HashMap<SocketAddr, DnsAdmission>>,
     peer: SocketAddr,
-    identity: SocketIdentity,
+    admission: DnsAdmission,
 ) -> io::Result<()> {
     let mut admissions = lock(admissions);
     if admissions.len() >= SOCKET_CAPACITY && !admissions.contains_key(&peer) {
         let installed =
             crate::linux::proc_fd::installed_socket_inodes_excluding(std::process::id())?;
-        admissions.retain(|_, socket| installed.contains(&socket.inode));
+        // Peer admissions are reclaimed by their own runtime, which can see
+        // the sockets; they are bounded per peer instead.
+        admissions.retain(|_, admission| match admission {
+            DnsAdmission::Local(socket) => installed.contains(&socket.inode),
+            DnsAdmission::Peer(_) => true,
+        });
         if admissions.len() >= SOCKET_CAPACITY {
             return Err(io::Error::from_raw_os_error(libc::EMFILE));
         }
     }
-    admissions.insert(peer, identity);
+    admissions.insert(peer, admission);
     Ok(())
 }
 
@@ -176,6 +272,15 @@ struct NotificationQueues {
     decision_timeout: Duration,
 }
 
+/// Where a broker's workload DNS sockets are answered.
+enum DnsRelaySetup {
+    /// Serve a relay at this address.
+    Serve(SocketAddr),
+    /// Register sockets with the primary runtime's relay on the well-known
+    /// address instead (peer runtimes).
+    Forward(Arc<dyn DnsAdmissionForwarder>),
+}
+
 /// Live broker handle retained by the sandbox boundary.
 #[derive(Clone)]
 pub struct NetworkBroker {
@@ -183,10 +288,22 @@ pub struct NetworkBroker {
     workload_frozen: Arc<AtomicBool>,
     pending: Arc<tokio::sync::Mutex<mpsc::Receiver<PendingTcpOpen>>>,
     pending_dns: Arc<tokio::sync::Mutex<mpsc::Receiver<PendingDnsQuery>>>,
+    /// Feeds TCP opens forwarded by peer runtimes into the same queue as
+    /// this runtime's own.
+    injector: mpsc::Sender<PendingTcpOpen>,
+    dns_relay: DnsRelay,
+    protected_control_port: Option<u16>,
     registry: Arc<Mutex<SocketRegistry>>,
     descriptor_soft_limit: usize,
     dns_address: SocketAddr,
     healthy: Arc<AtomicBool>,
+}
+
+/// The primary's side of one TCP open forwarded by a peer runtime: the
+/// supervisor's decision, and where the peer's relayed stream is delivered.
+pub struct ForwardedTcpOpen {
+    pub(crate) decision: std::sync::mpsc::Receiver<TcpOpenDecision>,
+    pub(crate) relay: oneshot::Sender<io::Result<TcpStream>>,
 }
 
 impl NetworkBroker {
@@ -195,6 +312,22 @@ impl NetworkBroker {
         protected_control_port: Option<u16>,
     ) -> io::Result<Self> {
         Self::start_with_dns_address(listener, DNS_RELAY_ADDRESS, protected_control_port)
+    }
+
+    /// Start the broker of a peer runtime. Its workloads' DNS sockets are
+    /// registered with the primary's relay through `forwarder`; the peer
+    /// serves no relay of its own.
+    pub(crate) fn start_peer(
+        listener: NotificationListener,
+        protected_control_port: Option<u16>,
+        forwarder: Arc<dyn DnsAdmissionForwarder>,
+    ) -> io::Result<Self> {
+        Self::start_with_relay(
+            listener,
+            DnsRelaySetup::Forward(forwarder),
+            protected_control_port,
+            NETWORK_DECISION_TIMEOUT,
+        )
     }
 
     #[cfg(any(test, feature = "perf-harness"))]
@@ -225,11 +358,33 @@ impl NetworkBroker {
         protected_control_port: Option<u16>,
         decision_timeout: Duration,
     ) -> io::Result<Self> {
+        Self::start_with_relay(
+            listener,
+            DnsRelaySetup::Serve(dns_address),
+            protected_control_port,
+            decision_timeout,
+        )
+    }
+
+    fn start_with_relay(
+        listener: NotificationListener,
+        relay: DnsRelaySetup,
+        protected_control_port: Option<u16>,
+        decision_timeout: Duration,
+    ) -> io::Result<Self> {
         let listener = Arc::new(listener);
         let (pending_tx, pending_rx) = mpsc::channel(OPEN_QUEUE_CAPACITY);
         let (pending_dns_tx, pending_dns_rx) = mpsc::channel(DNS_QUEUE_CAPACITY);
         let active_opens = Arc::new(AtomicUsize::new(0));
-        let dns_relay = start_dns_relay(dns_address, pending_dns_tx)?;
+        let dns_relay = match relay {
+            DnsRelaySetup::Serve(address) => start_dns_relay(address, pending_dns_tx)?,
+            // The peer's DNS queue never receives a query; dropping its
+            // sender makes an accidental accept fail instead of hanging.
+            DnsRelaySetup::Forward(forwarder) => DnsRelay {
+                address: DNS_RELAY_ADDRESS,
+                admissions: DnsAdmissions::Forwarded(forwarder),
+            },
+        };
         let dns_address = dns_relay.address;
         let descriptor_soft_limit = descriptor_soft_limit()?;
         let registry = Arc::new(Mutex::new(SocketRegistry::new(1, SOCKET_CAPACITY)?));
@@ -240,8 +395,8 @@ impl NetworkBroker {
             workload_frozen: workload_frozen.clone(),
             protected_control_port,
             identity_resolver: ProcfsIdentityResolver::for_pid_namespace(),
-            pending: pending_tx,
-            dns_relay,
+            pending: pending_tx.clone(),
+            dns_relay: dns_relay.clone(),
             active_opens,
             descriptor_soft_limit,
             decision_timeout,
@@ -315,6 +470,9 @@ impl NetworkBroker {
             workload_frozen,
             pending: Arc::new(tokio::sync::Mutex::new(pending_rx)),
             pending_dns: Arc::new(tokio::sync::Mutex::new(pending_dns_rx)),
+            injector: pending_tx,
+            dns_relay,
+            protected_control_port,
             registry,
             descriptor_soft_limit,
             dns_address,
@@ -375,6 +533,128 @@ impl NetworkBroker {
     pub(crate) fn provider_files(&self) -> &crate::provider_files::ProviderFiles {
         &self.provider_files
     }
+
+    /// Queue a TCP open that a peer runtime's broker staged for its own
+    /// workload. Mediation consumes it exactly like a local open; the caller
+    /// relays the supervisor's decision to the peer and delivers the peer's
+    /// relayed stream through the returned [`ForwardedTcpOpen`].
+    ///
+    /// The destination is checked again here: the peer's broker already
+    /// refuses loopback and control-port destinations, but the primary does
+    /// not depend on that.
+    pub(crate) fn inject_tcp_open(
+        &self,
+        destination: SocketAddr,
+        identity: Result<BinaryIdentity, ResolveError>,
+        socket: NetworkSocketMetadata,
+        notification_to_queue: Duration,
+        queued_for: Duration,
+    ) -> io::Result<ForwardedTcpOpen> {
+        reject_protected_control_destination(destination, self.protected_control_port)?;
+        if destination.ip().to_canonical().is_loopback()
+            && !openshell_core::google_cloud::is_metadata_destination(destination)
+        {
+            return Err(io::Error::from_raw_os_error(libc::EACCES));
+        }
+        let (decision_tx, decision_rx) = std::sync::mpsc::sync_channel(1);
+        let (relay_tx, relay_rx) = oneshot::channel();
+        let now = Instant::now();
+        self.injector
+            .try_send(PendingTcpOpen {
+                destination,
+                identity,
+                socket,
+                notification_to_queue,
+                queued_at: now.checked_sub(queued_for).unwrap_or(now),
+                decision: decision_tx,
+                relay: relay_rx,
+            })
+            .map_err(|error| match error {
+                mpsc::error::TrySendError::Full(_) => io::Error::from_raw_os_error(libc::EAGAIN),
+                mpsc::error::TrySendError::Closed(_) => {
+                    io::Error::new(io::ErrorKind::BrokenPipe, "network-open queue closed")
+                }
+            })?;
+        Ok(ForwardedTcpOpen {
+            decision: decision_rx,
+            relay: relay_tx,
+        })
+    }
+
+    /// Admit a DNS socket of peer workload `peer` to this runtime's relay.
+    pub(crate) fn admit_peer_dns(
+        &self,
+        peer: usize,
+        transport: DnsTransport,
+        source: SocketAddr,
+    ) -> io::Result<()> {
+        // Workload DNS sockets are always bound to loopback before they are
+        // admitted; anything else is not a workload socket of this Pod.
+        if !source.ip().is_loopback() || source.port() == 0 {
+            return Err(io::Error::from_raw_os_error(libc::EINVAL));
+        }
+        let Some((udp, tcp)) = self.dns_relay.served_maps() else {
+            return Err(io::Error::from_raw_os_error(libc::EOPNOTSUPP));
+        };
+        let held = [udp, tcp]
+            .iter()
+            .map(|admissions| {
+                lock(admissions)
+                    .iter()
+                    .filter(|(address, admission)| {
+                        **admission == DnsAdmission::Peer(peer) && **address != source
+                    })
+                    .count()
+            })
+            .sum::<usize>();
+        if held >= FORWARDED_DNS_ADMISSIONS_PER_PEER {
+            return Err(io::Error::from_raw_os_error(libc::EMFILE));
+        }
+        let admissions = match transport {
+            DnsTransport::Udp => udp,
+            DnsTransport::Tcp => tcp,
+        };
+        // A loopback source port names one socket in the shared network
+        // namespace; never let a peer take over another runtime's admission.
+        if lock(admissions)
+            .get(&source)
+            .is_some_and(|admission| *admission != DnsAdmission::Peer(peer))
+        {
+            return Err(io::Error::from_raw_os_error(libc::EADDRINUSE));
+        }
+        register_dns_socket(admissions, source, DnsAdmission::Peer(peer))
+    }
+
+    /// Withdraw admissions of peer workload `peer`. Admissions held by any
+    /// other runtime are left untouched.
+    pub(crate) fn revoke_peer_dns(
+        &self,
+        peer: usize,
+        transport: DnsTransport,
+        sources: &[SocketAddr],
+    ) {
+        let Some((udp, tcp)) = self.dns_relay.served_maps() else {
+            return;
+        };
+        let mut admissions = lock(match transport {
+            DnsTransport::Udp => udp,
+            DnsTransport::Tcp => tcp,
+        });
+        for source in sources {
+            if admissions.get(source) == Some(&DnsAdmission::Peer(peer)) {
+                admissions.remove(source);
+            }
+        }
+    }
+
+    /// Drop every admission of a peer whose runtime has gone.
+    pub(crate) fn forget_peer_dns(&self, peer: usize) {
+        let Some((udp, tcp)) = self.dns_relay.served_maps() else {
+            return;
+        };
+        lock(udp).retain(|_, admission| *admission != DnsAdmission::Peer(peer));
+        lock(tcp).retain(|_, admission| *admission != DnsAdmission::Peer(peer));
+    }
 }
 
 fn start_dns_relay(
@@ -382,13 +662,15 @@ fn start_dns_relay(
     pending: mpsc::Sender<PendingDnsQuery>,
 ) -> io::Result<DnsRelay> {
     let (udp, tcp, address) = bind_dns_relay_sockets(address)?;
-    let udp_admissions = Arc::new(Mutex::new(HashMap::new()));
-    let tcp_admissions = Arc::new(Mutex::new(HashMap::new()));
+    let udp_admissions: DnsAdmissionMap = Arc::new(Mutex::new(HashMap::new()));
+    let tcp_admissions: DnsAdmissionMap = Arc::new(Mutex::new(HashMap::new()));
     let active_workers = Arc::new(AtomicUsize::new(0));
     let relay = DnsRelay {
         address,
-        udp_admissions: Arc::clone(&udp_admissions),
-        tcp_admissions: Arc::clone(&tcp_admissions),
+        admissions: DnsAdmissions::Served {
+            udp: Arc::clone(&udp_admissions),
+            tcp: Arc::clone(&tcp_admissions),
+        },
     };
 
     let udp_active_workers = Arc::clone(&active_workers);
@@ -915,13 +1197,9 @@ fn connect_socket(
         let source_fd = entry.retained_preconnect()?.as_raw_fd();
         listener.validate_id(notification.id)?;
         let peer = ensure_dns_source_bound(source_fd, entry.metadata().family)?;
-        let admissions = match kind {
-            InetKind::Tcp => &dns_relay.tcp_admissions,
-            InetKind::DnsUdp => &dns_relay.udp_admissions,
-        };
-        register_dns_socket(admissions, peer, entry.identity())?;
+        dns_relay.admit(kind, peer, entry.identity())?;
         if let Err(error) = connect_exact(source_fd, destination) {
-            lock(admissions).remove(&peer);
+            dns_relay.revoke(kind, peer);
             return Err(error);
         }
         entry.set_state(match kind {
@@ -1435,9 +1713,9 @@ fn classify_send(
             let source_fd = entry.retained_preconnect()?.as_raw_fd();
             listener.validate_id(notification.id)?;
             let peer = ensure_dns_source_bound(source_fd, entry.metadata().family)?;
-            register_dns_socket(&dns_relay.udp_admissions, peer, entry.identity())?;
+            dns_relay.admit(InetKind::DnsUdp, peer, entry.identity())?;
             if let Err(error) = connect_exact(source_fd, dns_relay.address) {
-                lock(&dns_relay.udp_admissions).remove(&peer);
+                dns_relay.revoke(InetKind::DnsUdp, peer);
                 return Err(error);
             }
             // The socket is pinned to the relay and bound to loopback. The
@@ -2341,6 +2619,184 @@ mod tests {
         );
     }
 
+    /// Records what a peer broker asks the primary to admit.
+    #[derive(Default)]
+    struct RecordingForwarder {
+        admitted: Mutex<Vec<(DnsTransport, SocketAddr)>>,
+        revoked: Mutex<Vec<(DnsTransport, SocketAddr)>>,
+        refuse: AtomicBool,
+    }
+
+    impl DnsAdmissionForwarder for RecordingForwarder {
+        fn admit(
+            &self,
+            transport: DnsTransport,
+            source: SocketAddr,
+            _socket: SocketIdentity,
+        ) -> io::Result<()> {
+            if self.refuse.load(Ordering::Acquire) {
+                return Err(io::Error::from_raw_os_error(libc::EMFILE));
+            }
+            lock(&self.admitted).push((transport, source));
+            Ok(())
+        }
+
+        fn revoke(&self, transport: DnsTransport, source: SocketAddr) {
+            lock(&self.revoked).push((transport, source));
+        }
+    }
+
+    #[test]
+    fn peer_broker_admits_dns_sockets_with_the_primary_relay() {
+        let (launcher, listener) = crate::linux::workload_launcher::start().unwrap();
+        let forwarder = Arc::new(RecordingForwarder::default());
+        let broker = NetworkBroker::start_peer(listener, None, forwarder.clone()).unwrap();
+        broker.confirm_healthy().unwrap();
+        assert_eq!(broker.dns_address(), DNS_RELAY_ADDRESS);
+
+        // A connected UDP resolver socket (glibc) keeps the well-known
+        // nameserver as its peer, so replies come from the expected source.
+        let (source, peer) = launcher
+            .execute(|| -> io::Result<(SocketAddr, SocketAddr)> {
+                let socket = UdpSocket::bind("127.0.0.1:0")?;
+                socket.connect(DNS_RELAY_ADDRESS)?;
+                Ok((socket.local_addr()?, socket.peer_addr()?))
+            })
+            .unwrap()
+            .unwrap();
+        assert_eq!(peer, DNS_RELAY_ADDRESS);
+        assert_eq!(
+            lock(&forwarder.admitted).as_slice(),
+            &[(DnsTransport::Udp, source)]
+        );
+
+        // Unconnected sends (musl) are admitted the same way.
+        let source = launcher
+            .execute(|| -> io::Result<SocketAddr> {
+                let socket = UdpSocket::bind("127.0.0.1:0")?;
+                socket.send_to(b"\x12\x34", DNS_RELAY_ADDRESS)?;
+                socket.local_addr()
+            })
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            lock(&forwarder.admitted).last(),
+            Some(&(DnsTransport::Udp, source))
+        );
+
+        // A TCP resolver connection is admitted before it reaches the relay
+        // and withdrawn if the connect fails.
+        let outcome = launcher
+            .execute(|| TcpStream::connect(DNS_RELAY_ADDRESS).map(|_| ()))
+            .unwrap();
+        let (transport, tcp_source) = *lock(&forwarder.admitted).last().unwrap();
+        assert_eq!(transport, DnsTransport::Tcp);
+        if outcome.is_err() {
+            assert_eq!(
+                lock(&forwarder.revoked).as_slice(),
+                &[(DnsTransport::Tcp, tcp_source)]
+            );
+        }
+
+        // A refused admission fails the workload's call; nothing is sent.
+        forwarder.refuse.store(true, Ordering::Release);
+        let error = launcher
+            .execute(|| {
+                let socket = UdpSocket::bind("127.0.0.1:0")?;
+                socket.connect(DNS_RELAY_ADDRESS)
+            })
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(libc::EMFILE));
+    }
+
+    #[test]
+    fn primary_relay_admits_peer_sockets_without_letting_peers_take_others() {
+        let (_launcher, listener) = crate::linux::workload_launcher::start().unwrap();
+        let broker = NetworkBroker::start_for_test(listener).unwrap();
+        let source: SocketAddr = "127.0.0.1:41000".parse().unwrap();
+        broker.admit_peer_dns(0, DnsTransport::Udp, source).unwrap();
+        // Re-admitting its own source is idempotent; another peer may not
+        // claim it.
+        broker.admit_peer_dns(0, DnsTransport::Udp, source).unwrap();
+        assert_eq!(
+            broker
+                .admit_peer_dns(1, DnsTransport::Udp, source)
+                .unwrap_err()
+                .raw_os_error(),
+            Some(libc::EADDRINUSE)
+        );
+        // Revocation by another peer leaves the admission in place.
+        broker.revoke_peer_dns(1, DnsTransport::Udp, &[source]);
+        let (udp, _) = broker.dns_relay.served_maps().unwrap();
+        assert_eq!(lock(udp).get(&source), Some(&DnsAdmission::Peer(0)));
+        broker.revoke_peer_dns(0, DnsTransport::Udp, &[source]);
+        assert!(lock(udp).get(&source).is_none());
+
+        broker.admit_peer_dns(2, DnsTransport::Tcp, source).unwrap();
+        broker.forget_peer_dns(2);
+        let (_, tcp) = broker.dns_relay.served_maps().unwrap();
+        assert!(lock(tcp).is_empty());
+    }
+
+    #[test]
+    fn injected_opens_reach_mediation_but_never_loopback_or_control() {
+        let (_launcher, listener) = crate::linux::workload_launcher::start().unwrap();
+        let broker = NetworkBroker::start_with_dns_address(
+            listener,
+            "127.0.0.1:0".parse().unwrap(),
+            Some(9443),
+        )
+        .unwrap();
+        let socket = NetworkSocketMetadata {
+            socket_cookie: 1,
+            nonblocking: false,
+            process_generation: 1,
+        };
+        let identity = || Err(ResolveError::Failed("forwarded test identity".to_string()));
+        for destination in ["127.0.0.1:443", "203.0.113.7:9443", "[::1]:80"] {
+            let error = broker
+                .inject_tcp_open(
+                    destination.parse().unwrap(),
+                    identity(),
+                    socket,
+                    Duration::ZERO,
+                    Duration::ZERO,
+                )
+                .err()
+                .unwrap();
+            assert_eq!(error.raw_os_error(), Some(libc::EACCES), "{destination}");
+        }
+        let forwarded = broker
+            .inject_tcp_open(
+                "203.0.113.7:443".parse().unwrap(),
+                identity(),
+                socket,
+                Duration::from_micros(3),
+                Duration::from_millis(2),
+            )
+            .unwrap();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let pending = runtime.block_on(broker.accept()).unwrap();
+        assert_eq!(pending.destination, "203.0.113.7:443".parse().unwrap());
+        assert!(pending.queued_at.elapsed() >= Duration::from_millis(2));
+        let completion = std::thread::spawn(move || {
+            runtime.block_on(pending.complete(TcpOpenDecision::RelayReady))
+        });
+        assert_eq!(
+            forwarded.decision.recv().unwrap(),
+            TcpOpenDecision::RelayReady
+        );
+        let relay = TcpListener::bind("127.0.0.1:0").unwrap();
+        let _client = TcpStream::connect(relay.local_addr().unwrap()).unwrap();
+        let (stream, _) = relay.accept().unwrap();
+        forwarded.relay.send(Ok(stream)).unwrap();
+        assert!(completion.join().unwrap().unwrap().is_some());
+    }
+
     #[test]
     fn dns_admissions_reclaim_closed_sockets_at_the_bound() {
         let admissions = Mutex::new(HashMap::new());
@@ -2352,13 +2808,16 @@ mod tests {
         for port in 1..=SOCKET_CAPACITY {
             lock(&admissions).insert(
                 SocketAddr::from(([127, 0, 0, 1], u16::try_from(port).unwrap())),
-                stale,
+                DnsAdmission::Local(stale),
             );
         }
         let peer = "127.0.0.1:50000".parse().unwrap();
-        register_dns_socket(&admissions, peer, stale).unwrap();
+        register_dns_socket(&admissions, peer, DnsAdmission::Local(stale)).unwrap();
         assert_eq!(lock(&admissions).len(), 1);
-        assert_eq!(lock(&admissions).get(&peer), Some(&stale));
+        assert_eq!(
+            lock(&admissions).get(&peer),
+            Some(&DnsAdmission::Local(stale))
+        );
     }
 
     #[test]
