@@ -251,6 +251,7 @@ impl WireMessage for w::BinaryIdentityWire {
                     executable,
                     ancestors,
                     cmdline_paths,
+                    execution_environment,
                 } => R::Resolved(p::ResolvedBinaryIdentity {
                     executable: Some(executable.to_proto()?),
                     ancestors: ancestors
@@ -261,6 +262,7 @@ impl WireMessage for w::BinaryIdentityWire {
                         .iter()
                         .map(|v| path(v))
                         .collect::<Result<_, _>>()?,
+                    execution_environment: execution_environment.clone(),
                 }),
                 Self::Failed { message } => R::Failed(message.clone()),
             }),
@@ -277,6 +279,7 @@ impl WireMessage for w::BinaryIdentityWire {
                     .map(w::ExecutableIdentityWire::from_proto)
                     .collect::<Result<_, _>>()?,
                 cmdline_paths: v.cmdline_paths.into_iter().map(PathBuf::from).collect(),
+                execution_environment: v.execution_environment,
             },
             R::Failed(message) => Self::Failed { message },
         })

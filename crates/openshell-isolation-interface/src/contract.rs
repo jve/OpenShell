@@ -447,6 +447,16 @@ pub struct BinaryIdentity {
     /// Absolute script/interpreter paths drawn from the process cmdlines.
     /// Diagnostic context; never authorizes.
     pub cmdline_paths: Vec<PathBuf>,
+    /// Backend-assigned execution environment the paths were resolved in.
+    ///
+    /// `None` for the boundary's own workload. A backend that runs
+    /// cooperating workloads from different root filesystems under one
+    /// boundary names the environment each identity came from, so the same
+    /// path in two images is pinned independently. The backend sets this from
+    /// its own topology, never from workload input. Policy matching remains
+    /// path-based.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_environment: Option<String>,
 }
 
 /// A SHA-256 digest, kept typed so the identity field is not coupled to its
