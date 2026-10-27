@@ -77,7 +77,7 @@ use openshell_sandbox_backend::boundary_protocol::{
 use openshell_sandbox_backend::peer_workloads::{
     MAX_PEER_WORKLOADS, PEER_BOOT_DIR, PEER_CONTROL_DIR, PEER_SUBCOMMAND, PEER_TOKEN_BYTES,
     PeerWorkloadConfig, peer_boot_dir_in_init, peer_boot_volume_name, peer_control_dir_in_primary,
-    peer_control_volume_name, validate_peer_name,
+    peer_control_volume_name, peer_run_volume_name, validate_peer_name,
 };
 use openshell_supervisor_control::{
     InstanceSupervision, LaunchError, RecoverableInstance, RecoveryBaseline,
@@ -808,16 +808,6 @@ fn validate_kubernetes_driver_volume_mounts(
 /// not use it, so a declared volume can never alias a peer's private control,
 /// boot, or run directory.
 const PEER_WORKLOAD_VOLUME_PREFIX: &str = "openshell-peer-";
-
-/// Memory `emptyDir` mounted at `/run` in peer `index`.
-///
-/// The sandbox runtime stages supervisor CA material and provider files under
-/// `/run` (see [`SANDBOX_PROXY_CA_MOUNT_PATH`] for the agent). Each peer runtime
-/// needs the same writable, private location in its own root filesystem; it is
-/// never shared with the agent, whose `/run` also holds runtime sockets.
-fn peer_run_volume_name(index: usize) -> String {
-    format!("{PEER_WORKLOAD_VOLUME_PREFIX}{index}-run")
-}
 
 /// Validate caller-requested peer workload containers.
 ///

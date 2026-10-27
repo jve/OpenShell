@@ -28,6 +28,7 @@
 //! | | | peer | [`PEER_CONTROL_DIR`] |
 //! | [`peer_boot_volume_name`] | Memory `emptyDir` | bootstrap init | [`peer_boot_dir_in_init`] |
 //! | | | peer | [`PEER_BOOT_DIR`] |
+//! | [`peer_run_volume_name`] | Memory `emptyDir` | peer | [`PEER_RUN_DIR`] |
 //!
 //! The driver writes a random one-use token for each peer into the generation
 //! bootstrap Secret as [`peer_token_secret_key`] and records its SHA-256 in
@@ -36,11 +37,16 @@
 //! container never mounts the Secret. The peer consumes (reads, then unlinks)
 //! the token and presents it to the primary, which accepts exactly one
 //! connection per peer socket and unlinks the socket after accepting.
+//!
+//! Peers have no DNS relay of their own. Resolvers (glibc, musl) drop replies
+//! whose source differs from the configured nameserver, so only the primary's
+//! relay on `127.0.0.53:53` can answer. A peer admits each workload DNS socket's
+//! loopback source address with the primary, whose relay then serves it in the
+//! shared network namespace.
 
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fmt;
-use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 
 /// Maximum number of peer workload containers in one sandbox.
 pub const MAX_PEER_WORKLOADS: usize = 16;
@@ -66,6 +72,10 @@ pub const PEER_BOOT_DIR: &str = "/.openshell/peer-boot";
 
 /// Socket file the primary listens on inside each peer control directory.
 pub const PEER_SOCKET_FILE: &str = "peer.sock";
+
+/// Peer-side mount of its private, writable `/run`, where the peer runtime
+/// stages supervisor CA material and provider files as the agent's does.
+pub const PEER_RUN_DIR: &str = "/run";
 
 /// Token file the init container stages inside each peer boot directory.
 pub const PEER_TOKEN_FILE: &str = "token";
@@ -101,22 +111,16 @@ pub fn peer_boot_volume_name(index: usize) -> String {
     format!("openshell-peer-{index}-boot")
 }
 
+/// Name of the Memory `emptyDir` mounted at [`PEER_RUN_DIR`] in peer `index` only.
+#[must_use]
+pub fn peer_run_volume_name(index: usize) -> String {
+    format!("openshell-peer-{index}-run")
+}
+
 /// Key of peer `index`'s one-use token in the generation bootstrap Secret.
 #[must_use]
 pub fn peer_token_secret_key(index: usize) -> String {
     format!("peer-{index}.token")
-}
-
-/// Sandbox-local DNS relay address served by peer `index`'s runtime.
-///
-/// The primary runtime owns `127.0.0.53:53`. Every runtime in the shared
-/// network namespace needs its own relay address, so peers use
-/// `127.0.<index + 1>.53:53` and redirect their workloads' queries to the
-/// well-known resolver address onto it.
-#[must_use]
-pub fn peer_dns_relay_address(index: usize) -> SocketAddr {
-    let octet = u8::try_from(index + 1).expect("peer index is bounded by MAX_PEER_WORKLOADS");
-    SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(127, 0, octet, 53), 53))
 }
 
 /// One peer workload container, as recorded in the protected boundary config.
@@ -305,16 +309,12 @@ mod tests {
     }
 
     #[test]
-    fn layout_is_index_derived_and_relays_do_not_collide() {
+    fn layout_is_index_derived() {
         assert_eq!(peer_control_volume_name(3), "openshell-peer-3-control");
         assert_eq!(peer_boot_volume_name(3), "openshell-peer-3-boot");
+        assert_eq!(peer_run_volume_name(3), "openshell-peer-3-run");
         assert_eq!(peer_token_secret_key(3), "peer-3.token");
         assert_eq!(peer_control_dir_in_primary(3), "/.openshell/peers/3");
         assert_eq!(peer_boot_dir_in_init(3), "/.openshell/peer-boot/3");
-        let relays = (0..MAX_PEER_WORKLOADS)
-            .map(peer_dns_relay_address)
-            .collect::<std::collections::BTreeSet<_>>();
-        assert_eq!(relays.len(), MAX_PEER_WORKLOADS);
-        assert!(!relays.contains(&"127.0.0.53:53".parse().unwrap()));
     }
 }
