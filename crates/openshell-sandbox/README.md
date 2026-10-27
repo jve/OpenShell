@@ -68,3 +68,14 @@ terminates the agent tree and every other peer, and the primary then exits with
 an error so the Pod fails. A peer runtime that loses the primary freezes its
 broker, kills its workload tree and exits non-zero. Peer boundaries must use
 runtime-initiated supervisor control.
+
+Provider environment updates reach every peer before the agent's snapshot
+changes; an update is reported applied only when every peer applied it. A
+relay decision always resolves: a peer answers a decision for an open it no
+longer tracks with a relay failure, and the primary bounds the wait for a
+peer's relayed stream.
+
+Known limitation: peers share the primary's capacity rather than adding their
+own. Forwarded TCP opens use the primary broker's single open queue, and the
+supervisor's binary-identity pin cache is shared by every execution
+environment, so a busy peer can exhaust either for the whole sandbox.

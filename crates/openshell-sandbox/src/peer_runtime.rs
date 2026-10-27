@@ -104,9 +104,17 @@ pub fn consume_staged_token() -> Result<PeerToken, String> {
 /// workload.
 enum PeerEvent {
     Start(Box<PeerStart>),
+    UpdateProviderEnvironment {
+        id: u64,
+        revision: u64,
+        provider_env: HashMap<String, String>,
+        provider_files: HashMap<String, String>,
+    },
     Freeze,
     Thaw,
-    Terminate { enforcement_lost: bool },
+    Terminate {
+        enforcement_lost: bool,
+    },
     ChannelLost(String),
     Exited(Result<ExitStatusWire, String>),
     Fatal(String),
@@ -270,10 +278,18 @@ fn read_primary(
                 PeerEvent::Terminate { enforcement_lost }
             }
             PrimaryToPeer::TcpDecision { id, decision } => {
-                // An unknown ID is an open this runtime already abandoned.
                 let waiter = lock(&channel.opens).remove(&id);
-                if let Some(waiter) = waiter {
-                    let _ = waiter.send(decision);
+                let delivered = waiter.is_some_and(|waiter| waiter.send(decision).is_ok());
+                // An open this runtime already abandoned never produces a
+                // relay; say so, or the primary would wait for it.
+                if !delivered
+                    && decision == TcpOpenDecision::RelayReady
+                    && let Err(error) = channel.sender.send(&PeerToPrimary::TcpRelayFailed {
+                        id,
+                        message: "the peer runtime no longer tracks this open".to_string(),
+                    })
+                {
+                    tracing::warn!(%error, "could not report an abandoned peer TCP open");
                 }
                 continue;
             }
@@ -284,6 +300,17 @@ fn read_primary(
                 }
                 continue;
             }
+            PrimaryToPeer::UpdateProviderEnvironment {
+                id,
+                revision,
+                provider_env,
+                provider_files,
+            } => PeerEvent::UpdateProviderEnvironment {
+                id,
+                revision,
+                provider_env,
+                provider_files,
+            },
             PrimaryToPeer::Welcome { .. } => {
                 break "primary repeated its welcome".to_string();
             }
@@ -486,6 +513,7 @@ impl DnsAdmissionForwarder for PeerDnsForwarder {
 struct PeerWorkload {
     state: Arc<BoundaryRuntimeState>,
     exit: Arc<(Mutex<Option<ExitStatusWire>>, Condvar)>,
+    provider_credentials: ProviderCredentialState,
 }
 
 impl PeerWorkload {
@@ -541,6 +569,23 @@ impl PeerControl {
             };
             match event {
                 PeerEvent::Start(start) => self.start(*start),
+                PeerEvent::UpdateProviderEnvironment {
+                    id,
+                    revision,
+                    provider_env,
+                    provider_files,
+                } => {
+                    let error = self
+                        .update_provider_environment(revision, provider_env, provider_files)
+                        .err();
+                    if let Err(send_error) = self
+                        .channel
+                        .sender
+                        .send(&PeerToPrimary::ProviderEnvironmentUpdated { id, error })
+                    {
+                        tracing::warn!(%send_error, "could not report a provider environment update");
+                    }
+                }
                 PeerEvent::Freeze => {
                     // Refuse workload SIGCONT before stopping the tree.
                     self.broker.set_workload_frozen(true);
@@ -614,6 +659,39 @@ impl PeerControl {
         }
     }
 
+    /// Install a rotated provider snapshot exactly as the primary installs
+    /// its own, so revoked credentials stop being served to this workload.
+    fn update_provider_environment(
+        &self,
+        revision: u64,
+        provider_env: HashMap<String, String>,
+        provider_files: HashMap<String, String>,
+    ) -> Result<(), String> {
+        let Some(workload) = &self.workload else {
+            return Err("peer workload has not started".to_string());
+        };
+        self.broker
+            .confirm_healthy()
+            .map_err(|error| format!("peer network broker unavailable: {error}"))?;
+        crate::provider_files::ProviderFiles::validate(&provider_files)
+            .map_err(|error| format!("invalid provider files: {error}"))?;
+        let current = workload
+            .provider_credentials
+            .child_environment_snapshot()
+            .map_err(|error| error.to_string())?;
+        let installed = workload
+            .provider_credentials
+            .compare_and_install_child_env_snapshot(current.revision, revision, provider_env)
+            .map_err(|error| error.to_string())?;
+        if installed != revision {
+            return Err("provider environment changed during update".to_string());
+        }
+        self.broker
+            .provider_files()
+            .replace(provider_files)
+            .map_err(|error| format!("install provider files: {error}"))
+    }
+
     fn launch(&self, start: PeerStart) -> Result<PeerWorkload, String> {
         let PeerStart {
             command,
@@ -667,7 +745,7 @@ impl PeerControl {
                 false,
                 &policy,
                 Arc::new(AtomicU32::new(0)),
-                provider_credentials,
+                provider_credentials.clone(),
                 provider_env,
                 ca_file_paths,
                 Some(state.clone()),
@@ -690,7 +768,11 @@ impl PeerControl {
             let _ = events.send(PeerEvent::Exited(result));
         });
         tracing::info!(program, "Peer workload started");
-        Ok(PeerWorkload { state, exit })
+        Ok(PeerWorkload {
+            state,
+            exit,
+            provider_credentials,
+        })
     }
 
     /// Terminate the workload tree as the primary does its own, report the
@@ -939,7 +1021,7 @@ mod tests {
             channel,
             events,
             primary_sender,
-            primary_receiver: _primary_receiver,
+            mut primary_receiver,
         } = channel_pair();
         let (decision_tx, decision_rx) = oneshot::channel();
         lock(&channel.opens).insert(5, decision_tx);
@@ -976,6 +1058,17 @@ mod tests {
             decision_rx.blocking_recv().unwrap(),
             TcpOpenDecision::RelayReady
         );
+        // A relay decision for an abandoned open is answered, so the primary
+        // never waits for a relay that will not come.
+        match primary_receiver
+            .recv::<PeerToPrimary>()
+            .unwrap()
+            .unwrap()
+            .message
+        {
+            PeerToPrimary::TcpRelayFailed { id, .. } => assert_eq!(id, 6),
+            other => panic!("expected the abandoned open to fail, got {other:?}"),
+        }
         // A second welcome is a protocol violation that ends the channel.
         primary_sender
             .send(&PrimaryToPeer::Welcome {
