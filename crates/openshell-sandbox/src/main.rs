@@ -49,6 +49,22 @@ const PROBE_DENIED_TCP_PEER: &str = "203.0.113.1:9";
 const PROBE_SOCKADDR_IN_LEN: usize = size_of::<libc::sockaddr_in>();
 #[cfg(target_os = "linux")]
 const LINUX_SIGNAL_LIMIT: i32 = 65;
+/// Sandbox-local resolver address served by the primary runtime.
+#[cfg(target_os = "linux")]
+const WELL_KNOWN_DNS_RELAY: &str = "127.0.0.53:53";
+
+/// Where qualification runs its synthetic DNS relay.
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy, Debug)]
+enum ProbeDnsRelay {
+    /// The primary runtime's own resolver address, which it binds for life
+    /// right after qualifying.
+    WellKnown,
+    /// A free loopback port. Peer runtimes serve no relay (their workloads
+    /// use the primary's) and must never contend for the primary's address
+    /// in the shared network namespace.
+    Ephemeral,
+}
 
 #[derive(Parser, Debug)]
 #[command(name = "openshell-sandbox")]
@@ -68,7 +84,7 @@ struct BoundaryArgs {
 #[cfg(target_os = "linux")]
 #[allow(unsafe_code)]
 fn run_capability_probe() -> Result<()> {
-    let (qualification, report) = qualify_runtime()?;
+    let (qualification, report) = qualify_runtime(ProbeDnsRelay::WellKnown)?;
     debug_assert!(qualification.seccomp.notification_round_trip);
     println!("{}", serde_json::to_string(&report).into_diagnostic()?);
     Ok(())
@@ -103,6 +119,8 @@ struct QualificationReport {
     /// Workload INET sockets are bound to loopback, the binding cannot be
     /// changed from sandbox credentials, and accepted sockets inherit it.
     socket_loopback_confinement: bool,
+    /// The well-known resolver address is bindable. Peer runtimes serve no
+    /// relay and do not probe it.
     dns_relay_bind: bool,
     udp_dns_round_trip: bool,
     tcp_dns_round_trip: bool,
@@ -112,7 +130,9 @@ struct QualificationReport {
 
 #[cfg(target_os = "linux")]
 #[allow(unsafe_code)]
-fn qualify_runtime() -> Result<(openshell_sandbox::RuntimeQualification, QualificationReport)> {
+fn qualify_runtime(
+    dns_relay: ProbeDnsRelay,
+) -> Result<(openshell_sandbox::RuntimeQualification, QualificationReport)> {
     use miette::Context as _;
 
     let uid = nix::unistd::geteuid().as_raw();
@@ -167,11 +187,17 @@ fn qualify_runtime() -> Result<(openshell_sandbox::RuntimeQualification, Qualifi
     let notification = openshell_sandbox::linux::seccomp_notify::probe_notification_api()
         .into_diagnostic()
         .wrap_err("seccomp notification probe")?;
-    probe_socket_virtualization().wrap_err("socket virtualization probe")?;
+    probe_socket_virtualization(dns_relay).wrap_err("socket virtualization probe")?;
     openshell_sandbox::linux::socket_confinement::probe_loopback_confinement()
         .into_diagnostic()
         .wrap_err("socket loopback confinement probe")?;
-    probe_dns_relay_bind().wrap_err("DNS relay bind probe")?;
+    let dns_relay_bind = match dns_relay {
+        ProbeDnsRelay::WellKnown => {
+            probe_dns_relay_bind().wrap_err("DNS relay bind probe")?;
+            true
+        }
+        ProbeDnsRelay::Ephemeral => false,
+    };
 
     let groups = nix::unistd::getgroups()
         .into_diagnostic()?
@@ -197,7 +223,7 @@ fn qualify_runtime() -> Result<(openshell_sandbox::RuntimeQualification, Qualifi
         connected_send_fast_path: notification.connected_send_fast_path(),
         socket_virtualization: true,
         socket_loopback_confinement: true,
-        dns_relay_bind: true,
+        dns_relay_bind,
         udp_dns_round_trip: true,
         tcp_dns_round_trip: true,
         tcp_allow_round_trip: true,
@@ -239,8 +265,8 @@ fn probe_dns_relay_bind() -> Result<()> {
             "DNS relay requires net.ipv4.ip_unprivileged_port_start=0, got {unprivileged_port_start}"
         ));
     }
-    let tcp = TcpListener::bind("127.0.0.53:53").into_diagnostic()?;
-    let udp = UdpSocket::bind("127.0.0.53:53").into_diagnostic()?;
+    let tcp = TcpListener::bind(WELL_KNOWN_DNS_RELAY).into_diagnostic()?;
+    let udp = UdpSocket::bind(WELL_KNOWN_DNS_RELAY).into_diagnostic()?;
     drop((tcp, udp));
     Ok(())
 }
@@ -348,11 +374,58 @@ fn run_capability_landlock_child(_args: &[String]) -> Result<()> {
 /// execs the child. The child proves that the injected open-file description
 /// survives dup and epoll registration before connect and that native
 /// getpeername reports the endpoint used by the probe connection.
+/// Bind the synthetic relay's UDP socket and TCP listener on one address.
+#[cfg(target_os = "linux")]
+fn bind_probe_dns_relay(
+    relay: ProbeDnsRelay,
+) -> Result<(
+    std::net::UdpSocket,
+    std::net::TcpListener,
+    std::net::SocketAddr,
+)> {
+    use miette::Context as _;
+    use std::net::{Ipv4Addr, TcpListener, UdpSocket};
+
+    const EPHEMERAL_BIND_ATTEMPTS: usize = 32;
+
+    if matches!(relay, ProbeDnsRelay::WellKnown) {
+        let address = WELL_KNOWN_DNS_RELAY
+            .parse::<std::net::SocketAddr>()
+            .expect("fixed DNS relay address is valid");
+        let udp = UdpSocket::bind(address)
+            .into_diagnostic()
+            .wrap_err("bind socket probe DNS relay")?;
+        let tcp = TcpListener::bind(address)
+            .into_diagnostic()
+            .wrap_err("bind socket probe TCP DNS relay")?;
+        return Ok((udp, tcp, address));
+    }
+    // TCP and UDP allocate ephemeral ports independently; retry the pair.
+    for _ in 0..EPHEMERAL_BIND_ATTEMPTS {
+        let udp = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
+            .into_diagnostic()
+            .wrap_err("bind socket probe DNS relay")?;
+        let address = udp.local_addr().into_diagnostic()?;
+        match TcpListener::bind(address) {
+            Ok(tcp) => return Ok((udp, tcp, address)),
+            Err(error) if error.kind() == std::io::ErrorKind::AddrInUse => {}
+            Err(error) => {
+                return Err(error)
+                    .into_diagnostic()
+                    .wrap_err("bind socket probe TCP DNS relay");
+            }
+        }
+    }
+    Err(miette::miette!(
+        "could not reserve one loopback port for the socket probe DNS relay"
+    ))
+}
+
 #[cfg(target_os = "linux")]
 #[allow(unsafe_code)]
-fn probe_socket_virtualization() -> Result<()> {
+fn probe_socket_virtualization(dns_relay_kind: ProbeDnsRelay) -> Result<()> {
     use std::io::{Read as _, Write as _};
-    use std::net::{Ipv4Addr, SocketAddr, TcpListener, UdpSocket};
+    use std::net::{Ipv4Addr, SocketAddr, TcpListener};
     use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd};
     use std::os::unix::process::CommandExt as _;
     use std::sync::mpsc;
@@ -380,12 +453,7 @@ fn probe_socket_virtualization() -> Result<()> {
             stream.write_all(b"pong")
         })
         .into_diagnostic()?;
-    let dns_relay_addr = "127.0.0.53:53"
-        .parse::<SocketAddr>()
-        .expect("fixed DNS relay address is valid");
-    let dns_relay = UdpSocket::bind(dns_relay_addr)
-        .into_diagnostic()
-        .wrap_err("bind socket probe DNS relay")?;
+    let (dns_relay, dns_tcp_relay, dns_relay_addr) = bind_probe_dns_relay(dns_relay_kind)?;
     let dns_thread = std::thread::Builder::new()
         .name("openshell-probe-dns".to_string())
         .spawn(move || -> std::io::Result<()> {
@@ -402,9 +470,6 @@ fn probe_socket_virtualization() -> Result<()> {
             Ok(())
         })
         .into_diagnostic()?;
-    let dns_tcp_relay = TcpListener::bind(dns_relay_addr)
-        .into_diagnostic()
-        .wrap_err("bind socket probe TCP DNS relay")?;
     let dns_tcp_thread = std::thread::Builder::new()
         .name("openshell-probe-dns-tcp".to_string())
         .spawn(move || -> std::io::Result<()> {
@@ -463,6 +528,7 @@ fn probe_socket_virtualization() -> Result<()> {
                 .arg(CAPABILITY_SOCKET_CHILD_SUBCOMMAND)
                 .arg(original_peer.to_string())
                 .arg(sandbox_tgid.to_string())
+                .arg(dns_relay_addr.to_string())
                 .env_clear()
                 .stdin(std::process::Stdio::null())
                 .stdout(std::process::Stdio::null())
@@ -905,11 +971,15 @@ fn run_capability_socket_child(args: &[String]) -> Result<()> {
     use std::net::SocketAddr;
     use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd};
 
-    let [expected_peer, sandbox_tgid] = args else {
+    let [expected_peer, sandbox_tgid, dns_relay] = args else {
         return Err(miette::miette!(
-            "usage: {CAPABILITY_SOCKET_CHILD_SUBCOMMAND} <IPv4:PORT> <SANDBOX_TGID>"
+            "usage: {CAPABILITY_SOCKET_CHILD_SUBCOMMAND} <IPv4:PORT> <SANDBOX_TGID> <DNS_RELAY>"
         ));
     };
+    let dns_relay = dns_relay
+        .parse::<SocketAddr>()
+        .into_diagnostic()
+        .map_err(|error| miette::miette!("parse socket probe DNS relay: {error}"))?;
     let expected_peer = expected_peer
         .parse::<SocketAddr>()
         .into_diagnostic()
@@ -1021,8 +1091,8 @@ fn run_capability_socket_child(args: &[String]) -> Result<()> {
     if &response != b"pong" {
         return Err(miette::miette!("socket probe response mismatch"));
     }
-    probe_dns_socket_round_trip()?;
-    probe_tcp_dns_socket_round_trip()?;
+    probe_dns_socket_round_trip(dns_relay)?;
+    probe_tcp_dns_socket_round_trip(dns_relay)?;
     probe_tcp_denial()?;
     probe_child_self_protection(sandbox_tgid, alias.as_raw_fd())?;
     Ok(())
@@ -1037,15 +1107,11 @@ fn run_capability_socket_child(_args: &[String]) -> Result<()> {
 
 #[cfg(target_os = "linux")]
 #[allow(unsafe_code)]
-fn probe_dns_socket_round_trip() -> Result<()> {
-    use std::net::SocketAddr;
+fn probe_dns_socket_round_trip(relay: std::net::SocketAddr) -> Result<()> {
     use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd};
 
     const DNS_QUERY: &[u8] =
         b"\x12\x34\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00\x05probe\x09openshell\x04test\x00\x00\x01\x00\x01";
-    let relay = "127.0.0.53:53"
-        .parse::<SocketAddr>()
-        .expect("fixed DNS relay address is valid");
     let (sockaddr, sockaddr_length) = encode_probe_sockaddr(relay)?;
     // SAFETY: the syscall is intercepted and completed with a DNS-only
     // registered socket descriptor.
@@ -1113,12 +1179,12 @@ fn probe_dns_socket_round_trip() -> Result<()> {
 }
 
 #[cfg(target_os = "linux")]
-fn probe_tcp_dns_socket_round_trip() -> Result<()> {
+fn probe_tcp_dns_socket_round_trip(relay: std::net::SocketAddr) -> Result<()> {
     use std::io::{Read as _, Write as _};
 
     const DNS_QUERY: &[u8] =
         b"\x56\x78\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00\x05probe\x09openshell\x04test\x00\x00\x01\x00\x01";
-    let mut stream = std::net::TcpStream::connect("127.0.0.53:53").into_diagnostic()?;
+    let mut stream = std::net::TcpStream::connect(relay).into_diagnostic()?;
     stream.set_nodelay(true).into_diagnostic()?;
     stream
         .write_all(
@@ -1977,7 +2043,7 @@ fn seed_kubernetes_workspace() -> Result<()> {
 }
 
 #[cfg(target_os = "linux")]
-fn run_boundary(bootstrap: &Path, log_level: &str) -> Result<()> {
+fn init_runtime_logging(log_level: &str) {
     let console_filter =
         EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(log_level));
     let _ = tracing_subscriber::registry()
@@ -1989,13 +2055,35 @@ fn run_boundary(bootstrap: &Path, log_level: &str) -> Result<()> {
             .with_filter(console_filter),
         )
         .try_init();
-    let (qualification, _) = qualify_runtime()?;
+}
+
+#[cfg(target_os = "linux")]
+fn run_boundary(bootstrap: &Path, log_level: &str) -> Result<()> {
+    init_runtime_logging(log_level);
+    let (qualification, _) = qualify_runtime(ProbeDnsRelay::WellKnown)?;
     openshell_sandbox::run(bootstrap, qualification)
 }
 
 #[cfg(not(target_os = "linux"))]
 fn run_boundary(_bootstrap: &Path, _log_level: &str) -> Result<()> {
     Err(miette::miette!("openshell-sandbox requires Linux"))
+}
+
+/// Run the subordinate runtime of a peer workload container. The token is
+/// consumed before anything else so it never outlives this process's start.
+#[cfg(target_os = "linux")]
+fn run_peer_runtime() -> Result<()> {
+    let log_level = std::env::var(openshell_core::sandbox_env::LOG_LEVEL)
+        .unwrap_or_else(|_| "warn".to_string());
+    init_runtime_logging(&log_level);
+    let token = openshell_sandbox::consume_peer_token()?;
+    let (qualification, _) = qualify_runtime(ProbeDnsRelay::Ephemeral)?;
+    openshell_sandbox::run_peer(token, qualification)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn run_peer_runtime() -> Result<()> {
+    Err(miette::miette!("the peer runtime requires Linux"))
 }
 
 fn main() -> Result<()> {
@@ -2013,6 +2101,17 @@ fn main() -> Result<()> {
             ));
         }
         return run_kubernetes_bootstrap();
+    }
+    if raw_args.get(1).map(String::as_str)
+        == Some(openshell_sandbox_backend::peer_workloads::PEER_SUBCOMMAND)
+    {
+        if raw_args.len() != 2 {
+            return Err(miette::miette!(
+                "usage: openshell-sandbox {}",
+                openshell_sandbox_backend::peer_workloads::PEER_SUBCOMMAND
+            ));
+        }
+        return run_peer_runtime();
     }
     if raw_args.get(1).map(String::as_str) == Some(SEED_WORKSPACE_SUBCOMMAND) {
         if raw_args.len() != 2 {
@@ -2154,11 +2253,10 @@ mod tests {
         if nix::unistd::geteuid().is_root() || nix::unistd::getegid().as_raw() == 0 {
             return;
         }
-        let token = "ab".repeat(32);
         // A token whose boot volume was never mounted.
         let root = tempfile::tempdir().unwrap();
         let source = root.path().join("input");
-        projected_secret(&source, &bootstrap_entries(&[(0, token.clone())]));
+        projected_secret(&source, &bootstrap_entries(&[(0, "ab".repeat(32))]));
         let error = stage_kubernetes_bootstrap_at(
             &source,
             &root.path().join("runtime"),

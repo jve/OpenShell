@@ -87,9 +87,9 @@ mod linux {
     const CONTROL_KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(10);
     const MEDIATION_REPLACEMENT_TIMEOUT: Duration = Duration::from_secs(20);
     const AUTHENTICATED_RECONNECT_TIMEOUT: Duration = Duration::from_secs(30);
-    const ENFORCEMENT_LOSS_TERMINATION_GRACE: Duration =
+    pub const ENFORCEMENT_LOSS_TERMINATION_GRACE: Duration =
         Duration::from_secs(openshell_core::config::DEFAULT_STOP_TIMEOUT_SECS as u64);
-    const FORCE_KILL_REAP_TIMEOUT: Duration = Duration::from_secs(2);
+    pub const FORCE_KILL_REAP_TIMEOUT: Duration = Duration::from_secs(2);
     /// Bound the wait for a flush before acknowledging termination. A timed-out
     /// blocking task cannot be cancelled and may outlive the acknowledgement.
     const FILESYSTEM_FLUSH_TIMEOUT: Duration = Duration::from_secs(3);
@@ -133,7 +133,7 @@ mod linux {
     /// Add the filesystem paths required by GPU devices visible inside the
     /// workload. The supervisor's device namespace can differ from the
     /// workload's, so discovery must happen here, gated by the resource claim.
-    fn enrich_gpu_filesystem_paths(
+    pub fn enrich_gpu_filesystem_paths(
         policy: &mut openshell_core::policy::SandboxPolicy,
         gpu_requested: bool,
     ) -> bool {
@@ -266,22 +266,54 @@ mod linux {
             .enable_all()
             .build()
             .map_err(|error| format!("create boundary process runtime: {error}"))?;
-        let runtime = Arc::new(BoundaryRuntime::new(
-            config.clone(),
-            process_runtime.handle().clone(),
-            network_broker,
-            launcher,
-            qualification,
-        )?);
+        // Peer barrier: every peer runtime joins and qualifies before the
+        // boundary is served, so the supervisor never confirms a partial group.
+        let peer_hub = if config.peers.is_empty() {
+            None
+        } else {
+            let identity = config.workload_identity.clone();
+            let verify = move |credentials| {
+                crate::peer_hub::require_peer_credentials(credentials, &identity)
+            };
+            let should_abort = || BOUNDARY_TERMINATION_REQUESTED.load(Ordering::Acquire);
+            Some(crate::peer_hub::PeerHub::establish(
+                &crate::peer_hub::HubSetup::production(
+                    &config.peers,
+                    &verify,
+                    protected_control_port,
+                    &should_abort,
+                ),
+                network_broker.clone(),
+            )?)
+        };
+        let runtime = Arc::new(
+            BoundaryRuntime::new(
+                config.clone(),
+                process_runtime.handle().clone(),
+                network_broker,
+                launcher,
+                qualification,
+            )?
+            .with_peer_hub(peer_hub.clone()),
+        );
+        if let Some(hub) = &peer_hub {
+            let boundary = Arc::downgrade(&runtime);
+            hub.set_failure_handler(Arc::new(move |reason| {
+                if let Some(boundary) = boundary.upgrade() {
+                    let handle = boundary.process_runtime.clone();
+                    handle.spawn(async move { boundary.end_peer_group(reason).await });
+                }
+            }));
+        }
         serve(&config.listener, runtime)
     }
 
-    fn make_boundary_nondumpable() -> Result<(), String> {
+    pub fn make_boundary_nondumpable() -> Result<(), String> {
         rustix::process::set_dumpable_behavior(rustix::process::DumpableBehavior::NotDumpable)
             .map_err(|error| format!("make sandbox process nondumpable: {error}"))
     }
 
-    fn disable_core_dumps() -> Result<(), String> {
+    pub fn disable_core_dumps() -> Result<(), String> {
         rustix::process::setrlimit(
             rustix::process::Resource::Core,
             rustix::process::Rlimit {
@@ -292,7 +324,12 @@ mod linux {
         .map_err(|error| format!("disable sandbox core dumps: {error}"))
     }
 
-    fn install_boundary_signal_handlers() -> Result<(), String> {
+    /// Whether SIGTERM or SIGINT has asked this runtime to stop.
+    pub fn boundary_termination_requested() -> bool {
+        BOUNDARY_TERMINATION_REQUESTED.load(Ordering::Acquire)
+    }
+
+    pub fn install_boundary_signal_handlers() -> Result<(), String> {
         BOUNDARY_TERMINATION_REQUESTED.store(false, Ordering::Release);
         BOUNDARY_TERMINATION_SIGNAL.store(0, Ordering::Release);
         let action = nix::sys::signal::SigAction::new(
@@ -399,7 +436,27 @@ mod linux {
         if config.workload_identity.uid == 0 || config.workload_identity.gid == 0 {
             return Err("sandbox workload UID and GID must be nonzero".to_string());
         }
-        Ok(())
+        validate_peer_config(config)
+    }
+
+    /// Peers share the workload's network namespace, so an inbound control
+    /// listener would be reachable from every peer container. Peer
+    /// boundaries therefore dial their supervisor.
+    fn validate_peer_config(config: &BoundaryConfig) -> Result<(), String> {
+        if config.peers.is_empty() {
+            return Ok(());
+        }
+        openshell_sandbox_backend::peer_workloads::validate_peer_workloads(&config.peers)?;
+        match &config.listener {
+            BoundaryListenerConfig::RuntimeInitiatedTlsTcp { .. }
+            | BoundaryListenerConfig::RuntimeInitiatedUnix { .. }
+            | BoundaryListenerConfig::RuntimeInitiatedVsock { .. } => Ok(()),
+            BoundaryListenerConfig::TlsTcp { .. }
+            | BoundaryListenerConfig::Unix { .. }
+            | BoundaryListenerConfig::Vsock { .. } => {
+                Err("peer workloads require runtime-initiated supervisor control".to_string())
+            }
+        }
     }
 
     /// VM selectors assert the protected overlay owner; they cannot choose a
@@ -559,8 +616,15 @@ mod linux {
         Ok(())
     }
 
-    /// Shut down after SIGTERM/SIGINT; `None` while no termination is pending.
+    /// Shut down after SIGTERM/SIGINT, or once a failed peer workload group
+    /// has been torn down; `None` while neither is pending.
     fn take_termination(runtime: &BoundaryRuntime) -> Option<Result<(), String>> {
+        let peer_group_ended = lock(&runtime.peer_group_ended).clone();
+        if let Some(reason) = peer_group_ended {
+            // The pod must end in failure: no container may keep running
+            // with part of its group missing.
+            return Some(Err(reason));
+        }
         if !BOUNDARY_TERMINATION_REQUESTED.load(Ordering::Acquire) {
             return None;
         }
@@ -1813,6 +1877,11 @@ mod linux {
         network_broker: NetworkBroker,
         workload_launcher: crate::linux::workload_launcher::WorkloadLauncher,
         qualification: crate::RuntimeQualification,
+        /// Peer workload runtimes; `None` for a single-container boundary.
+        peer_hub: Option<Arc<crate::peer_hub::PeerHub>>,
+        /// Set once a failed peer group has been torn down; the boundary
+        /// then exits with this reason.
+        peer_group_ended: Mutex<Option<String>>,
     }
 
     #[derive(Clone)]
@@ -2109,7 +2178,61 @@ mod linux {
                 network_broker,
                 workload_launcher,
                 qualification,
+                peer_hub: None,
+                peer_group_ended: Mutex::new(None),
             })
+        }
+
+        fn with_peer_hub(mut self, peer_hub: Option<Arc<crate::peer_hub::PeerHub>>) -> Self {
+            self.peer_hub = peer_hub;
+            self
+        }
+
+        /// Terminate peers alongside an operation that ends the agent's tree.
+        fn terminate_peers(
+            &self,
+            enforcement_lost: bool,
+        ) -> Option<tokio::task::JoinHandle<Result<(), String>>> {
+            let hub = self.peer_hub.clone()?;
+            Some(self.process_runtime.spawn_blocking(move || {
+                hub.terminate(enforcement_lost, crate::peer_hub::PEER_TERMINATION_TIMEOUT)
+            }))
+        }
+
+        async fn await_peer_termination(
+            termination: Option<tokio::task::JoinHandle<Result<(), String>>>,
+        ) -> Result<(), String> {
+            let Some(termination) = termination else {
+                return Ok(());
+            };
+            termination
+                .await
+                .map_err(|error| format!("join peer termination: {error}"))?
+        }
+
+        /// End the whole group after a peer runtime failed or its workload
+        /// exited: terminate the agent tree and every peer, then let the
+        /// boundary exit with the reason.
+        async fn end_peer_group(&self, reason: String) {
+            let peers = self.terminate_peers(false);
+            let process = {
+                let state = lock(&self.state);
+                match &*state {
+                    RuntimeState::Running(process) => Some(process.clone()),
+                    RuntimeState::AwaitingAttach
+                    | RuntimeState::Bound(_)
+                    | RuntimeState::Ready(_) => None,
+                }
+            };
+            if let Some(process) = process
+                && let Err(error) = Self::terminate_process_tree(&process, false).await
+            {
+                tracing::error!(%error, "agent workload did not terminate with its peer group");
+            }
+            if let Err(error) = Self::await_peer_termination(peers).await {
+                tracing::error!(%error, "peer workloads did not terminate with their group");
+            }
+            *lock(&self.peer_group_ended) = Some(format!("peer workload group ended: {reason}"));
         }
 
         #[cfg(test)]
@@ -2239,6 +2362,9 @@ mod linux {
                         ));
                     }
                     self.network_broker.set_workload_frozen(false);
+                    if let Some(hub) = &self.peer_hub {
+                        hub.thaw();
+                    }
                     tracing::info!(
                         connection_id = ?principal.connection_id(),
                         "Sandbox Protocol connection recovered; workload resumed"
@@ -2297,6 +2423,9 @@ mod linux {
                 if let Some(process) = &process {
                     self.network_broker.set_workload_frozen(true);
                     let _ = process.boundary_runtime.freeze();
+                    if let Some(hub) = &self.peer_hub {
+                        hub.freeze();
+                    }
                 }
                 *connection = SupervisorConnectionState::Frozen { recovery_id };
             }
@@ -2359,10 +2488,15 @@ mod linux {
                     .message("Supervisor recovery expired; terminating sandbox workload")
                     .build()
             );
+            let peers = self.terminate_peers(true);
             if let Some(process) = process
                 && let Err(error) = Self::terminate_process_tree(&process, true).await
             {
                 tracing::error!(%error, "sandbox workload did not terminate after recovery loss");
+                return;
+            }
+            if let Err(error) = Self::await_peer_termination(peers).await {
+                tracing::error!(%error, "peer workloads did not terminate after recovery loss");
                 return;
             }
             *lock(&self.supervisor_connection) = SupervisorConnectionState::Terminal;
@@ -2388,10 +2522,12 @@ mod linux {
                     | RuntimeState::Ready(_) => None,
                 }
             };
+            let peers = self.terminate_peers(false);
             let terminated = match process {
                 Some(process) => Self::terminate_process_tree(&process, false).await,
                 None => Ok(()),
             };
+            let terminated = terminated.and(Self::await_peer_termination(peers).await);
             // The host may end the VM on acknowledgement. Flush dirty writes
             // first, even if process termination failed.
             self.flush_filesystem().await;
@@ -2471,6 +2607,9 @@ mod linux {
             };
             if let Some(process) = process {
                 process.boundary_runtime.deactivate();
+            }
+            if let Some(hub) = &self.peer_hub {
+                hub.request_termination(false);
             }
         }
 
@@ -2909,6 +3048,19 @@ mod linux {
             if !self.workload_launcher.is_alive() {
                 return Err("sandbox workload launcher is not running".to_string());
             }
+            // Peers are part of this boundary: every one must still be
+            // connected, and each mechanism is reported only as strong as the
+            // weakest runtime that enforces it.
+            let qualification = match &self.peer_hub {
+                Some(hub) => {
+                    hub.confirm_healthy()?;
+                    crate::peer_protocol::aggregate_qualification(
+                        self.qualification,
+                        hub.qualifications(),
+                    )
+                }
+                None => self.qualification,
+            };
             let status = std::fs::read_to_string("/proc/self/status")
                 .map_err(|error| format!("read sandbox process status: {error}"))?;
             let capabilities = openshell_sandbox_backend::boundary_protocol::CapabilityEvidence {
@@ -2933,14 +3085,14 @@ mod linux {
                 core_limit_zero: core_current == 0 && core_maximum == 0,
                 native_architecture,
                 kernel_release,
-                seccomp: self.qualification.seccomp,
-                landlock_abi: self.qualification.landlock_abi,
-                landlock_allow_deny: self.qualification.landlock_allow_deny,
-                udp_dns_round_trip: self.qualification.udp_dns_round_trip,
-                tcp_dns_round_trip: self.qualification.tcp_dns_round_trip,
-                tcp_allow_round_trip: self.qualification.tcp_allow_round_trip,
-                tcp_deny_round_trip: self.qualification.tcp_deny_round_trip,
-                socket_loopback_confinement: self.qualification.socket_loopback_confinement,
+                seccomp: qualification.seccomp,
+                landlock_abi: qualification.landlock_abi,
+                landlock_allow_deny: qualification.landlock_allow_deny,
+                udp_dns_round_trip: qualification.udp_dns_round_trip,
+                tcp_dns_round_trip: qualification.tcp_dns_round_trip,
+                tcp_allow_round_trip: qualification.tcp_allow_round_trip,
+                tcp_deny_round_trip: qualification.tcp_deny_round_trip,
+                socket_loopback_confinement: qualification.socket_loopback_confinement,
             };
             // The boundary reports mechanism evidence; the authenticated host
             // backend validates it before constructing a ConfirmedBoundary.
@@ -2979,6 +3131,15 @@ mod linux {
                 Ok(spec) => spec,
                 Err(error) => return guest_error(BoundaryErrorKind::Process, error),
             };
+            // Peers receive exactly the inputs applied to the agent.
+            let peer_inputs = self.peer_hub.as_ref().map(|_| PeerStartInputs {
+                policy: policy.clone(),
+                ca_cert: ca_cert.clone(),
+                ca_bundle: ca_bundle.clone(),
+                provider_env_revision,
+                provider_env: provider_env.clone(),
+                provider_files: provider_files.clone(),
+            });
             let mut state = lock(&self.state);
             let requested = StartedAgent {
                 sandbox_id,
@@ -3058,6 +3219,14 @@ mod linux {
                     format!("install provider files: {error}"),
                 );
             }
+            if let (Some(hub), Some(inputs)) = (&self.peer_hub, peer_inputs)
+                && let Err(error) = hub.start(
+                    |peer| inputs.for_peer(&self.config, peer, gpu_requested),
+                    crate::peer_hub::PEER_START_TIMEOUT,
+                )
+            {
+                return guest_error(BoundaryErrorKind::Process, error);
+            }
             let process = match ManagedProcess::spawn(
                 &self.process_runtime,
                 &self.workload_launcher,
@@ -3065,8 +3234,26 @@ mod linux {
                 prepared.clone(),
             ) {
                 Ok(process) => Arc::new(process),
-                Err(error) => return guest_error(BoundaryErrorKind::Process, error),
+                Err(error) => {
+                    if let Some(hub) = &self.peer_hub {
+                        hub.request_termination(false);
+                    }
+                    return guest_error(BoundaryErrorKind::Process, error);
+                }
             };
+            if let Some(hub) = &self.peer_hub {
+                // The peers live exactly as long as the agent.
+                let hub = hub.clone();
+                let agent = process.clone();
+                self.process_runtime.spawn_blocking(move || {
+                    let _ = agent.wait();
+                    if let Err(error) =
+                        hub.terminate(false, crate::peer_hub::PEER_TERMINATION_TIMEOUT)
+                    {
+                        tracing::error!(%error, "peer workloads did not terminate after the agent exited");
+                    }
+                });
+            }
             let process_id = process.process_id();
             *lock(&self.started_agent) = Some(requested);
             *state = RuntimeState::Running(process);
@@ -3294,7 +3481,7 @@ mod linux {
         }
     }
 
-    fn install_ca_material(
+    pub fn install_ca_material(
         ca_cert: Option<String>,
         ca_bundle: Option<String>,
     ) -> Result<Option<(std::path::PathBuf, std::path::PathBuf)>, String> {
@@ -3437,6 +3624,41 @@ mod linux {
         provider_env_revision: u64,
         provider_env: std::collections::HashMap<String, String>,
         ca_file_paths: Option<(std::path::PathBuf, std::path::PathBuf)>,
+    }
+
+    /// The `start_agent` inputs every peer receives as well.
+    struct PeerStartInputs {
+        policy: SandboxPolicyWire,
+        ca_cert: Option<String>,
+        ca_bundle: Option<String>,
+        provider_env_revision: u64,
+        provider_env: std::collections::HashMap<String, String>,
+        provider_files: std::collections::HashMap<String, String>,
+    }
+
+    impl PeerStartInputs {
+        fn for_peer(
+            &self,
+            config: &BoundaryConfig,
+            peer: &openshell_sandbox_backend::peer_workloads::PeerWorkloadConfig,
+            gpu_requested: bool,
+        ) -> crate::peer_protocol::PeerStart {
+            let mut environment = config.child_env.clone();
+            environment.extend(peer.environment.clone());
+            crate::peer_protocol::PeerStart {
+                command: peer.command.clone(),
+                environment,
+                policy: self.policy.clone(),
+                gpu_requested,
+                workload_uid: config.workload_identity.uid,
+                workload_gid: config.workload_identity.gid,
+                ca_cert: self.ca_cert.clone(),
+                ca_bundle: self.ca_bundle.clone(),
+                provider_env_revision: self.provider_env_revision,
+                provider_env: self.provider_env.clone(),
+                provider_files: self.provider_files.clone(),
+            }
+        }
     }
 
     fn resolve_agent_spec(mut spec: AgentSpecWire) -> Result<AgentSpecWire, String> {
@@ -3693,7 +3915,7 @@ mod linux {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    fn process_status(status: ProcessStatus) -> ExitStatusWire {
+    pub fn process_status(status: ProcessStatus) -> ExitStatusWire {
         status.signal().map_or_else(
             || ExitStatusWire::Exited(status.code()),
             ExitStatusWire::Signaled,
@@ -5721,6 +5943,59 @@ mod linux {
         }
 
         #[test]
+        fn peer_workloads_require_valid_peers_and_runtime_initiated_control() {
+            let directory = tempfile::tempdir().expect("temporary directory");
+            let (server_tls, _client_tls) = stage_test_tls(directory.path(), "peers");
+            let peer = openshell_sandbox_backend::peer_workloads::PeerWorkloadConfig {
+                index: 0,
+                name: "mesh-peer".to_string(),
+                command: vec!["/usr/local/bin/python3".to_string()],
+                environment: std::collections::BTreeMap::new(),
+                token_sha256: "a".repeat(64),
+            };
+            let config = |listener: BoundaryListenerConfig,
+                          peers: Vec<
+                openshell_sandbox_backend::peer_workloads::PeerWorkloadConfig,
+            >| {
+                BoundaryConfig {
+                    boundary_id: "sandbox-1".to_string(),
+                    generation: "generation-1".to_string(),
+                    session_id: test_session_id(),
+                    session_rotation: openshell_core::jwt::SessionRotation::new(1)
+                        .expect("session rotation"),
+                    auth_epoch: CredentialEpoch::new(1).expect("auth epoch"),
+                    gateway_id: "test-gateway".to_string(),
+                    verification_keys: vec![test_verification_key()],
+                    listener,
+                    resource_claims: std::collections::BTreeMap::new(),
+                    resource_claim_files: std::collections::BTreeMap::new(),
+                    workload_identity: test_workload_identity(),
+                    provisioning_evidence: test_provisioning_evidence(),
+                    child_env: std::collections::HashMap::new(),
+                    peers,
+                }
+            };
+            let inbound = BoundaryListenerConfig::TlsTcp {
+                address: "10.42.0.7:5500".parse().expect("valid address"),
+                tls: server_tls.clone(),
+            };
+            let dialed = BoundaryListenerConfig::RuntimeInitiatedTlsTcp {
+                authority: "supervisor.openshell.internal".to_string(),
+                addresses: vec!["10.42.0.9:5500".parse().expect("valid address")],
+                tls: server_tls,
+                route: None,
+            };
+            validate_config(&config(inbound.clone(), Vec::new())).expect("no peers, inbound");
+            validate_config(&config(dialed.clone(), vec![peer.clone()])).expect("peers, dialed");
+            let error = validate_config(&config(inbound, vec![peer.clone()]))
+                .expect_err("peers must not share an inbound control listener");
+            assert!(error.contains("runtime-initiated"), "{error}");
+            let mut misindexed = peer;
+            misindexed.index = 1;
+            assert!(validate_config(&config(dialed, vec![misindexed])).is_err());
+        }
+
+        #[test]
         fn runtime_resource_claim_file_must_match_admitted_claim() {
             let directory = tempfile::tempdir().expect("temporary directory");
             let pod_uid_path = directory.path().join("pod-uid");
@@ -7037,6 +7312,15 @@ mod linux {
         }
     }
 }
+
+// Shared with the peer runtime and the primary's peer hub, which apply the
+// same process hardening, CA installation and termination bounds.
+#[cfg(target_os = "linux")]
+pub use linux::{
+    ENFORCEMENT_LOSS_TERMINATION_GRACE, FORCE_KILL_REAP_TIMEOUT, boundary_termination_requested,
+    disable_core_dumps, enrich_gpu_filesystem_paths, install_boundary_signal_handlers,
+    install_ca_material, make_boundary_nondumpable, process_status,
+};
 
 #[cfg(target_os = "linux")]
 pub fn run_boundary(

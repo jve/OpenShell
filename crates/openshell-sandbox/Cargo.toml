@@ -51,7 +51,7 @@ clap = { workspace = true }
 miette = { workspace = true }
 
 # Unix identity and bootstrap ownership
-nix = { workspace = true, features = ["resource", "socket", "feature", "poll"] }
+nix = { workspace = true, features = ["resource", "socket", "feature", "poll", "uio"] }
 
 # TLS crypto provider install (main.rs)
 rustls = { workspace = true }
