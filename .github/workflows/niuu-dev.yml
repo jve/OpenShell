@@ -5,7 +5,7 @@ name: Niuu Dev Images
 
 on:
   push:
-    branches: [codex/niuu-multi-container-sandboxes]
+    branches: ["niuu/**"]
   workflow_dispatch:
 
 permissions:
@@ -56,13 +56,14 @@ jobs:
         with:
           shared-key: niuu-${{ matrix.arch }}
           cache-on-failure: true
-      - name: Build gateway and static supervisor
+      - name: Build gateway, sandbox runtime and supervisor binaries
         run: mise run build:docker:prebuilt
       - name: Create Docker builder for image attestations
         run: docker buildx create --name niuu-builder --driver docker-container --use
       - name: Build local images
         run: |
           mise run build:docker:gateway
+          mise run build:docker:sandbox
           mise run build:docker:supervisor
       - name: Build test clients
         run: mise exec -- cargo build -p openshell-cli -p openshell-conformance-cli
@@ -75,19 +76,30 @@ jobs:
         run: |
           kind load docker-image --name niuu-acceptance \
             "${IMAGE_REGISTRY}/gateway:${IMAGE_TAG}" \
+            "${IMAGE_REGISTRY}/sandbox:${IMAGE_TAG}" \
             "${IMAGE_REGISTRY}/supervisor:${IMAGE_TAG}"
           kind get kubeconfig --name niuu-acceptance > "${RUNNER_TEMP}/acceptance-kubeconfig"
           cp "${RUNNER_TEMP}/acceptance-kubeconfig" kubeconfig
-      - name: Verify multi-container localhost and egress enforcement
+      - name: Verify peer workloads with a per-sandbox supervisor
         env:
           OPENSHELL_BIN: ${{ github.workspace }}/target/debug/openshell
           OPENSHELL_CONFORMANCE_BIN: ${{ github.workspace }}/target/debug/openshell-conformance
           OPENSHELL_E2E_KUBE_CONTEXT: kind-niuu-acceptance
           OPENSHELL_E2E_KUBE_BUILD_IMAGES: "0"
           OPENSHELL_REGISTRY: ghcr.io/jve/openshell
-          OPENSHELL_E2E_KUBE_TEST: kubernetes_workload_containers
-          OPENSHELL_E2E_KUBE_EXTRA_VALUES: deploy/helm/openshell/ci/values-sidecar.yaml
-        run: mise run e2e:kubernetes
+          OPENSHELL_E2E_KUBE_TEST: kubernetes_peer_workloads
+          OPENSHELL_E2E_KUBE_EXTRA_VALUES: deploy/helm/openshell/ci/values-peer-workloads.yaml
+        run: mise exec -- e2e/rust/e2e-kubernetes.sh
+      - name: Verify peer workloads with the shared gateway supervisor
+        env:
+          OPENSHELL_BIN: ${{ github.workspace }}/target/debug/openshell
+          OPENSHELL_CONFORMANCE_BIN: ${{ github.workspace }}/target/debug/openshell-conformance
+          OPENSHELL_E2E_KUBE_CONTEXT: kind-niuu-acceptance
+          OPENSHELL_E2E_KUBE_BUILD_IMAGES: "0"
+          OPENSHELL_REGISTRY: ghcr.io/jve/openshell
+          OPENSHELL_E2E_KUBE_TEST: kubernetes_peer_workloads
+          OPENSHELL_E2E_KUBE_EXTRA_VALUES: deploy/helm/openshell/ci/values-supervisor.yaml:deploy/helm/openshell/ci/values-peer-workloads.yaml
+        run: mise exec -- e2e/rust/e2e-kubernetes.sh
       - uses: docker/login-action@af1e73f918a031802d376d3c8bbc3fe56130a9b0 # v4
         with:
           registry: ghcr.io
@@ -98,6 +110,7 @@ jobs:
           DOCKER_PUSH: "1"
         run: |
           mise run build:docker:gateway
+          mise run build:docker:sandbox
           mise run build:docker:supervisor
       - name: Remove acceptance cluster
         if: always()
@@ -123,7 +136,7 @@ jobs:
           password: ${{ github.token }}
       - name: Publish multi-architecture image indexes
         run: |
-          for component in gateway supervisor; do
+          for component in gateway sandbox supervisor; do
             docker buildx imagetools create --prefer-index=false \
               --tag "${REGISTRY}/${component}:${REVISION}" \
               "${REGISTRY}/${component}:${REVISION}-amd64" \
@@ -136,12 +149,14 @@ jobs:
           chart="${RUNNER_TEMP}/openshell-chart"
           sed -i "s/^version:.*/version: 0.0.0-niuu.sha${REVISION}/" "${chart}/Chart.yaml"
           sed -i "s/^appVersion:.*/appVersion: \"${REVISION}\"/" "${chart}/Chart.yaml"
-          sed -i "s|ghcr.io/nvidia/openshell/gateway|${REGISTRY}/gateway|g; s|ghcr.io/nvidia/openshell/supervisor|${REGISTRY}/supervisor|g" "${chart}/values.yaml"
+          # Chart images resolve as <global.image.registry>/openshell/<component>.
+          sed -i "s|^    registry: ghcr.io/nvidia$|    registry: ghcr.io/jve|" "${chart}/values.yaml"
+          grep -q "^    registry: ghcr.io/jve$" "${chart}/values.yaml"
           helm lint "${chart}"
           helm package "${chart}" --destination "${RUNNER_TEMP}/charts"
           helm push "${RUNNER_TEMP}/charts/helm-chart-0.0.0-niuu.sha${REVISION}.tgz" "oci://${REGISTRY}"
           {
-            echo "Gateway and supervisor: ${REGISTRY}/{gateway,supervisor}:${REVISION}"
+            echo "Images: ${REGISTRY}/{gateway,sandbox,supervisor}:${REVISION}"
             echo "Chart: oci://${REGISTRY}/helm-chart:0.0.0-niuu.sha${REVISION}"
-            echo "Both architectures passed the multi-container Kubernetes acceptance test."
+            echo "Both architectures passed the peer-workload Kubernetes acceptance tests (dedicated and shared supervisor)."
           } >> "$GITHUB_STEP_SUMMARY"

@@ -1,0 +1,59 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Fast Linux verification of the crates the Niuu fork changes. Most of the
+# sandbox runtime is Linux-only, so this is the compile and unit-test gate for
+# fork branches; Niuu Dev Images runs the Kubernetes acceptance tests.
+name: Niuu Check
+
+on:
+  push:
+    branches: ["niuu/**"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: niuu-check-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    if: github.repository == 'jve/OpenShell'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      CARGO_INCREMENTAL: "0"
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
+      MISE_GITHUB_TOKEN: ${{ github.token }}
+      OPENSHELL_TELEMETRY_ENABLED: "false"
+      FORK_CRATES: >-
+        -p openshell-core
+        -p openshell-sandbox-backend
+        -p openshell-sandbox
+        -p openshell-driver-kubernetes
+        -p openshell-supervisor-network
+        -p openshell-isolation-interface
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install native build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential cmake clang lld pkg-config libssl-dev musl-tools
+      - uses: jdx/mise-action@e6a8b3978addb5a52f2b4cd9d91eafa7f0ab959d # v4.2.0
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: niuu-check
+          cache-on-failure: true
+      - name: Format
+        run: mise exec -- cargo fmt --all -- --check
+      - name: Clippy
+        run: mise exec -- cargo clippy ${FORK_CRATES} --all-targets -- -D warnings
+      - name: Unit tests
+        run: mise exec -- cargo test ${FORK_CRATES}
+      - name: E2E crate compiles
+        run: mise exec -- cargo clippy --manifest-path e2e/rust/Cargo.toml --all-targets --all-features -- -D warnings

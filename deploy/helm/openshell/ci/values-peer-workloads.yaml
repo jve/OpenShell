@@ -1,0 +1,9 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# E2E overlay: accept caller-supplied Kubernetes driver config so sandboxes can
+# request peer workload containers (containers.workloads). Resource admission
+# stays enabled; peer workloads use Memory emptyDir volumes only.
+gatewayConfig:
+  openshell.drivers.kubernetes:
+    allow_driver_config: true
