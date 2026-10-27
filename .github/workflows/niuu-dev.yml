@@ -27,7 +27,8 @@ jobs:
           - arch: arm64
             runner: ubuntu-24.04-arm
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 90
+    # A cold cache rebuilds the gateway's vendored z3 from source.
+    timeout-minutes: 180
     permissions:
       contents: read
       packages: write
@@ -35,7 +36,7 @@ jobs:
       CARGO_INCREMENTAL: "0"
       CARGO_PROFILE_DEV_DEBUG: "0"
       CARGO_PROFILE_TEST_DEBUG: "0"
-      CARGO_BUILD_JOBS: "2"
+      CARGO_BUILD_JOBS: "4"
       CONTAINER_ENGINE: docker
       MISE_GITHUB_TOKEN: ${{ github.token }}
       PREBUILT_ARCH: ${{ matrix.arch }}
