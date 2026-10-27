@@ -7525,6 +7525,16 @@ fn validate_peer_workload_pod(
         return Ok(());
     }
     let agent = &spec.containers[peers.len()];
+    // `workspace` is reserved for the driver-managed PVC, so an agent mount of
+    // it at `/sandbox` means the driver injected the shared workspace.
+    let shared_workspace = agent
+        .volume_mounts
+        .as_deref()
+        .unwrap_or_default()
+        .iter()
+        .any(|mount| {
+            mount.name == WORKSPACE_VOLUME_NAME && mount.mount_path == WORKSPACE_MOUNT_PATH
+        });
     let runtime_env = agent
         .env
         .as_deref()
@@ -7590,7 +7600,7 @@ fn validate_peer_workload_pod(
                 "peer workload {name} environment differs from the agent's runtime settings"
             ));
         }
-        let expected_mounts = peer_workload_volume_mounts(index, peer)
+        let expected_mounts = peer_workload_volume_mounts(index, peer, shared_workspace)
             .iter()
             .map(volume_mount_key)
             .collect::<std::collections::BTreeSet<_>>();
@@ -7683,12 +7693,15 @@ fn peer_workload_entrypoint() -> [String; 2] {
     ]
 }
 
-/// Exact volume mounts of peer `index`: the driver-owned mounts followed by
-/// the caller's declared mounts. No peer mounts the bootstrap Secret, the
-/// runtime state, the Pod identity, the workspace, or another peer's volumes.
+/// Exact volume mounts of peer `index`: the driver-owned mounts, the
+/// OpenShell-managed workspace when the driver injected one for the agent, and
+/// then the caller's declared mounts. Peers share the agent's `/sandbox` so a
+/// flock works on one workspace. No peer mounts the bootstrap Secret, the
+/// runtime state, the Pod identity, or another peer's volumes.
 fn peer_workload_volume_mounts(
     index: usize,
     peer: &KubernetesPeerWorkloadConfig,
+    shared_workspace: bool,
 ) -> Vec<VolumeMount> {
     let driver_mount = |name: String, mount_path: &str, read_only: bool| VolumeMount {
         name,
@@ -7706,6 +7719,13 @@ fn peer_workload_volume_mounts(
         driver_mount(peer_boot_volume_name(index), PEER_BOOT_DIR, false),
         driver_mount(peer_run_volume_name(index), PEER_RUN_DIR, false),
     ];
+    if shared_workspace {
+        mounts.push(driver_mount(
+            WORKSPACE_VOLUME_NAME.to_string(),
+            WORKSPACE_MOUNT_PATH,
+            false,
+        ));
+    }
     mounts.extend(peer.volume_mounts.iter().map(VolumeMount::from));
     mounts
 }
@@ -7739,6 +7759,7 @@ fn volume_mount_key(mount: &VolumeMount) -> VolumeMountKey {
 fn apply_peer_workload_containers(
     spec: &mut serde_json::Map<String, serde_json::Value>,
     peers: &[KubernetesPeerWorkloadConfig],
+    inject_workspace: bool,
     params: &SandboxPodParams<'_>,
 ) {
     if peers.is_empty() {
@@ -7797,7 +7818,7 @@ fn apply_peer_workload_containers(
         .collect::<Vec<_>>();
 
     let rendered = peers.iter().enumerate().map(|(index, peer)| {
-        let mounts = peer_workload_volume_mounts(index, peer)
+        let mounts = peer_workload_volume_mounts(index, peer, inject_workspace)
             .iter()
             .map(|mount| serde_json::to_value(mount).expect("VolumeMount serializes to JSON"))
             .collect::<Vec<_>>();
@@ -7837,6 +7858,7 @@ fn apply_peer_workload_containers(
 fn apply_supervisor_sandbox_runtime_boundary(
     pod_template: &mut serde_json::Value,
     peers: &[KubernetesPeerWorkloadConfig],
+    inject_workspace: bool,
     params: &SandboxPodParams<'_>,
 ) {
     let metadata = pod_template
@@ -8031,7 +8053,7 @@ fn apply_supervisor_sandbox_runtime_boundary(
         remove_env(env, key);
     }
     apply_resolved_identity_env(env, params.sandbox_uid, params.sandbox_gid);
-    apply_peer_workload_containers(spec, peers, params);
+    apply_peer_workload_containers(spec, peers, inject_workspace, params);
 }
 
 /// Apply workspace persistence transforms to an already-built pod template.
@@ -8572,6 +8594,7 @@ fn sandbox_template_to_k8s_with_validated_config(
     apply_supervisor_sandbox_runtime_boundary(
         &mut result,
         &driver_config.containers.workloads,
+        inject_workspace,
         params,
     );
 
@@ -11727,6 +11750,11 @@ mod tests {
                     "/run".to_string(),
                     false,
                 ),
+                (
+                    WORKSPACE_VOLUME_NAME.to_string(),
+                    WORKSPACE_MOUNT_PATH.to_string(),
+                    false,
+                ),
             ];
             if index == 0 {
                 expected.push(("flock-ipc".to_string(), "/tmp/niuu-mesh".to_string(), false));
@@ -11811,11 +11839,18 @@ mod tests {
         assert_eq!(flock["emptyDir"], serde_json::json!({}));
         assert!(flock.get("persistentVolumeClaim").is_none());
 
-        // No peer sees the bootstrap Secret or the workspace.
+        // Peers share the agent's workspace but never see the bootstrap Secret.
+        assert!(agent_mounts.contains(&(
+            WORKSPACE_VOLUME_NAME.to_string(),
+            WORKSPACE_MOUNT_PATH.to_string(),
+            false
+        )));
         for peer in [reviewer, coder] {
-            assert!(!mount_paths(peer).iter().any(|(name, _, _)| {
-                name == SANDBOX_BOOTSTRAP_VOLUME_NAME || name == WORKSPACE_VOLUME_NAME
-            }));
+            assert!(
+                !mount_paths(peer)
+                    .iter()
+                    .any(|(name, _, _)| name == SANDBOX_BOOTSTRAP_VOLUME_NAME)
+            );
         }
     }
 
@@ -11832,6 +11867,50 @@ mod tests {
                 .unwrap()
                 .starts_with(PEER_WORKLOAD_VOLUME_PREFIX)
         }));
+    }
+
+    #[test]
+    fn peers_share_only_caller_storage_when_the_caller_owns_sandbox_data() {
+        let mount = serde_json::json!({
+            "name": "home", "mount_path": "/sandbox/workspace", "read_only": false
+        });
+        let driver_config = serde_json::json!({
+            "volumes": [{
+                "name": "home",
+                "persistent_volume_claim": {"claim_name": "home", "read_only": false}
+            }],
+            "containers": {
+                "agent": {"volume_mounts": [mount]},
+                "workloads": [{
+                    "name": "ravn-coder",
+                    "image": "registry.example.com/coder:v2",
+                    "command": ["/usr/bin/coder"],
+                    "volume_mounts": [mount]
+                }]
+            }
+        });
+        let peers =
+            kubernetes_driver_config_for_spec(Some(&peer_sandbox_spec(driver_config.clone())))
+                .unwrap()
+                .containers
+                .workloads;
+        let pod = admitted_raw_peer_pod(driver_config);
+        let containers = pod["spec"]["containers"].as_array().unwrap();
+        for container in containers {
+            assert!(
+                !mount_paths(container)
+                    .iter()
+                    .any(|(name, _, _)| name == WORKSPACE_VOLUME_NAME),
+                "{} must not mount the driver workspace",
+                container["name"]
+            );
+        }
+        assert!(mount_paths(&containers[0]).contains(&(
+            "home".to_string(),
+            "/sandbox/workspace".to_string(),
+            false
+        )));
+        gate_raw_peer_pod(&pod, &peers).expect("caller-owned storage passes the gate");
     }
 
     #[test]
@@ -11897,6 +11976,35 @@ mod tests {
                             mount_path: "/secret".to_string(),
                             ..Default::default()
                         });
+                }),
+            ),
+            (
+                "peer missing the shared workspace",
+                tamper(&|spec| {
+                    spec.containers[1]
+                        .volume_mounts
+                        .get_or_insert_default()
+                        .retain(|mount| mount.name != WORKSPACE_VOLUME_NAME);
+                }),
+            ),
+            (
+                "peer workspace moved",
+                tamper(&|spec| {
+                    for mount in spec.containers[0].volume_mounts.get_or_insert_default() {
+                        if mount.name == WORKSPACE_VOLUME_NAME {
+                            mount.mount_path = "/elsewhere".to_string();
+                        }
+                    }
+                }),
+            ),
+            (
+                "peer workspace without an agent workspace",
+                tamper(&|spec| {
+                    let agent = spec.containers.len() - 1;
+                    spec.containers[agent]
+                        .volume_mounts
+                        .get_or_insert_default()
+                        .retain(|mount| mount.name != WORKSPACE_VOLUME_NAME);
                 }),
             ),
             (

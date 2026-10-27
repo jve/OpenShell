@@ -507,8 +507,11 @@ resources, and declared volume mounts. The driver owns everything else:
 - Peers render ahead of `agent` with the agent's security context. They mount
   the runtime volume read-only and three private Memory `emptyDir` volumes:
   a control directory shared only with `agent`, a boot directory shared only
-  with the init container, and their own `/run`. They never mount the bootstrap
-  Secret, the runtime state, the Pod identity, or the workspace PVC.
+  with the init container, and their own `/run`. When the driver injects the
+  default workspace PVC, every peer also mounts it at `/sandbox`, so the flock
+  works on the agent's workspace; when the caller owns `/sandbox` storage, peers
+  get only the caller's declared mounts. Peers never mount the bootstrap
+  Secret, the runtime state, or the Pod identity.
 - `command` and `environment` are not placed on the container. The driver
   records them in the protected boundary config, and the primary runtime starts
   each peer workload with them once the sandbox starts. The container carries

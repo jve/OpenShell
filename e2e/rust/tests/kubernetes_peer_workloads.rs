@@ -169,6 +169,9 @@ report["no_bootstrap_secret"] = not os.path.exists("/.openshell/bootstrap-input"
 
 wait_for(mesh / "agent-hello")
 report["shared_volume"] = (mesh / "agent-hello").read_text() == "hello-from-agent"
+workspace_hello = pathlib.Path("/sandbox/agent-workspace-hello")
+wait_for(workspace_hello)
+report["shared_workspace"] = workspace_hello.read_text() == "hello-from-agent-workspace"
 
 for _ in range(300):
     try:
@@ -237,6 +240,7 @@ def reply():
 
 listener = threading.Thread(target=reply)
 listener.start()
+pathlib.Path("/sandbox/agent-workspace-hello").write_text("hello-from-agent-workspace")
 (mesh / "agent-hello").write_text("hello-from-agent")
 
 for _ in range(1200):
@@ -376,6 +380,14 @@ fn assert_rendered_peer(pod: &serde_json::Value) {
             .any(|entry| entry["name"] == "MESH_PEER"),
         "peer environment must travel in the boundary config, not the Pod: {peer}"
     );
+    assert!(
+        peer["volumeMounts"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .any(|mount| mount["name"] == "workspace" && mount["mountPath"] == "/sandbox"),
+        "peer must share the agent's OpenShell workspace: {peer}"
+    );
 }
 
 /// Every check the peer and agent report must have passed.
@@ -390,6 +402,7 @@ fn assert_peer_report(output: &str) {
         ("token_consumed", serde_json::json!(true)),
         ("no_bootstrap_secret", serde_json::json!(true)),
         ("shared_volume", serde_json::json!(true)),
+        ("shared_workspace", serde_json::json!(true)),
         ("peer_to_agent", serde_json::json!(true)),
         ("agent_to_peer", serde_json::json!(true)),
         ("dns", serde_json::json!(true)),
