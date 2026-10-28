@@ -315,9 +315,17 @@ fn is_kubernetes_service_host(host: &str) -> bool {
 /// Reject credentials that cannot safely occupy an HTTP header value.
 ///
 /// Provider access tokens are opaque, not necessarily token68 (Linear uses colons).
-/// Keep whitespace, controls and non-ASCII bytes out of injected HTTP headers.
+/// A header-style credential may also be a complete `<auth-scheme> <credentials>`
+/// value, such as the `Basic` header GitHub's Git endpoints require, so one
+/// space between two visible runs is allowed. Controls, other whitespace and
+/// non-ASCII bytes never reach an injected HTTP header.
 pub fn validate_access_token(token: &str) -> Result<(), TokenGrantFailure> {
-    if token.is_empty() || !token.bytes().all(|byte| byte.is_ascii_graphic()) {
+    let visible = |part: &str| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_graphic());
+    let header_safe = match token.split_once(' ') {
+        Some((scheme, credentials)) => visible(scheme) && visible(credentials),
+        None => visible(token),
+    };
+    if !header_safe {
         return Err(TokenGrantFailure::new(
             TokenGrantFailureKind::Unclassified,
             TokenGrantStage::TokenEndpoint,
@@ -982,6 +990,7 @@ mod tests {
             "linear:opaque:access-token",
             "token=continued",
             "opaque!#$%&*",
+            "Basic eC1hY2Nlc3MtdG9rZW46Z2hzX3Rva2Vu",
         ] {
             validate_access_token(token).expect("should be accepted");
         }
@@ -992,6 +1001,10 @@ mod tests {
         for token in [
             "",
             "token with spaces",
+            "Basic  double-space",
+            " leading",
+            "trailing ",
+            " ",
             "token\r\nX-Injected: yes",
             "token\u{7f}",
             "tokené",
