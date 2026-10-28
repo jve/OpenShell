@@ -596,6 +596,11 @@ async fn preauthorize_transparent_open(
         timing,
         operation: "tcp",
     };
+    // A dual-stack (AF_INET6) socket reaches an IPv4 destination through its
+    // IPv4-mapped address, as gRPC's C core connects. Policy DNS mappings and
+    // every destination rule key on the IPv4 address, so decide on the
+    // canonical form; a real IPv6 destination is unchanged.
+    let destination = SocketAddr::new(destination.ip().to_canonical(), destination.port());
     if openshell_core::google_cloud::is_metadata_destination(destination) {
         let identity_check = binary_identity
             .as_ref()
@@ -7857,6 +7862,50 @@ process: { run_as_user: sandbox, run_as_group: sandbox }
         )
         .await
         .expect("policy-backed mapping is admitted");
+
+        assert_eq!(completion.await.unwrap(), TcpOpenDecision::RelayReady);
+        let (_, connector) = transparent
+            .and_then(|open| open.authorization)
+            .expect("transparent authorization");
+        assert_eq!(connector.addrs(), &["203.0.113.8:5432".parse().unwrap()]);
+    }
+
+    #[tokio::test]
+    async fn staged_transparent_open_maps_an_ipv4_mapped_synthetic_destination() {
+        let engine = native_identity_engine(
+            include_str!("../data/sandbox-policy.rego"),
+            &policy_with_native_executable_paths(POLICY_DNS_OPEN_POLICY),
+        )
+        .unwrap();
+        let store = policy_dns_test_store();
+        let record = publish_mapping(
+            &store,
+            "db.example",
+            "database",
+            5432,
+            engine.current_generation(),
+        );
+        let IpAddr::V4(synthetic) = record.synthetic_address else {
+            panic!("policy DNS hands out IPv4 synthetic addresses");
+        };
+        // gRPC's C core dials the resolved IPv4 address from an AF_INET6 socket.
+        let (open, completion) = staged_curl_open(
+            SocketAddr::new(IpAddr::V6(synthetic.to_ipv6_mapped()), 5432),
+            engine.current_generation(),
+        );
+
+        let (_, _, _, transparent) = preauthorize_transparent_open(
+            open,
+            Some(&store),
+            &engine,
+            &BinaryIdentityCache::new(),
+            None,
+            None,
+            false,
+            None,
+        )
+        .await
+        .expect("an IPv4-mapped synthetic address is the same mapping");
 
         assert_eq!(completion.await.unwrap(), TcpOpenDecision::RelayReady);
         let (_, connector) = transparent
