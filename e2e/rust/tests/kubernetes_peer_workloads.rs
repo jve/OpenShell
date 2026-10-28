@@ -496,7 +496,11 @@ async fn recreate_under_a_terminating_name_waits_for_the_old_pod() {
         .await
         .expect("create the first generation");
     first
-        .exec(&["sh", "-c", "nohup sh -c 'trap \"\" TERM; while :; do sleep 1; done' >/dev/null 2>&1 &"])
+        .exec(&[
+            "sh",
+            "-c",
+            "nohup sh -c 'trap \"\" TERM; while :; do sleep 1; done' >/dev/null 2>&1 &",
+        ])
         .await
         .expect("start a workload that ignores SIGTERM");
     let old_pod_uid = workload_pod(&name)
