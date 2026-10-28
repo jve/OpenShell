@@ -31,7 +31,7 @@ use k8s_openapi::api::authentication::v1::{
     TokenReview, TokenReviewSpec, TokenReviewStatus, UserInfo,
 };
 use k8s_openapi::api::core::v1::{
-    EmptyDirVolumeSource, Event as KubeEventObj, Namespace, Node,
+    EmptyDirVolumeSource, Event as KubeEventObj, Namespace, Node, PersistentVolumeClaim,
     PersistentVolumeClaimVolumeSource, Pod, Secret, Service, ServiceAccount, Volume, VolumeMount,
 };
 use k8s_openapi::api::networking::v1::{
@@ -2402,6 +2402,7 @@ impl KubernetesComputeDriver {
             sandbox_secret_name: &proxy_names.sandbox_secret,
         };
         let kube_name = self.config.kube_resource_name(workspace, name);
+        wait_for_previous_sandbox_generation(&self.client, &target_namespace, &kube_name).await?;
         let mut data = sandbox_to_k8s_spec(sandbox.spec.as_ref(), &params)
             .map_err(KubernetesDriverError::InvalidArgument)?;
         let peer_workloads = encode_peer_workloads_annotation(
@@ -9308,6 +9309,88 @@ fn kubernetes_sandbox_stop_timeout(obj: &DynamicObject) -> Duration {
     termination_grace_period.saturating_add(KUBE_API_TIMEOUT)
 }
 
+/// Wait for a deleted predecessor named `kube_name` to finish terminating.
+///
+/// A recreated sandbox reuses its predecessor's workload Pod and workspace
+/// claim names. Kubernetes removes a deleted Sandbox resource before its Pod
+/// finishes terminating, and the claim stays protected while that Pod exists,
+/// so a generation created in that window meets the old Pod (the workload gate
+/// rejects it as not controlled by the new Sandbox) or a claim that is being
+/// deleted. Waits at most the leftover Pod's termination grace plus one API
+/// timeout, then fails instead of creating into the collision.
+async fn wait_for_previous_sandbox_generation(
+    client: &Client,
+    namespace: &str,
+    kube_name: &str,
+) -> Result<(), KubernetesDriverError> {
+    let pods = Api::<Pod>::namespaced(client.clone(), namespace);
+    let claims = Api::<PersistentVolumeClaim>::namespaced(client.clone(), namespace);
+    let claim_name = format!("{WORKSPACE_VOLUME_NAME}-{kube_name}");
+    let mut deadline = None;
+    let mut poll = STOP_INITIAL_POLL_INTERVAL;
+    loop {
+        let pod = tokio::time::timeout(KUBE_API_TIMEOUT, pods.get_opt(kube_name))
+            .await
+            .map_err(|_| {
+                KubernetesDriverError::Message(format!(
+                    "timed out checking for a previous workload Pod {kube_name}"
+                ))
+            })?
+            .map_err(KubernetesDriverError::from_kube)?;
+        let deleting_claim = tokio::time::timeout(KUBE_API_TIMEOUT, claims.get_opt(&claim_name))
+            .await
+            .map_err(|_| {
+                KubernetesDriverError::Message(format!(
+                    "timed out checking for a previous workspace claim {claim_name}"
+                ))
+            })?
+            .map_err(KubernetesDriverError::from_kube)?
+            .is_some_and(|claim| claim.metadata.deletion_timestamp.is_some());
+        if pod.is_none() && !deleting_claim {
+            return Ok(());
+        }
+        let now = tokio::time::Instant::now();
+        let deadline = *deadline.get_or_insert_with(|| {
+            now + pod.as_ref().map_or(
+                DEFAULT_POD_TERMINATION_GRACE_PERIOD.saturating_add(KUBE_API_TIMEOUT),
+                previous_pod_termination_remaining,
+            )
+        });
+        if now >= deadline {
+            let leftover = if pod.is_some() {
+                format!("workload Pod {kube_name}")
+            } else {
+                format!("workspace claim {claim_name}")
+            };
+            return Err(KubernetesDriverError::Precondition(format!(
+                "previous sandbox {leftover} in namespace {namespace} is still terminating; \
+                 retry once it is gone"
+            )));
+        }
+        info!(
+            namespace,
+            pod = kube_name,
+            "waiting for the previous sandbox generation to terminate before creating"
+        );
+        tokio::time::sleep(poll).await;
+        poll = next_stop_poll_interval(poll);
+    }
+}
+
+/// How much longer a leftover Pod may take to go. A terminating Pod's
+/// `deletionTimestamp` is the end of its grace period, so only the time left
+/// until then plus kubelet teardown remains; a Pod not yet marked for deletion
+/// still has its whole grace period ahead.
+fn previous_pod_termination_remaining(pod: &Pod) -> Duration {
+    let Some(deletion) = pod.metadata.deletion_timestamp.as_ref() else {
+        return kubernetes_pod_termination_timeout(pod);
+    };
+    let until_grace_ends = (deletion.0 - k8s_openapi::chrono::Utc::now())
+        .to_std()
+        .unwrap_or_default();
+    until_grace_ends.saturating_add(KUBE_API_TIMEOUT)
+}
+
 fn kubernetes_pod_termination_timeout(pod: &Pod) -> Duration {
     let default_grace = u64::try_from(SUPERVISOR_TERMINATION_GRACE_PERIOD_SECONDS)
         .map_or(DEFAULT_POD_TERMINATION_GRACE_PERIOD, Duration::from_secs);
@@ -10089,6 +10172,171 @@ mod tests {
             .header(http::header::CONTENT_TYPE, "application/json")
             .body(kube::client::Body::from(body.to_string().into_bytes()))
             .expect("valid Kubernetes test response")
+    }
+
+    type ScriptedKubeSteps =
+        Arc<std::sync::Mutex<VecDeque<(String, http::Response<kube::client::Body>)>>>;
+
+    /// A client that answers each GET from `steps` in order and fails on any
+    /// other request.
+    fn scripted_get_client(steps: &ScriptedKubeSteps) -> Client {
+        let steps = steps.clone();
+        let service = tower::service_fn(move |request: http::Request<kube::client::Body>| {
+            let steps = steps.clone();
+            async move {
+                let (path, response) = steps
+                    .lock()
+                    .unwrap()
+                    .pop_front()
+                    .expect("unexpected Kubernetes API request");
+                assert_eq!(request.method(), http::Method::GET);
+                assert_eq!(request.uri().path(), path);
+                Ok::<_, std::convert::Infallible>(response)
+            }
+        });
+        Client::new(service, "openshell-sandboxes")
+    }
+
+    const PREVIOUS_POD_PATH: &str = "/api/v1/namespaces/openshell-sandboxes/pods/default--r-1";
+    const PREVIOUS_CLAIM_PATH: &str =
+        "/api/v1/namespaces/openshell-sandboxes/persistentvolumeclaims/workspace-default--r-1";
+
+    fn previous_pod(terminating: bool) -> http::Response<kube::client::Body> {
+        let mut metadata = serde_json::json!({"name": "default--r-1"});
+        if terminating {
+            metadata["deletionTimestamp"] = serde_json::json!("2026-10-28T00:35:28Z");
+        }
+        kube_test_response(
+            http::StatusCode::OK,
+            serde_json::json!({
+                "apiVersion": "v1", "kind": "Pod", "metadata": metadata,
+                "spec": {"containers": [], "terminationGracePeriodSeconds": 30}
+            }),
+        )
+    }
+
+    fn previous_claim(terminating: bool) -> http::Response<kube::client::Body> {
+        let mut metadata = serde_json::json!({"name": "workspace-default--r-1"});
+        if terminating {
+            metadata["deletionTimestamp"] = serde_json::json!("2026-10-28T00:35:28Z");
+        }
+        kube_test_response(
+            http::StatusCode::OK,
+            serde_json::json!({
+                "apiVersion": "v1", "kind": "PersistentVolumeClaim", "metadata": metadata,
+                "spec": {}
+            }),
+        )
+    }
+
+    #[test]
+    fn leftover_pod_wait_ends_with_its_grace_period() {
+        let mut pod = Pod {
+            spec: Some(k8s_openapi::api::core::v1::PodSpec {
+                termination_grace_period_seconds: Some(30),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert_eq!(
+            previous_pod_termination_remaining(&pod),
+            Duration::from_secs(30) + KUBE_API_TIMEOUT
+        );
+        pod.metadata.deletion_timestamp =
+            Some(k8s_openapi::apimachinery::pkg::apis::meta::v1::Time(
+                k8s_openapi::chrono::Utc::now() - k8s_openapi::chrono::Duration::seconds(5),
+            ));
+        assert_eq!(previous_pod_termination_remaining(&pod), KUBE_API_TIMEOUT);
+        pod.metadata.deletion_timestamp =
+            Some(k8s_openapi::apimachinery::pkg::apis::meta::v1::Time(
+                k8s_openapi::chrono::Utc::now() + k8s_openapi::chrono::Duration::seconds(10),
+            ));
+        let remaining = previous_pod_termination_remaining(&pod);
+        assert!(
+            remaining > KUBE_API_TIMEOUT && remaining <= KUBE_API_TIMEOUT + Duration::from_secs(10)
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn recreate_waits_for_the_previous_pod_and_claim_to_go() {
+        let steps: ScriptedKubeSteps = Arc::new(std::sync::Mutex::new(
+            [
+                (PREVIOUS_POD_PATH, previous_pod(true)),
+                (PREVIOUS_CLAIM_PATH, previous_claim(true)),
+                (
+                    PREVIOUS_POD_PATH,
+                    kube_test_not_found("pods", "default--r-1"),
+                ),
+                (PREVIOUS_CLAIM_PATH, previous_claim(true)),
+                (
+                    PREVIOUS_POD_PATH,
+                    kube_test_not_found("pods", "default--r-1"),
+                ),
+                (
+                    PREVIOUS_CLAIM_PATH,
+                    kube_test_not_found("persistentvolumeclaims", "workspace-default--r-1"),
+                ),
+            ]
+            .into_iter()
+            .map(|(path, response)| (path.to_string(), response))
+            .collect(),
+        ));
+        wait_for_previous_sandbox_generation(
+            &scripted_get_client(&steps),
+            "openshell-sandboxes",
+            "default--r-1",
+        )
+        .await
+        .expect("previous generation terminated");
+        assert!(steps.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn create_proceeds_at_once_without_a_previous_generation() {
+        let steps: ScriptedKubeSteps = Arc::new(std::sync::Mutex::new(
+            [
+                (
+                    PREVIOUS_POD_PATH,
+                    kube_test_not_found("pods", "default--r-1"),
+                ),
+                // A live claim is the sandbox's retained workspace, not a leftover.
+                (PREVIOUS_CLAIM_PATH, previous_claim(false)),
+            ]
+            .into_iter()
+            .map(|(path, response)| (path.to_string(), response))
+            .collect(),
+        ));
+        wait_for_previous_sandbox_generation(
+            &scripted_get_client(&steps),
+            "openshell-sandboxes",
+            "default--r-1",
+        )
+        .await
+        .expect("nothing to wait for");
+        assert!(steps.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn create_fails_when_the_previous_pod_outlives_its_grace() {
+        let service = tower::service_fn(|request: http::Request<kube::client::Body>| async move {
+            let response = if request.uri().path() == PREVIOUS_POD_PATH {
+                previous_pod(false)
+            } else {
+                kube_test_not_found("persistentvolumeclaims", "workspace-default--r-1")
+            };
+            Ok::<_, std::convert::Infallible>(response)
+        });
+        let error = wait_for_previous_sandbox_generation(
+            &Client::new(service, "openshell-sandboxes"),
+            "openshell-sandboxes",
+            "default--r-1",
+        )
+        .await
+        .expect_err("a Pod that never terminates blocks the create");
+        let KubernetesDriverError::Precondition(message) = error else {
+            panic!("expected a precondition failure, got {error:?}");
+        };
+        assert!(message.contains("workload Pod default--r-1"), "{message}");
     }
 
     fn kube_test_not_found(kind: &str, name: &str) -> http::Response<kube::client::Body> {

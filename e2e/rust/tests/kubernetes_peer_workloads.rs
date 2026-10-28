@@ -484,3 +484,61 @@ async fn peer_workloads_share_localhost_and_volume_under_sandbox_policy() {
 
     sandbox.cleanup().await;
 }
+
+/// Recreating a sandbox under the name of one that is still terminating must
+/// wait for the old workload Pod instead of colliding with it. The gateway
+/// frees the name when deletion starts, while Kubernetes keeps the old Pod for
+/// its grace period; a workload that ignores SIGTERM holds it there.
+#[tokio::test]
+async fn recreate_under_a_terminating_name_waits_for_the_old_pod() {
+    let name = openshell_e2e::harness::sandbox::unique_sandbox_name();
+    let first = SandboxGuard::create(&["--name", &name])
+        .await
+        .expect("create the first generation");
+    first
+        .exec(&["sh", "-c", "nohup sh -c 'trap \"\" TERM; while :; do sleep 1; done' >/dev/null 2>&1 &"])
+        .await
+        .expect("start a workload that ignores SIGTERM");
+    let old_pod_uid = workload_pod(&name)
+        .await
+        .expect("first generation has a workload Pod")["metadata"]["uid"]
+        .clone();
+
+    let delete = openshell_e2e::harness::binary::openshell_cmd()
+        .args(["sandbox", "delete", &name])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("start deleting the first generation");
+
+    let deadline = tokio::time::Instant::now() + TERMINATION_TIMEOUT;
+    let mut second = loop {
+        match SandboxGuard::create(&["--name", &name]).await {
+            Ok(sandbox) => break sandbox,
+            Err(error) if error.to_ascii_lowercase().contains("already") => {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "the name was never freed: {error}"
+                );
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
+            Err(error) => panic!("recreating a terminating sandbox name failed: {error}"),
+        }
+    };
+    let new_pod = workload_pod(&name)
+        .await
+        .expect("second generation has a workload Pod");
+    assert_ne!(new_pod["metadata"]["uid"], old_pod_uid, "{new_pod}");
+    let output = second
+        .exec(&["echo", "second-generation"])
+        .await
+        .expect("second generation runs");
+    assert!(output.contains("second-generation"), "{output}");
+
+    let _ = delete.wait_with_output().await;
+    // The first generation is gone; its guard would delete the name, which
+    // now belongs to the second.
+    std::mem::forget(first);
+    second.cleanup().await;
+}
